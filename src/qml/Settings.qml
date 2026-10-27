@@ -71,9 +71,8 @@ FormCard.FormCardPage {
             Connections {
                 target: frontendManager
                 function onUpmixEnabledChanged() {
-                    // The toggle above replaced this binding with a plain value, so
-                    // re-create it on every change - a switch the user refused has to
-                    // show the old state again
+                    // Clicking replaces this binding with a plain value; re-create it so
+                    // a failed graph rebuild can show the reverted state
                     upmixEnabled.checked = Qt.binding(function () {
                         return frontendManager.upmixEnabled;
                     })

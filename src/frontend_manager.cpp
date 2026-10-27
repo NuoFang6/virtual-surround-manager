@@ -1,11 +1,13 @@
 #include "frontend_manager.h"
 #include "pipewire_manager.h"
 
+#include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
 #include <QFile>
 #include <QStandardPaths>
 #include <QTextStream>
+#include <QTimer>
 #include <QUrl>
 
 #ifdef IS_FLATPAK
@@ -52,6 +54,30 @@ FrontendManager::FrontendManager(PipeWireManager *pipewire_manager, KConfig *con
     if (!m_pipewire_manager->is_valid()) {
         set_error_message(QStringLiteral("Failed connecting to PipeWire audio service."));
     }
+
+    // Headless measurement hook: Wayland sessions cannot be automated by the test
+    // tooling, so this cycles profiles/upmix through the same setters the UI uses.
+    // Inert unless VSM_TEST_AUTO_SWITCH_MS is set to a positive interval.
+    const int test_switch_ms = qEnvironmentVariableIntValue("VSM_TEST_AUTO_SWITCH_MS");
+    if (test_switch_ms > 0) {
+        auto *timer = new QTimer(this);
+        timer->setInterval(test_switch_ms);
+        connect(timer, &QTimer::timeout, this, [this]() {
+            static int step = 0;
+            ++step;
+            qInfo("VSM_TEST switch step %d at %lld", step, static_cast<long long>(QDateTime::currentMSecsSinceEpoch()));
+            if (step % 2 == 1) {
+                if (m_hrir_wav_file_names.size() > 1) {
+                    const int next = (m_hrir_wav_file_name_index + 1) % m_hrir_wav_file_names.size();
+                    set_hrir_wav_file_name_index(next);
+                }
+            } else {
+                set_upmix_enabled(!m_upmix_enabled);
+            }
+        });
+        timer->start();
+        qInfo("VSM_TEST_AUTO_SWITCH_MS=%d: cycling profiles/upmix for measurements", test_switch_ms);
+    }
 }
 
 bool FrontendManager::does_hrir_wav_file_exist(const QString &file_path) {
@@ -83,41 +109,36 @@ bool FrontendManager::create_module() {
     return true;
 }
 
-void FrontendManager::rebuild_module() {
+bool FrontendManager::rebuild_module() {
     // A fresh attempt invalidates any error message from a previous failure
     set_error_message(QString());
 
     if (m_hrir_wav_file_names.isEmpty()) {
         qWarning("rebuild_module: No virtualization profiles available");
         set_error_message(QStringLiteral("No virtualization profiles found. Add HRIR WAV files to the folder below and press Reload."));
-        return;
+        return false;
     }
 
     QString path = m_hrir_wav_file_paths.value(m_hrir_wav_file_name_index);
     if (!does_hrir_wav_file_exist(path))
-        return;
+        return false;
 
     if (m_virtual_surround_enabled) {
-        // Replace the graph in place: routed streams move directly from the old
-        // virtual sink to the new one. Tearing the module down first (the previous
-        // approach) briefly sent them to the physical device, which made the audio
-        // jump in level and caused players to pause.
+        // Only the effects graph is replaced. The sink applications are routed to
+        // stays alive, so their streams are never moved: no fallback to the physical
+        // device (loud) and no sink removal for WirePlumber to pause players over.
         if (m_pipewire_manager->replace_virtual_surround_module(path.toStdString(), m_upmix_enabled))
-            return;
+            return true;
 
-        // Fall back to a full rebuild when the in-place replacement failed
-        qWarning("rebuild_module: In-place replacement failed, rebuilding from scratch");
-        m_pipewire_manager->remove_virtual_surround_module();
-        if (!create_module()) {
-            m_virtual_surround_enabled = false;
-            Q_EMIT virtual_surround_enabled_changed();
-        }
-        return;
+        // Do not tear the device down on failure: that is exactly what causes the
+        // level jump and the player pause. Keep the previous graph running.
+        qWarning("rebuild_module: Effects graph replacement failed, keeping the previous graph");
+        return false;
     }
 
-    // Module survives a disable, keep it up to date without enabling routing
+    // Routing is off and nothing is linked to the bridge, so a full rebuild is safe
     m_pipewire_manager->remove_virtual_surround_module();
-    create_module();
+    return create_module();
 }
 
 bool FrontendManager::get_virtual_surround_enabled() const {
@@ -175,7 +196,13 @@ void FrontendManager::set_hrir_wav_file_name_index(int index) {
     m_config_settings.writeEntry("hrir_wav_file_path", m_hrir_wav_file_paths.value(index));
     m_config->sync();
 
-    run_switch([this]() { rebuild_module(); }, [this, previous_index]() { rollback_hrir_selection(previous_index); });
+    if (!rebuild_module()) {
+        // The previous graph is still running; keep the UI and config in sync with it
+        m_hrir_wav_file_name_index = previous_index;
+        m_config_settings.writeEntry("hrir_wav_file_path", m_hrir_wav_file_paths.value(previous_index));
+        m_config->sync();
+        Q_EMIT hrir_wav_file_name_index_changed();
+    }
 }
 
 void FrontendManager::load_hrir_wav_files() {
@@ -402,80 +429,12 @@ void FrontendManager::set_upmix_enabled(bool value) {
     // also applies the change to already routed streams). This must happen even
     // while disabled: the module survives a disable, and leaving it stale here
     // would resurrect the old upmix setting on the next enable.
-    run_switch([this]() { rebuild_module(); }, [this, previous_value]() { rollback_upmix_enabled(previous_value); });
-}
-
-void FrontendManager::run_switch(std::function<void()> apply, std::function<void()> cancel) {
-    // Nothing can be heard while the graph is off or nothing is playing
-    if (!m_virtual_surround_enabled || !m_pipewire_manager->is_audio_playing()) {
-        apply();
-        return;
+    if (!rebuild_module()) {
+        m_upmix_enabled = previous_value;
+        m_config_settings.writeEntry("upmix_enabled", m_upmix_enabled);
+        m_config->sync();
+        Q_EMIT upmix_enabled_changed();
     }
-
-    if (m_pipewire_manager->silence_routed_streams()) {
-        apply();
-        m_pipewire_manager->schedule_unsilence();
-        return;
-    }
-
-    // A stream that cannot be muted may come back loud, so this is the user's call
-    m_pipewire_manager->unsilence_streams();
-    m_pending_switch_apply = std::move(apply);
-    m_pending_switch_cancel = std::move(cancel);
-    m_switch_needs_confirm = true;
-    Q_EMIT switch_needs_confirm_changed();
-}
-
-bool FrontendManager::get_switch_needs_confirm() const {
-    return m_switch_needs_confirm;
-}
-
-void FrontendManager::resolve_switch_confirm(bool proceed) {
-    if (!m_switch_needs_confirm)
-        return;
-
-    m_switch_needs_confirm = false;
-    Q_EMIT switch_needs_confirm_changed();
-
-    std::function<void()> apply = std::move(m_pending_switch_apply);
-    std::function<void()> cancel = std::move(m_pending_switch_cancel);
-    m_pending_switch_apply = nullptr;
-    m_pending_switch_cancel = nullptr;
-
-    if (!proceed) {
-        if (cancel)
-            cancel();
-        return;
-    }
-
-    // Still worth trying: every stream that mutes now is one that cannot come back
-    // loud after the swap
-    m_pipewire_manager->silence_routed_streams();
-    if (apply)
-        apply();
-    m_pipewire_manager->schedule_unsilence();
-}
-
-void FrontendManager::rollback_upmix_enabled(bool value) {
-    if (m_upmix_enabled == value)
-        return;
-    m_upmix_enabled = value;
-
-    m_config_settings.writeEntry("upmix_enabled", m_upmix_enabled);
-    m_config->sync();
-
-    Q_EMIT upmix_enabled_changed();
-}
-
-void FrontendManager::rollback_hrir_selection(int index) {
-    if (m_hrir_wav_file_name_index == index)
-        return;
-    m_hrir_wav_file_name_index = index;
-
-    m_config_settings.writeEntry("hrir_wav_file_path", m_hrir_wav_file_paths.value(index));
-    m_config->sync();
-
-    Q_EMIT hrir_wav_file_name_index_changed();
 }
 
 bool FrontendManager::is_audio_playing() const {

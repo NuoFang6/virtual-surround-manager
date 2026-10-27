@@ -1,6 +1,7 @@
 #include "pipewire_manager.h"
 
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QList>
@@ -9,11 +10,8 @@
 #include <QtEndian>
 #include <algorithm>
 #include <array>
-#include <chrono>
+#include <cstdlib>
 #include <cstring>
-#include <spa/param/props.h>
-#include <spa/pod/builder.h>
-#include <spa/pod/iter.h>
 #include <string_view>
 #include <time.h>
 
@@ -46,7 +44,8 @@ static string json_escape(const string &value) {
 // HeSuvi-style HRIRs).
 //
 static bool parse_wav_format(const string &path, uint32_t &channels, uint32_t &rate,
-                             uint32_t &block_align, uint16_t &bits, uint32_t &frames) {
+                             uint32_t &block_align, uint16_t &bits, uint16_t &format_tag,
+                             uint32_t &frames) {
     QFile file(QString::fromStdString(path));
     if (!file.open(QIODevice::ReadOnly))
         return false;
@@ -58,7 +57,7 @@ static bool parse_wav_format(const string &path, uint32_t &channels, uint32_t &r
         return false;
 
     bool have_fmt = false;
-    uint16_t format_tag = 0;
+    format_tag = 0;
     size_t offset = 12;
     while (offset + 8 <= static_cast<size_t>(data.size())) {
         const char *id = data.constData() + offset;
@@ -71,9 +70,12 @@ static bool parse_wav_format(const string &path, uint32_t &channels, uint32_t &r
             rate = qFromLittleEndian<uint32_t>(body.constData() + 4);
             block_align = qFromLittleEndian<uint16_t>(body.constData() + 12);
             bits = qFromLittleEndian<uint16_t>(body.constData() + 14);
-            // WAVE_FORMAT_EXTENSIBLE: real bits per sample live in the extension
-            if (format_tag == 0xFFFE && size >= 40)
+            // WAVE_FORMAT_EXTENSIBLE: the real format and bits per sample live in
+            // the extension (the sub-format GUID starts with the plain format tag)
+            if (format_tag == 0xFFFE && size >= 40) {
                 bits = qFromLittleEndian<uint16_t>(body.constData() + 18);
+                format_tag = qFromLittleEndian<uint16_t>(body.constData() + 24);
+            }
             have_fmt = true;
         } else if (memcmp(id, "data", 4) == 0 && have_fmt) {
             if (block_align == 0 || channels == 0)
@@ -100,7 +102,8 @@ static bool parse_wav_format(const string &path, uint32_t &channels, uint32_t &r
 static bool write_lfe_bypass_delta(const string &hrir_path, const string &delta_path) {
     uint32_t channels = 0, rate = 0, block_align = 0, frames = 0;
     uint16_t bits = 0;
-    if (!parse_wav_format(hrir_path, channels, rate, block_align, bits, frames))
+    uint16_t format_tag = 0;
+    if (!parse_wav_format(hrir_path, channels, rate, block_align, bits, format_tag, frames))
         return false;
 
     // Keep a sane cap so a broken header cannot produce a huge file
@@ -118,9 +121,17 @@ static bool write_lfe_bypass_delta(const string &hrir_path, const string &delta_
     auto le32 = [](uint32_t v) { return QByteArray(reinterpret_cast<const char *>(&v), 4); };
     auto le16 = [](uint16_t v) { return QByteArray(reinterpret_cast<const char *>(&v), 2); };
 
+    // Same encoding as the source IR. Writing every file as IEEE float (the old
+    // behaviour) made 16/24-bit PCM HRIRs produce a delta whose header lied about
+    // its samples; PipeWire then failed to start the whole effects graph, leaving
+    // the output silent until the next switch.
+    const bool is_float = format_tag == 3;
+    if (is_float && bits != 32)
+        return false;
+
     QByteArray fmt;
-    fmt += le16(3);      // IEEE float
-    fmt += le16(1);      // mono
+    fmt += le16(format_tag); // 1 = PCM, 3 = IEEE float
+    fmt += le16(1);          // mono
     fmt += le32(rate);
     fmt += le32(rate * frame_size);
     fmt += le16(frame_size);
@@ -137,7 +148,7 @@ static bool write_lfe_bypass_delta(const string &hrir_path, const string &delta_
     header += le32(data_size);
 
     QByteArray samples(data_size, '\0');
-    if (bits == 32) {
+    if (is_float) {
         const float full_scale = 1.0f;
         memcpy(samples.data(), &full_scale, 4);
     } else if (bits == 16) {
@@ -146,6 +157,9 @@ static bool write_lfe_bypass_delta(const string &hrir_path, const string &delta_
     } else if (bits == 24) {
         const uint8_t full_scale[3] = {0xFF, 0xFF, 0x7F};
         memcpy(samples.data(), full_scale, 3);
+    } else if (bits == 32) {
+        const int32_t full_scale = INT32_MAX;
+        memcpy(samples.data(), &full_scale, 4);
     } else {
         return false;
     }
@@ -228,8 +242,14 @@ bool PipeWireManager::stream_follows_default(uint32_t id, const string &props_ta
         return true;
 
     const string sink = resolve_sink_name(target);
-    if (sink.empty())
-        return false;
+    if (sink.empty()) {
+        // The target matches no current node. That happens after a restart or a
+        // hard kill: WirePlumber restores a stream's old target serial, but the
+        // sink (e.g. a previous instance's virtual sink) is gone. The stream is
+        // not actually assigned to another device, and leaving it alone would keep
+        // it out of the virtual device forever, so treat it as following default.
+        return true;
+    }
     return sink == default_sink_name;
 }
 
@@ -292,7 +312,9 @@ int PipeWireManager::on_metadata_property(void *data,
 
     if (strcmp(key, PW_KEY_TARGET_OBJECT) != 0 && strcmp(key, "target.node") != 0)
         return 0;
-    if (subject == manager->playback_node_id)
+    // Our own bridge/effects nodes are internal; their target changes are not
+    // application routing decisions
+    if (manager->internal_playback_ids.contains(subject))
         return 0;
 
     // Ignore the echo of our own routing writes
@@ -307,19 +329,13 @@ int PipeWireManager::on_metadata_property(void *data,
         manager->metadata_targets[subject] = value;
 
     if (no_target && manager->routed_node_ids.contains(subject)) {
-        // Re-assert routing if a stream we virtualize had its target cleared.
-        // A full removal is always countered. Clears to "-1" are normally left alone
-        // (re-asserting on them could start a write battle with WirePlumber), but
-        // right after a graph replacement they are how WirePlumber drops the stream
-        // back onto the physical device - so pin them for a short window, rate limited.
-        const qint64 now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                  std::chrono::steady_clock::now().time_since_epoch())
-                                  .count();
-        const bool in_pin_window = no_target && value != nullptr && manager->pin_routes_until_ms > now_ms;
-        if ((value == nullptr || in_pin_window) && now_ms - manager->last_pin_ms.value(subject, 0) >= 250) {
-            manager->last_pin_ms[subject] = now_ms;
+        // Re-assert routing if a stream we virtualize had its target removed.
+        // Clears to "-1" are left alone: WirePlumber uses them to make a stream
+        // follow the default sink, and answering them starts a write battle. The
+        // bridge sink survives graph swaps, so they no longer occur mid-switch.
+        if (value == nullptr) {
             pw_metadata_set_property(manager->metadata, subject, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", manager->capture_node_name.c_str());
-            qDebug("on_metadata_property: Pinned node %u to sink '%s'", subject, manager->capture_node_name.c_str());
+            qDebug("on_metadata_property: Re-routed node %u to sink '%s' after target removal", subject, manager->capture_node_name.c_str());
         }
     } else if (!no_target && manager->routed_node_ids.contains(subject) &&
                strcmp(value, manager->capture_node_name.c_str()) != 0) {
@@ -384,7 +400,30 @@ void PipeWireManager::registry_event_global(void *data,
                 pw_metadata_set_property(manager->metadata, node_id, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", manager->capture_node_name.c_str());
                 qDebug("registry_event_global: Re-routed node %u to sink '%s' after metadata change", node_id, manager->capture_node_name.c_str());
             }
+            // The bridge's target metadata is just as volatile, but its node property
+            // still names the sink of the first generation. Without this the bridge
+            // would follow a stale target after a WirePlumber restart.
+            if (manager->bridge_playback_id != SPA_ID_INVALID && !manager->effects_capture_node_name.empty()) {
+                pw_metadata_set_property(manager->metadata, manager->bridge_playback_id, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", manager->effects_capture_node_name.c_str());
+                qDebug("registry_event_global: Re-linked bridge node %u to effects sink '%s'", manager->bridge_playback_id, manager->effects_capture_node_name.c_str());
+            }
         }
+    }
+
+    // Track links so a graph swap can wait until the bridge really feeds the new
+    // effects sink before the previous sink is removed
+    if (strcmp(type, PW_TYPE_INTERFACE_Link) == 0) {
+        const char *output = spa_dict_lookup(props, PW_KEY_LINK_OUTPUT_NODE);
+        const char *input = spa_dict_lookup(props, PW_KEY_LINK_INPUT_NODE);
+        if (output && input) {
+            manager->links.insert(id, LinkInfo{
+                                          static_cast<uint32_t>(std::strtoul(output, nullptr, 10)),
+                                          static_cast<uint32_t>(std::strtoul(input, nullptr, 10)),
+                                      });
+            if (manager->link_wait_active.load(std::memory_order_relaxed))
+                pw_thread_loop_signal(manager->thread_loop, false);
+        }
+        return;
     }
 
     // Check if object is a node
@@ -406,7 +445,17 @@ void PipeWireManager::registry_event_global(void *data,
     // Track output sinks to resolve stream targets to a device (excluding our own,
     // including sinks of previous graph generations that are still tearing down)
     if (strcmp(node_media_class, "Audio/Sink") == 0 || strcmp(node_media_class, "Audio/Duplex") == 0) {
-        if (node_name && strncmp(node_name, manager->capture_node_name_base, strlen(manager->capture_node_name_base)) != 0) {
+        const size_t base_len = strlen(manager->capture_node_name_base);
+        if (node_name && strncmp(node_name, manager->capture_node_name_base, base_len) == 0) {
+            // The app-facing bridge sink and the current effects sink are internal
+            manager->internal_capture_ids.insert(id);
+            if (strcmp(node_name, manager->capture_node_name_base) == 0)
+                manager->bridge_capture_id = id;
+            else if (node_name == manager->effects_capture_node_name)
+                manager->effects_capture_id = id;
+            if (manager->link_wait_active.load(std::memory_order_relaxed))
+                pw_thread_loop_signal(manager->thread_loop, false);
+        } else if (node_name) {
             const char *serial = spa_dict_lookup(props, PW_KEY_OBJECT_SERIAL);
             manager->sinks[id] = SinkInfo{node_name, serial ? serial : ""};
         }
@@ -419,7 +468,13 @@ void PipeWireManager::registry_event_global(void *data,
     if (node_media_role && strcmp(node_media_role, "Notification") == 0)
         return;
     if (node_name && strncmp(node_name, manager->playback_node_name_base, strlen(manager->playback_node_name_base)) == 0) {
-        manager->playback_node_id = id;
+        manager->internal_playback_ids.insert(id);
+        if (strcmp(node_name, manager->playback_node_name_base) == 0)
+            manager->bridge_playback_id = id;
+        else if (node_name == manager->effects_playback_node_name)
+            manager->effects_playback_id = id;
+        if (manager->link_wait_active.load(std::memory_order_relaxed))
+            pw_thread_loop_signal(manager->thread_loop, false);
         return;
     }
 
@@ -458,14 +513,25 @@ void PipeWireManager::registry_event_global_remove(void *data, uint32_t id) {
         manager->metadata_targets.clear();
     }
 
+    if (manager->links.remove(id) > 0 && manager->link_wait_active.load(std::memory_order_relaxed))
+        pw_thread_loop_signal(manager->thread_loop, false);
+
     manager->sinks.remove(id);
     manager->metadata_targets.remove(id);
     manager->routed_node_ids.remove(id);
     manager->decided_streams.remove(id);
+    manager->internal_playback_ids.remove(id);
+    manager->internal_capture_ids.remove(id);
 
-    // Do not let a stale ID suppress metadata handling of future nodes reusing it
-    if (manager->playback_node_id == id)
-        manager->playback_node_id = SPA_ID_INVALID;
+    // Do not let stale IDs suppress metadata handling of future nodes reusing them
+    if (manager->bridge_capture_id == id)
+        manager->bridge_capture_id = SPA_ID_INVALID;
+    if (manager->bridge_playback_id == id)
+        manager->bridge_playback_id = SPA_ID_INVALID;
+    if (manager->effects_capture_id == id)
+        manager->effects_capture_id = SPA_ID_INVALID;
+    if (manager->effects_playback_id == id)
+        manager->effects_playback_id = SPA_ID_INVALID;
 
     auto binding = manager->node_bindings.find(id);
     if (binding != manager->node_bindings.end()) {
@@ -489,10 +555,10 @@ void PipeWireManager::detach_binding_listener(NodeBinding *binding) {
     binding->listener_attached = false;
 }
 
-string PipeWireManager::build_module_args(const string &hrir_wav_path, bool upmix_enabled,
-                                          const string &capture_name, const string &playback_name) {
+string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, bool upmix_enabled,
+                                                  const string &capture_name, const string &playback_name) {
     if (hrir_wav_path.empty()) {
-        qWarning("build_module_args: No HRIR file provided");
+        qWarning("build_effects_module_args: No HRIR file provided");
         return {};
     }
 
@@ -769,47 +835,54 @@ bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path
         Q_EMIT error_occurred(QStringLiteral("Failed connecting to PipeWire audio service."));
         return false;
     }
-    if (module) {
-        qInfo("create_virtual_surround_module: Virtual surround module already exists");
+    if (bridge_module) {
+        qInfo("create_virtual_surround_module: Virtual surround device already exists");
         return true;
     }
 
-    // Generation 0 keeps the plain names so streams routed by a previous instance
-    // of this application are picked up again
     capture_node_name = capture_node_name_base;
-    playback_node_name = playback_node_name_base;
-    module_generation = 0;
+    effects_generation = 0;
 
-    qInfo("create_virtual_surround_module: Creating module with WAV path '%s', upmixing %s",
+    qInfo("create_virtual_surround_module: Creating device with WAV path '%s', upmixing %s",
           hrir_wav_path.c_str(), upmix_enabled ? "enabled" : "disabled");
-
-    const string args = build_module_args(hrir_wav_path, upmix_enabled, capture_node_name, playback_node_name);
-    if (args.empty())
-        return false;
 
     pw_thread_loop_lock(thread_loop);
 
-    module = pw_context_load_module(
-        context,
-        "libpipewire-module-filter-chain",
-        args.c_str(),
-        nullptr);
-    if (!module) {
+    pw_impl_module *new_effects = load_effects_module_locked(hrir_wav_path, upmix_enabled);
+    if (!new_effects) {
+        effects_capture_node_name.clear();
+        effects_playback_node_name.clear();
         pw_thread_loop_unlock(thread_loop);
-        qWarning("create_virtual_surround_module: Failed to load module into PipeWire context");
         Q_EMIT error_occurred(QStringLiteral("Error creating virtual surround device."));
         return false;
     }
 
+    // The bridge names the effects sink as its target, so let the server register
+    // the effects nodes first
+    sync_with_core(1);
+
+    if (!load_bridge_module_locked()) {
+        pw_impl_module_destroy(new_effects);
+        sync_with_core(1);
+        effects_capture_node_name.clear();
+        effects_playback_node_name.clear();
+        pw_thread_loop_unlock(thread_loop);
+        qWarning("create_virtual_surround_module: Failed to load the bridge module");
+        Q_EMIT error_occurred(QStringLiteral("Error creating virtual surround device."));
+        return false;
+    }
+
+    effects_module = new_effects;
+    sync_with_core(1);
     pw_thread_loop_unlock(thread_loop);
 
-    qInfo("create_virtual_surround_module: Successfully created module");
+    qInfo("create_virtual_surround_module: Successfully created device");
 
     return true;
 }
 
 bool PipeWireManager::replace_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled) {
-    if (!module)
+    if (!bridge_module)
         return create_virtual_surround_module(hrir_wav_path, upmix_enabled);
 
     if (!is_valid()) {
@@ -817,286 +890,326 @@ bool PipeWireManager::replace_virtual_surround_module(const string &hrir_wav_pat
         return false;
     }
 
-    // Fresh names so the new module can coexist with the running one
-    const string new_generation = std::to_string(module_generation + 1);
-    const string new_capture_name = string(capture_node_name_base) + "." + new_generation;
-    const string new_playback_name = string(playback_node_name_base) + "." + new_generation;
+    if (!is_registry_listener_added || !metadata) {
+        // Only called while routing is enabled; without the registry listener the
+        // internal node IDs are unknown and the bridge cannot be re-targeted
+        qWarning("replace_virtual_surround_module: Routing is not enabled");
+        return false;
+    }
 
-    qInfo("replace_virtual_surround_module: Replacing graph with WAV path '%s', upmixing %s",
+    qInfo("replace_virtual_surround_module: Replacing effects graph with WAV path '%s', upmixing %s",
           hrir_wav_path.c_str(), upmix_enabled ? "enabled" : "disabled");
 
-    const string args = build_module_args(hrir_wav_path, upmix_enabled, new_capture_name, new_playback_name);
-    if (args.empty())
-        return false; // Keep the old graph playing with the previous settings
+    QElapsedTimer switch_timer;
+    switch_timer.start();
 
     pw_thread_loop_lock(thread_loop);
+
+    // Pick up node globals that arrived since the last iteration
+    sync_with_core(1);
+
+    const string old_capture_name = effects_capture_node_name;
+    const string old_playback_name = effects_playback_node_name;
+    const uint32_t old_capture_id = effects_capture_id;
+    const uint32_t old_playback_id = effects_playback_id;
+    const uint32_t old_generation = effects_generation;
+
+    if (bridge_playback_id == SPA_ID_INVALID || old_capture_id == SPA_ID_INVALID) {
+        pw_thread_loop_unlock(thread_loop);
+        qWarning("replace_virtual_surround_module: Bridge or effects nodes are not known yet");
+        Q_EMIT error_occurred(QStringLiteral("The virtual surround device is not ready yet. Please try again."));
+        return false;
+    }
+
+    pw_impl_module *new_effects = load_effects_module_locked(hrir_wav_path, upmix_enabled);
+    if (!new_effects) {
+        effects_capture_node_name = old_capture_name;
+        effects_playback_node_name = old_playback_name;
+        effects_capture_id = old_capture_id;
+        effects_playback_id = old_playback_id;
+        effects_generation = old_generation;
+        pw_thread_loop_unlock(thread_loop);
+        qWarning("replace_virtual_surround_module: Failed to load the new effects module, keeping the old one");
+        return false;
+    }
+
+    // The filter-chain module registers its nodes through its own client connection,
+    // so they are not covered by our core sync. Wait for the new sink (and its
+    // playback node) to show up in the registry before pointing the bridge at it.
+    const bool sink_ready = wait_for([this]() { return effects_capture_id != SPA_ID_INVALID; }, 1000);
+    if (sink_ready)
+        wait_for([this]() { return effects_playback_id != SPA_ID_INVALID; }, 500);
+    qDebug("replace_virtual_surround_module: New effects sink '%s' id %u, playback id %u",
+           effects_capture_node_name.c_str(), effects_capture_id, effects_playback_id);
+
+    // Give the new effects output a device link first, so it is already processing
+    // when the audio arrives. A graph without a device link would consume nothing
+    // and come out silent until the next switch, so this is worth waiting for.
+    bool playback_linked = false;
+    if (effects_playback_id != SPA_ID_INVALID)
+        playback_linked = wait_for([this]() { return has_outgoing_link(effects_playback_id); }, 600);
+    qDebug("replace_virtual_surround_module: New effects playback node link: %d", playback_linked);
+
+    const uint32_t new_capture_id = effects_capture_id;
+    bool linked = false;
+
+    if (new_capture_id != SPA_ID_INVALID) {
+        // Re-target the bridge playback stream: the application streams stay linked
+        // to the bridge sink, so they never touch the physical device and no sink
+        // they are linked to is removed (which is what makes WirePlumber pause
+        // MPRIS players and what made the output jump in level).
+        // Retry the write once in case WirePlumber had not picked up the new sink yet.
+        for (int attempt = 0; attempt < 2 && !linked; ++attempt) {
+            pw_metadata_set_property(metadata, bridge_playback_id, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", effects_capture_node_name.c_str());
+            qDebug("replace_virtual_surround_module: Bridge node %u re-targeted to effects sink '%s' (attempt %d)",
+                   bridge_playback_id, effects_capture_node_name.c_str(), attempt + 1);
+            sync_with_core(1);
+            linked = wait_for([this, new_capture_id]() { return has_link(bridge_playback_id, new_capture_id); }, 600);
+        }
+    }
+
+    if (!linked) {
+        qWarning("replace_virtual_surround_module: New effects sink was not linked in time (sink id %u)", new_capture_id);
+
+        // Put the bridge back on the old sink before discarding the new graph. If
+        // that is confirmed, the old graph keeps playing and the setting is reverted.
+        bool restored = false;
+        if (old_capture_id != SPA_ID_INVALID && !old_capture_name.empty()) {
+            pw_metadata_set_property(metadata, bridge_playback_id, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", old_capture_name.c_str());
+            sync_with_core(1);
+            restored = wait_for([this, old_capture_id]() { return has_link(bridge_playback_id, old_capture_id); }, 500);
+        }
+
+        if (restored) {
+            pw_impl_module_destroy(new_effects);
+            sync_with_core(1);
+            effects_capture_node_name = old_capture_name;
+            effects_playback_node_name = old_playback_name;
+            effects_capture_id = old_capture_id;
+            effects_playback_id = old_playback_id;
+            effects_generation = old_generation;
+            pw_thread_loop_unlock(thread_loop);
+            Q_EMIT error_occurred(QStringLiteral("Could not switch the virtual surround profile. The previous one is still active."));
+            return false;
+        }
+
+        // Neither confirmed: keep the new graph alive rather than leaving the bridge
+        // without a target, and point the bridge at it once more
+        qWarning("replace_virtual_surround_module: Could not restore the old sink, keeping the new graph");
+        if (new_capture_id != SPA_ID_INVALID)
+            pw_metadata_set_property(metadata, bridge_playback_id, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", effects_capture_node_name.c_str());
+    }
+
+    qDebug("replace_virtual_surround_module: After bridge move, effects playback link: %d, bridge link: %d",
+           has_outgoing_link(effects_playback_id), has_link(bridge_playback_id, new_capture_id));
+
+    pw_impl_module *old_effects = effects_module;
+    effects_module = new_effects;
+    sync_with_core(1);
+
+    pw_thread_loop_unlock(thread_loop);
+
+    // The old sink stays around briefly: WirePlumber updates its link bookkeeping
+    // asynchronously, and removing a sink it still considers linked would pause
+    // MPRIS media players. By now it has no input link anymore, so it is silent.
+    schedule_effects_destroy(old_effects);
+
+    qInfo("replace_virtual_surround_module: Successfully replaced effects graph in %lld ms",
+          static_cast<long long>(switch_timer.elapsed()));
+
+    return true;
+}
+
+void PipeWireManager::schedule_effects_destroy(pw_impl_module *old_module) {
+    if (!old_module || !thread_loop)
+        return;
+
+    pending_effects_destroy.append(old_module);
+
+    QTimer::singleShot(250, this, [this, old_module]() {
+        // The shutdown path or a following replace may have collected it already
+        if (!pending_effects_destroy.removeOne(old_module) || !thread_loop)
+            return;
+
+        pw_thread_loop_lock(thread_loop);
+        pw_impl_module_destroy(old_module);
+        sync_with_core(1);
+        pw_thread_loop_unlock(thread_loop);
+
+        qDebug("schedule_effects_destroy: Destroyed replaced effects graph");
+    });
+}
+
+void PipeWireManager::destroy_pending_effects_locked() {
+    for (pw_impl_module *m : std::as_const(pending_effects_destroy))
+        pw_impl_module_destroy(m);
+    pending_effects_destroy.clear();
+}
+
+pw_impl_module *PipeWireManager::load_effects_module_locked(const string &hrir_wav_path, bool upmix_enabled) {
+    const uint32_t new_generation = effects_generation + 1;
+    const string generation = std::to_string(new_generation);
+    const string capture_name = string(capture_node_name_base) + ".effects." + generation;
+    const string playback_name = string(playback_node_name_base) + ".effects." + generation;
+
+    const string args = build_effects_module_args(hrir_wav_path, upmix_enabled, capture_name, playback_name);
+    if (args.empty())
+        return nullptr;
+
+    // Registry callbacks compare against the member names; switch them before the
+    // module's nodes are announced
+    effects_capture_node_name = capture_name;
+    effects_playback_node_name = playback_name;
+    effects_capture_id = SPA_ID_INVALID;
+    effects_playback_id = SPA_ID_INVALID;
 
     pw_impl_module *new_module = pw_context_load_module(context,
                                                         "libpipewire-module-filter-chain",
                                                         args.c_str(),
                                                         nullptr);
     if (!new_module) {
-        pw_thread_loop_unlock(thread_loop);
-        qWarning("replace_virtual_surround_module: Failed to load the new module, keeping the old one");
-        Q_EMIT error_occurred(QStringLiteral("Error creating virtual surround device."));
-        return false;
+        qWarning("load_effects_module_locked: Failed to load module into PipeWire context");
+        return nullptr;
     }
 
-    // Move every routed stream from the old sink to the new one before the old sink
-    // disappears. Streams only ever move between two virtual sinks here - with the
-    // old code they briefly fell back to the physical output device (unattenuated,
-    // different volume) which caused an audible level jump and made players pause.
-    // While the swap settles, pin the target back if WirePlumber clears it ("-1"),
-    // which is how it would drop the stream onto the physical device.
-    pin_routes_until_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                              std::chrono::steady_clock::now().time_since_epoch()).count()
-        + 6000;
-    if (is_registry_listener_added && metadata) {
-        for (const uint32_t id : routed_node_ids) {
-            pw_metadata_set_property(metadata, id, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", new_capture_name.c_str());
-            qDebug("replace_virtual_surround_module: Node %u re-targeted to sink '%s'", id, new_capture_name.c_str());
-        }
-        // Let the server complete the re-links before the old module is torn down
-        sync_with_core(2);
-    }
-
-    // Event handlers compare against the member names, so switch them over before
-    // the old module's nodes produce their removal events
-    capture_node_name = new_capture_name;
-    playback_node_name = new_playback_name;
-    module_generation += 1;
-
-    pw_impl_module *old_module = module;
-    module = new_module;
-
-    // Also sweep up any module whose deferred teardown has not run yet, so that
-    // repeated quick switches do not stack up
-    destroy_pending_modules_locked();
-    sync_with_core(2);
-
-    pw_thread_loop_unlock(thread_loop);
-
-    // The re-target writes above only become effective once WirePlumber has
-    // re-linked the streams, which happens asynchronously. Destroying the previous
-    // graph right away drops the streams onto the physical device for a moment:
-    // audible as a loud level jump (no graph attenuation, different device volume)
-    // and enough to make media players pause.
-    schedule_module_destroy(old_module);
-
-    qInfo("replace_virtual_surround_module: Successfully replaced module");
-
-    return true;
+    effects_generation = new_generation;
+    return new_module;
 }
 
-void PipeWireManager::schedule_module_destroy(pw_impl_module *old_module) {
-    if (!old_module || !thread_loop)
-        return;
-
-    pending_destroy.append(old_module);
-
-    QTimer::singleShot(1200, this, [this, old_module]() {
-        // The shutdown path or a following replace may have collected it already
-        if (!pending_destroy.removeOne(old_module) || !thread_loop)
-            return;
-
-        pw_thread_loop_lock(thread_loop);
-
-        // Safety net: if WirePlumber dropped a stream elsewhere while the graphs were
-        // swapped (e.g. onto the physical device, or cleared its target so it follows
-        // the default sink again), pull it back to the current graph
-        if (metadata) {
-            for (const uint32_t id : std::as_const(routed_node_ids)) {
-                const string target = metadata_targets.value(id, string());
-                if (target != capture_node_name) {
-                    qInfo("schedule_module_destroy: Node %u target is '%s', pinning back to graph", id,
-                          target.empty() ? "(default)" : target.c_str());
-                    pw_metadata_set_property(metadata, id, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", capture_node_name.c_str());
-                }
-            }
-        }
-
-        pw_impl_module_destroy(old_module);
-        sync_with_core(2);
-        pw_thread_loop_unlock(thread_loop);
-
-        qInfo("schedule_module_destroy: Destroyed replaced module");
-    });
-}
-
-void PipeWireManager::destroy_pending_modules_locked() {
-    for (pw_impl_module *m : std::as_const(pending_destroy))
-        pw_impl_module_destroy(m);
-    pending_destroy.clear();
-}
-
-void PipeWireManager::write_stream_mute(struct pw_node *node, bool mute) {
-    if (!node)
-        return;
-
-    uint8_t buffer[512];
-    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
-    // The value type comes from the vararg protocol as a *string* tag ("b" for bool),
-    // not as a SPA_TYPE_* id - passing the id here walks garbage and crashes
-    const struct spa_pod *pod = reinterpret_cast<const struct spa_pod *>(
-        spa_pod_builder_add_object(&b,
-                                   SPA_TYPE_OBJECT_Props, SPA_PARAM_Props,
-                                   SPA_POD_Prop(SPA_PROP_mute, SPA_POD_Bool(mute))));
-
-    pw_node_set_param(node, SPA_PARAM_Props, 0, pod);
-}
-
-void PipeWireManager::release_stream_proxy(uint32_t id) {
-    auto it = silenced_streams.find(id);
-    if (it == silenced_streams.end())
-        return;
-    StreamSilence *state = it.value();
-    if (state->proxy) {
-        spa_hook_remove(&state->listener);
-        pw_proxy_destroy(state->proxy);
-    }
-    delete state;
-    silenced_streams.erase(it);
-}
-
-void PipeWireManager::on_stream_param(void *data, int seq, uint32_t id,
-                                      [[maybe_unused]] uint32_t index, uint32_t next,
-                                      const struct spa_pod *param) {
-    PipeWireManager *manager = static_cast<PipeWireManager *>(data);
-
-    for (StreamSilence *state : manager->silenced_streams) {
-        // Only one read is in flight, so any Props answer belongs to it
-        if (!state->awaiting || id != SPA_PARAM_Props)
-            continue;
-
-        // A null pod or a non-object one is a removal notification: an answer too,
-        // it just carries no mute value (and must not be walked as a pod object)
-        if (param != nullptr && SPA_POD_TYPE(param) == SPA_TYPE_Object) {
-            const struct spa_pod_prop *prop =
-                spa_pod_object_find_prop(reinterpret_cast<const struct spa_pod_object *>(param), nullptr, SPA_PROP_mute);
-            if (prop && spa_pod_get_bool(&prop->value, &state->reported_mute) == 0)
-                state->has_report = true;
-        }
-
-        if (next == SPA_ID_INVALID)
-            state->awaiting = false;
-        break;
-    }
-
-    qDebug("on_stream_param: node event seq=%d id=%u next=%u", seq, id, next);
-}
-
-bool PipeWireManager::read_stream_mute(StreamSilence *state, int timeout_ms) {
-    state->awaiting = true;
-    state->has_report = false;
-    state->reported_mute = false;
-
-    // The reply is not identified by the sequence number (the server reports its own),
-    // so exactly one read may be in flight and its answer is the next Props event
-    pw_node_enum_params(state->node, 0, SPA_PARAM_Props, 0, SPA_ID_INVALID, nullptr);
-
-    struct timespec abstime;
-    clock_gettime(CLOCK_REALTIME, &abstime);
-    abstime.tv_sec += timeout_ms / 1000;
-    abstime.tv_nsec += static_cast<long>(timeout_ms % 1000) * 1000 * 1000;
-    if (abstime.tv_nsec >= 1000000000) {
-        abstime.tv_sec += 1;
-        abstime.tv_nsec -= 1000000000;
-    }
-    // Waiting releases the lock, so the PipeWire thread can still deliver the reply
-    while (state->awaiting && pw_thread_loop_timed_wait_full(thread_loop, &abstime) == 0)
-        ;
-    state->awaiting = false;
-
-    return state->has_report;
-}
-
-bool PipeWireManager::silence_routed_streams() {
-    if (!thread_loop || !registry)
+bool PipeWireManager::load_bridge_module_locked() {
+    const string args = build_bridge_module_args(effects_capture_node_name);
+    if (args.empty())
         return false;
 
-    const QList<uint32_t> ids = routed_node_ids.values();
-    if (ids.isEmpty())
+    bridge_module = pw_context_load_module(context,
+                                          "libpipewire-module-filter-chain",
+                                          args.c_str(),
+                                          nullptr);
+    return bridge_module != nullptr;
+}
+
+string PipeWireManager::build_bridge_module_args(const string &effects_sink_name) {
+    // A plain 8-channel pass-through. The capture side is the stable sink that
+    // applications are routed to; the playback side feeds the current effects
+    // sink. Keeping this module alive across profile switches is what makes the
+    // switch inaudible to applications: their stream never moves, and the sink
+    // they target never disappears.
+    const string capture_props = R"(
+{
+    node.name = )" + string(capture_node_name_base) + R"(
+    node.description = "Virtual Surround Manager"
+    media.class = "Audio/Sink"
+    node.latency = "1024/48000"
+    audio.rate = 48000
+    audio.channels = 8
+    audio.position = [ FL FR FC LFE RL RR SL SR ]
+}
+        )";
+
+    // node.linger + node.dont-fallback: when the named effects sink is momentarily
+    // absent (e.g. during a WirePlumber restart) the bridge waits instead of
+    // following the default device. A fallback would put unattenuated 7.1 on the
+    // physical output, which is the loud jump this design exists to prevent.
+    const string playback_props = R"(
+{
+    node.name = )" + string(playback_node_name_base) + R"(
+    node.passive = true
+    node.latency = "1024/48000"
+    node.dont-fallback = true
+    node.linger = true
+    audio.rate = 48000
+    audio.channels = 8
+    audio.position = [ FL FR FC LFE RL RR SL SR ]
+    target.object = ")" + json_escape(effects_sink_name) + R"("
+}
+        )";
+
+    const string filter_graph = R"(
+{
+    nodes = [
+        { type = builtin label = copy name = copyFL }
+        { type = builtin label = copy name = copyFR }
+        { type = builtin label = copy name = copyFC }
+        { type = builtin label = copy name = copyLFE }
+        { type = builtin label = copy name = copyRL }
+        { type = builtin label = copy name = copyRR }
+        { type = builtin label = copy name = copySL }
+        { type = builtin label = copy name = copySR }
+    ]
+    links = [ ]
+    inputs  = [ "copyFL:In" "copyFR:In" "copyFC:In" "copyLFE:In" "copyRL:In" "copyRR:In" "copySL:In" "copySR:In" ]
+    outputs = [ "copyFL:Out" "copyFR:Out" "copyFC:Out" "copyLFE:Out" "copyRL:Out" "copyRR:Out" "copySL:Out" "copySR:Out" ]
+}
+        )";
+
+    return R"(
+{
+    node.description = "Virtual Surround Manager"
+    media.name = "Virtual Surround Manager"
+    filter.graph = )" +
+        filter_graph + R"(,
+    capture.props = )" + capture_props + R"(,
+    playback.props = )" + playback_props + R"(
+}
+        )";
+}
+
+bool PipeWireManager::has_link(uint32_t output_node, uint32_t input_node) const {
+    for (const LinkInfo &link : links) {
+        if (link.output_node == output_node && link.input_node == input_node)
+            return true;
+    }
+    return false;
+}
+
+bool PipeWireManager::has_outgoing_link(uint32_t output_node) const {
+    for (const LinkInfo &link : links) {
+        if (link.output_node == output_node)
+            return true;
+    }
+    return false;
+}
+
+bool PipeWireManager::has_input_link(uint32_t input_node) const {
+    for (const LinkInfo &link : links) {
+        if (link.input_node == input_node)
+            return true;
+    }
+    return false;
+}
+
+bool PipeWireManager::wait_for(const std::function<bool()> &predicate, int timeout_ms) {
+    if (predicate())
         return true;
-
-    bool all_silenced = true;
-
-    pw_thread_loop_lock(thread_loop);
-    for (const uint32_t id : ids) {
-        if (silenced_streams.contains(id))
-            continue;
-
-        StreamSilence *state = new StreamSilence();
-        state->proxy = reinterpret_cast<pw_proxy *>(
-            pw_registry_bind(registry, id, PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, 0));
-        if (!state->proxy) {
-            qWarning("silence_routed_streams: Cannot bind stream node %u", id);
-            delete state;
-            all_silenced = false;
-            continue;
-        }
-        state->node = reinterpret_cast<pw_node *>(state->proxy);
-        spa_zero(state->listener);
-        pw_node_add_listener(state->node, &state->listener, &stream_silence_events, this);
-        silenced_streams.insert(id, state);
-
-        // Remember what the user had set, so it is restored exactly afterwards
-        if (!read_stream_mute(state, 300)) {
-            qWarning("silence_routed_streams: Stream node %u does not report its mute state", id);
-            all_silenced = false;
-            continue;
-        }
-        if (state->reported_mute) {
-            // Silent already: nothing to write here and nothing to restore later
-            continue;
-        }
-
-        write_stream_mute(state->node, true);
-        state->muted_by_us = true;
-
-        // Believe the mute only once the client confirms it. A stream that ignores the
-        // property would still land on the device at full level when the graph swaps,
-        // which is exactly what this is supposed to prevent.
-        if (!read_stream_mute(state, 300) || !state->reported_mute) {
-            qWarning("silence_routed_streams: Stream node %u did not confirm the mute", id);
-            all_silenced = false;
-        }
-    }
-    pw_thread_loop_unlock(thread_loop);
-
-    if (!silenced_streams.isEmpty())
-        qInfo("silence_routed_streams: Silenced %d stream(s) for the graph swap", silenced_streams.size());
-
-    return all_silenced;
-}
-
-void PipeWireManager::schedule_unsilence() {
-    if (!unsilence_timer) {
-        unsilence_timer = new QTimer(this);
-        unsilence_timer->setSingleShot(true);
-        connect(unsilence_timer, &QTimer::timeout, this, &PipeWireManager::unsilence_streams);
-    }
-    // Covers the deferred teardown of the replaced graph plus settling time
-    unsilence_timer->start(1800);
-}
-
-void PipeWireManager::unsilence_streams() {
     if (!thread_loop)
-        return;
-    pw_thread_loop_lock(thread_loop);
-    unsilence_streams_now();
-    pw_thread_loop_unlock(thread_loop);
-}
+        return false;
 
-void PipeWireManager::unsilence_streams_now() {
-    for (StreamSilence *state : std::as_const(silenced_streams)) {
-        if (state->muted_by_us && state->node)
-            write_stream_mute(state->node, false);
+    link_wait_active.store(true, std::memory_order_relaxed);
+    QElapsedTimer elapsed;
+    elapsed.start();
+    bool satisfied = false;
+
+    // Wait in slices so registry events are dispatched even if no explicit signal
+    // arrives (the link/global callbacks signal the loop, but a missed wakeup must
+    // not turn into a full-timeout stall)
+    while (!(satisfied = predicate())) {
+        const int remaining = timeout_ms - static_cast<int>(elapsed.elapsed());
+        if (remaining <= 0)
+            break;
+
+        struct timespec abstime;
+        clock_gettime(CLOCK_REALTIME, &abstime);
+        const int slice = std::min(remaining, 50);
+        abstime.tv_nsec += static_cast<long>(slice) * 1000 * 1000;
+        if (abstime.tv_nsec >= 1000000000) {
+            abstime.tv_sec += 1;
+            abstime.tv_nsec -= 1000000000;
+        }
+        pw_thread_loop_timed_wait_full(thread_loop, &abstime);
     }
-    const QList<uint32_t> ids = silenced_streams.keys();
-    for (const uint32_t id : ids)
-        release_stream_proxy(id);
-    if (!ids.isEmpty())
-        qInfo("unsilence_streams_now: Restored %d stream(s)", ids.size());
+
+    link_wait_active.store(false, std::memory_order_relaxed);
+    return satisfied;
 }
 
 bool PipeWireManager::is_audio_playing() const {
@@ -1118,14 +1231,32 @@ void PipeWireManager::remove_virtual_surround_module() {
 
     pw_thread_loop_lock(thread_loop);
 
-    if (module) {
-        pw_impl_module_destroy(module);
-        module = nullptr;
+    // Removing a sink while streams are still linked to it makes WirePlumber pause
+    // their MPRIS players. Callers clear the routing first; give WirePlumber a
+    // moment to actually move the streams before the bridge sink disappears.
+    if (is_registry_listener_added && bridge_capture_id != SPA_ID_INVALID)
+        wait_for([this]() { return !has_input_link(bridge_capture_id); }, 500);
+
+    if (bridge_module) {
+        pw_impl_module_destroy(bridge_module);
+        bridge_module = nullptr;
+    }
+    if (effects_module) {
+        pw_impl_module_destroy(effects_module);
+        effects_module = nullptr;
     }
     // Any graph whose teardown was deferred must also go away now
-    destroy_pending_modules_locked();
-    // The playback node disappears with the module; do not keep its now stale ID
-    playback_node_id = SPA_ID_INVALID;
+    destroy_pending_effects_locked();
+
+    bridge_capture_id = SPA_ID_INVALID;
+    bridge_playback_id = SPA_ID_INVALID;
+    effects_capture_id = SPA_ID_INVALID;
+    effects_playback_id = SPA_ID_INVALID;
+    internal_playback_ids.clear();
+    internal_capture_ids.clear();
+    effects_capture_node_name.clear();
+    effects_playback_node_name.clear();
+    effects_generation = 0;
     audio_playing.store(false, std::memory_order_relaxed);
 
     // Wait until the server has actually destroyed the module's nodes,
@@ -1134,7 +1265,7 @@ void PipeWireManager::remove_virtual_surround_module() {
 
     pw_thread_loop_unlock(thread_loop);
 
-    qInfo("Removed virtual surround module");
+    qInfo("Removed virtual surround device");
 }
 
 void PipeWireManager::enable_routing() {
@@ -1170,10 +1301,14 @@ void PipeWireManager::disable_routing() {
 
     pw_thread_loop_lock(thread_loop);
 
-    spa_hook_remove(&registry_listener);
+    // Take the streams out of the routed set *before* clearing their target. The
+    // metadata listener below re-routes a routed stream whose target is removed,
+    // which would otherwise undo this very write and keep the stream on the bridge
+    // sink until it is destroyed (WirePlumber then pauses MPRIS players).
+    const QList<uint32_t> cleared_ids = routed_node_ids.values();
+    routed_node_ids.clear();
 
-    // Iterate over all nodes with our node name set as target.object, then disconnect them from the filter chain
-    for (uint32_t id : routed_node_ids) {
+    for (uint32_t id : cleared_ids) {
         qDebug("disable_routing: clearing target.object for node %u", id);
         if (metadata) {
             // Remove the target object property from the node
@@ -1184,7 +1319,16 @@ void PipeWireManager::disable_routing() {
         }
     }
 
-    routed_node_ids.clear();
+    // Keep the registry listener alive until WirePlumber has moved the streams off
+    // the bridge sink. Removing the sink while they are still linked makes
+    // WirePlumber pause their MPRIS players.
+    if (bridge_capture_id != SPA_ID_INVALID) {
+        sync_with_core(1);
+        if (!wait_for([this]() { return !has_input_link(bridge_capture_id); }, 500))
+            qWarning("disable_routing: Streams did not leave the bridge sink in time");
+    }
+
+    spa_hook_remove(&registry_listener);
 
     for (auto it = node_bindings.begin(); it != node_bindings.end(); ++it)
         destroy_binding(it.value());
@@ -1192,6 +1336,13 @@ void PipeWireManager::disable_routing() {
     metadata_targets.clear();
     sinks.clear();
     decided_streams.clear();
+    links.clear();
+    internal_playback_ids.clear();
+    internal_capture_ids.clear();
+    bridge_capture_id = SPA_ID_INVALID;
+    bridge_playback_id = SPA_ID_INVALID;
+    effects_capture_id = SPA_ID_INVALID;
+    effects_playback_id = SPA_ID_INVALID;
     audio_playing.store(false, std::memory_order_relaxed);
 
     // The registry is re-created on the next enable_routing()
@@ -1317,13 +1468,13 @@ PipeWireManager::PipeWireManager() {
 }
 
 PipeWireManager::~PipeWireManager() {
+    // Release the routed streams first (disable_routing waits until they have left
+    // the bridge sink), then tear the device down
     disable_routing();
+    remove_virtual_surround_module();
 
     if (thread_loop) {
         pw_thread_loop_lock(thread_loop);
-
-        // Never leave routed streams muted when this connection goes away
-        unsilence_streams_now();
 
         // Destroy the metadata proxy while holding the lock: its listener can
         // still be dispatched on the PipeWire thread until the loop is stopped
@@ -1332,9 +1483,6 @@ PipeWireManager::~PipeWireManager() {
             pw_proxy_destroy((pw_proxy *)metadata);
             metadata = nullptr;
         }
-
-        // No deferred teardown survives the connection: destroy replaced graphs now
-        destroy_pending_modules_locked();
 
         // Make sure the server has processed the target clears above before the
         // connection goes away

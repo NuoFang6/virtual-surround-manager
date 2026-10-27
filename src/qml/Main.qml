@@ -61,39 +61,6 @@ Kirigami.ApplicationWindow {
         ]
     }
 
-    Connections {
-        target: frontendManager
-        function onSwitchNeedsConfirmChanged() {
-            if (frontendManager.switchNeedsConfirm) {
-                switchConfirmDialog.open();
-            }
-        }
-    }
-
-    Kirigami.PromptDialog {
-        id: switchConfirmDialog
-        title: i18nc("@title:dialog", "Audio is playing")
-        subtitle: i18nc("@info:dialog", "The playing audio could not be muted in advance, so switching now may become noticeably louder for a moment. Some applications also have to be set back to the Virtual Surround device by hand afterwards. Switch anyway?")
-        standardButtons: Controls.Dialog.NoButton
-        customFooterActions: [
-            Kirigami.Action {
-                text: i18nc("@action:button", "Cancel")
-                onTriggered: {
-                    frontendManager.resolve_switch_confirm(false);
-                    switchConfirmDialog.close();
-                }
-            },
-            Kirigami.Action {
-                text: i18nc("@action:button", "Switch anyway")
-                icon.name: "dialog-warning-symbolic"
-                onTriggered: {
-                    frontendManager.resolve_switch_confirm(true);
-                    switchConfirmDialog.close();
-                }
-            }
-        ]
-    }
-
     Kirigami.PromptDialog {
         id: quitConfirmDialog
         title: i18nc("@title:dialog", "Audio is playing")
@@ -221,9 +188,8 @@ Kirigami.ApplicationWindow {
                         Connections {
                             target: frontendManager
                             function onHrirWavFileNameIndexChanged() {
-                                // The click above replaced this binding with a plain value, so
-                                // re-create it on every change - a switch the user refused has to
-                                // drop the new highlight again
+                                // Clicking replaces this binding with a plain value, so re-create
+                                // it on every change to keep tray-driven switches highlighted
                                 profileDelegate.checked = Qt.binding(function () {
                                     return profileDelegate.index === frontendManager.hrirWavFileNameIndex;
                                 })

@@ -8,6 +8,7 @@
 #include <QTimer>
 #include <array>
 #include <atomic>
+#include <functional>
 #include <pipewire/extensions/metadata.h>
 #include <pipewire/impl-module.h>
 #include <pipewire/pipewire.h>
@@ -31,8 +32,9 @@ class PipeWireManager : public QObject {
     bool is_valid() const;
 
     //
-    // Creates a new 7.1 virtual surround module. Does nothing if a module already exists.
-    // Call this before enable_routing().
+    // Creates the virtual surround device: a permanent bridge sink that applications
+    // are routed to, plus the effects graph (upmixer and HRIR convolvers) behind it.
+    // Does nothing if the device already exists. Call this before enable_routing().
     // When upmix_enabled is set, stereo streams are upmixed to 7.1 by the bundled
     // FreeSurround LADSPA plugin (see find_ladspa_plugin()).
     // The LFE path is always rendered without HRIR coloring, through a unit impulse
@@ -42,11 +44,12 @@ class PipeWireManager : public QObject {
     bool create_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled);
 
     //
-    // Replaces the graph of the running module without interrupting routed streams:
-    // the new module is created first (under a fresh node name), all streams that were
-    // routed to the old sink are re-targeted to the new one (virtual sink to virtual
-    // sink - they never touch the physical device in between), then the old module is
-    // destroyed. Falls back to create_virtual_surround_module() when no module exists.
+    // Replaces only the effects graph behind the permanent bridge sink. Applications
+    // keep their stream linked to the same sink, so nothing falls back to the physical
+    // device and WirePlumber's MPRIS pause-on-sink-removal never triggers. The new
+    // effects graph is created first, the bridge is re-linked to it, and the previous
+    // graph is destroyed only after the new link is observed.
+    // Falls back to create_virtual_surround_module() when no device exists.
     //
     bool replace_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled);
 
@@ -57,7 +60,10 @@ class PipeWireManager : public QObject {
     bool is_audio_playing() const;
 
     //
-    // Removes the virtual surround module.
+    // Removes the bridge and effects modules. Call disable_routing() first: this
+    // waits briefly for the routed streams to leave the bridge sink, because
+    // removing a sink while streams are still linked to it makes WirePlumber pause
+    // their MPRIS players.
     //
     void remove_virtual_surround_module();
 
@@ -70,25 +76,6 @@ class PipeWireManager : public QObject {
     // Stops the PipeWire loop, disabling routing of audio data through the virtual surround node.
     //
     void disable_routing();
-
-    //
-    // Mutes every stream currently routed to the virtual sink, remembering each
-    // stream's own mute state. Returns false when any stream could not be silenced,
-    // meaning a loud fallback cannot be excluded and the user should be asked first.
-    // Must be called from the GUI thread without the thread loop lock held.
-    //
-    bool silence_routed_streams();
-
-    //
-    // Restores the mute states captured by silence_routed_streams() after a delay
-    // long enough for the graph swap to settle.
-    //
-    void schedule_unsilence();
-
-    //
-    // Unmute and forget all captured streams. Takes the thread loop lock itself.
-    //
-    void unsilence_streams();
 
     Q_SIGNAL void error_occurred(const QString &message);
 
@@ -111,54 +98,45 @@ class PipeWireManager : public QObject {
 
     const char *capture_node_name_base = "effect_input.virtual-surround-manager";
     const char *playback_node_name_base = "effect_output.virtual-surround-manager";
-    // Graph rebuilds get fresh names ("<base>.<generation>") so the old and new
-    // module can coexist while routed streams are moved between them. Generation 0
-    // keeps the plain base names so streams routed by a previous app instance
-    // (whose target.object was persisted in the metadata) are picked up again.
+
+    // The app-facing bridge sink keeps the plain base name forever. Applications are
+    // routed to it once and never moved again, not even while the effects graph is
+    // replaced. Only the effects sink behind it gets a per-generation name.
     string capture_node_name = capture_node_name_base;
-    string playback_node_name = playback_node_name_base;
-    uint32_t module_generation = 0;
+    string effects_capture_node_name;
+    string effects_playback_node_name;
+    uint32_t effects_generation = 0;
     // Thanks to EasyEffects for the list
     constexpr static auto ignored_node_names = std::to_array<std::string_view>({"libcanberra", "org.gnome.VolumeControl", "GNOME Shell", "Mutter", "gsd-media-keys"});
 
     bool is_registry_listener_added = false;
     QSet<uint32_t> routed_node_ids;
     QSet<uint32_t> decided_streams;
-    uint32_t playback_node_id = SPA_ID_INVALID;
-    pw_impl_module *module = nullptr;
+    pw_impl_module *bridge_module = nullptr;
+    pw_impl_module *effects_module = nullptr;
 
-    // Modules that were replaced but whose teardown is deferred (see
-    // schedule_module_destroy): WirePlumber relinks the moved streams asynchronously
-    // and destroying the previous graph too early drops them onto the physical device
-    QList<pw_impl_module *> pending_destroy;
+    // Replaced effects graphs stay alive for a short settle period after the bridge
+    // has moved: WirePlumber updates its own link bookkeeping asynchronously, and a
+    // sink removed while it still considers a link present would pause MPRIS players
+    QList<pw_impl_module *> pending_effects_destroy;
 
-    // Until this deadline (steady clock, ms) a routed stream whose target is cleared
-    // is pulled back to the graph. WirePlumber answers a re-target write with
-    // "follow the default sink" once the previous graph is gone, which drops the
-    // stream onto the physical device: loud (no graph attenuation) and enough for
-    // media players to pause.
-    qint64 pin_routes_until_ms = 0;
-    // Last pin write per node, to keep a possible ping-pong with WirePlumber bounded
-    QHash<uint32_t, qint64> last_pin_ms;
+    // Node IDs of the bridge/effects nodes, learned from the registry. The bridge
+    // playback node is the internal 8-channel stream that feeds the effects sink.
+    uint32_t bridge_capture_id = SPA_ID_INVALID;
+    uint32_t bridge_playback_id = SPA_ID_INVALID;
+    uint32_t effects_capture_id = SPA_ID_INVALID;
+    uint32_t effects_playback_id = SPA_ID_INVALID;
+    QSet<uint32_t> internal_playback_ids;
+    QSet<uint32_t> internal_capture_ids;
 
-    // Silencing of the routed streams while the graph is swapped. Muting at the
-    // stream is the only thing that stays silent no matter which sink WirePlumber
-    // ends up linking it to, so it covers the "stream falls back to the device" case.
-    // The entries live on the heap: pw_node_add_listener links the spa_hook into the
-    // object, so a StreamSilence must never be moved by a container rehash.
-    struct StreamSilence {
-        struct pw_proxy *proxy = nullptr;
-        struct pw_node *node = nullptr;
-        struct spa_hook listener;
-        // True while a Props read is in flight for this entry; only one read runs
-        // at a time, so the reply belongs to it
-        bool awaiting = false;
-        bool has_report = false;
-        bool reported_mute = false;
-        bool muted_by_us = false;
+    // Live PipeWire links (node id pairs), used to wait until the bridge really
+    // feeds the new effects sink before the old graph is destroyed.
+    struct LinkInfo {
+        uint32_t output_node;
+        uint32_t input_node;
     };
-    QHash<uint32_t, StreamSilence *> silenced_streams;
-    QTimer *unsilence_timer = nullptr;
+    QHash<uint32_t, LinkInfo> links;
+    std::atomic<bool> link_wait_active{false};
 
     // Written from the PipeWire thread, read from the UI thread
     std::atomic<bool> audio_playing{false};
@@ -249,58 +227,58 @@ class PipeWireManager : public QObject {
     void update_playing_state();
 
     //
-    // Defers destruction of a replaced module until the streams have certainly been
-    // re-linked to the new graph. Callers must not hold the thread loop lock.
+    // Schedules destruction of a replaced effects graph. Callers must not hold the
+    // thread loop lock.
     //
-    void schedule_module_destroy(pw_impl_module *old_module);
+    void schedule_effects_destroy(pw_impl_module *old_module);
 
     //
-    // Destroys all deferred modules. Must be called with the thread loop lock held.
+    // Destroys all deferred effects modules. Must be called with the thread loop
+    // lock held.
     //
-    void destroy_pending_modules_locked();
+    void destroy_pending_effects_locked();
 
     //
-    // Unmutes and forgets every captured stream. The caller must already hold the
-    // thread loop lock (unsilence_streams() takes it).
+    // Builds the effects graph JSON arguments. Returns an empty string (after
+    // emitting an error) if the LFE bypass impulse for the HRIR could not be
+    // generated.
     //
-    void unsilence_streams_now();
+    string build_effects_module_args(const string &hrir_wav_path, bool upmix_enabled,
+                                     const string &capture_name, const string &playback_name);
 
     //
-    // Writes the mute property to a bound stream node.
+    // Builds the permanent bridge graph: an 8-channel sink that fans out to an
+    // 8-channel playback stream targeting the effects sink.
     //
-    static void write_stream_mute(struct pw_node *node, bool mute);
+    string build_bridge_module_args(const string &effects_sink_name);
 
     //
-    // Requests the Props of one silenced stream and blocks until the client answers,
-    // releasing the lock while waiting. Returns false if nothing came back within
-    // timeout_ms or the answer carries no mute property. Lock must be held.
+    // Loads the effects module under fresh node names, recording the new sink and
+    // playback node IDs as they appear in the registry. Must be called with the
+    // thread loop lock held. Returns nullptr (and restores the previous names) on
+    // failure.
     //
-    bool read_stream_mute(StreamSilence *state, int timeout_ms);
+    pw_impl_module *load_effects_module_locked(const string &hrir_wav_path, bool upmix_enabled);
 
     //
-    // Removes a stream proxy and its listener. Lock must be held.
+    // Loads the bridge module if it does not exist yet. Must be called with the
+    // thread loop lock held.
     //
-    void release_stream_proxy(uint32_t id);
+    bool load_bridge_module_locked();
 
     //
-    // Reads the Props of a bound stream node to learn its current mute state.
+    // Waits (releasing the thread loop lock) until the predicate returns true or
+    // timeout_ms expires. The predicate runs with the lock held. Returns whether
+    // the predicate became true.
     //
-    static void on_stream_param(void *data, int seq, uint32_t id, uint32_t index, uint32_t next,
-                                const struct spa_pod *param);
-
-    const struct pw_node_events stream_silence_events = {
-        .version = PW_VERSION_NODE_EVENTS,
-        .info = nullptr,
-        .param = on_stream_param,
-    };
+    bool wait_for(const std::function<bool()> &predicate, int timeout_ms);
 
     //
-    // Builds the libpipewire-module-filter-chain JSON arguments for the given
-    // names. Returns an empty string (after emitting an error) if the LFE bypass
-    // impulse for the HRIR could not be generated.
+    // True if a link from output_node to input_node is present. Lock must be held.
     //
-    string build_module_args(const string &hrir_wav_path, bool upmix_enabled,
-                             const string &capture_name, const string &playback_name);
+    bool has_link(uint32_t output_node, uint32_t input_node) const;
+    bool has_outgoing_link(uint32_t output_node) const;
+    bool has_input_link(uint32_t input_node) const;
 
     //
     // Returns true if a stream has no explicit target or targets the default sink.

@@ -205,8 +205,4 @@ void TrayIcon::on_profile_selected() {
     }
 
     m_frontend_manager->set_hrir_wav_file_name_index(action->data().toInt());
-    if (m_frontend_manager->get_switch_needs_confirm()) {
-        // The switch now waits for an answer that only the window can give
-        show_main_window();
-    }
 }
