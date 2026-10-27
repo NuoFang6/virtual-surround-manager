@@ -7,4 +7,5 @@ build_install
 quick-sharun.sh
 .flatpak-builder
 flatpak-build
-repobuild-appimage
+repo
+build-appimage
