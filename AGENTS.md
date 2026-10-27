@@ -300,5 +300,6 @@ Copy:    L0=LVI R1=LVI SL0=SLVI SR1=SLVI RL0=RLVI RR1=RLVI C0=CVI
 | `cc6fde6` | LFE 直通模式（δ IR + GUI 开关） |
 | `270d51c` / `0846c25` / `9837ecd` | 上一个 LLM 的切换修复尝试（重叠重建 / 钉路由 / 流静音 + 确认框）；**2026-10-28 已证明不足，mute/confirm/pin 代码全部删除**，见 §4-11/13 |
 | `86c5cc5` | 稳定桥 sink + 只重建效果图（§4-14）；WirePlumber MPRIS 暂停根因；24-bit δ IR 头修复（§4-15）；`disable_routing` 自回声修复（§4-16）；隔离会话 + 假 MPRIS 验收（§4-17、§6）；重启过期 target 接管修复（§4-18）；删除静音/确认/回滚/钉路由机制；加默认关闭的 `VSM_TEST_AUTO_SWITCH_MS` 测量钩子；实机安装并验证 Edge 经新桥路由 |
-| 本次（2026-10-28 审计提交） | auto 插件内容切换无空洞 + 原生 LFE bypass 2×（§4-19）；非 14ch HRIR 拒绝（§4-20）；短 IR OFF→ON 90ms 缺口记录（§4-21）；插件宿主回归测试升级；README/AGENTS 的 LFE/切换文档同步（含旧 `convLFE` 表修正） |
+| `1095d78` | auto 插件内容切换无空洞 + 原生 LFE bypass 2×（§4-19）；非 14ch HRIR 拒绝（§4-20）；短 IR OFF→ON 90ms 缺口记录（§4-21）；插件宿主回归测试升级；README/AGENTS 的 LFE/切换文档同步（含旧 `convLFE` 表修正） |
+| 本次（2026-10-28 配置清理） | 删除已无行为的 `lfe_bypass` 旧配置键（与 `channels` 一起在启动时清理） |
 | 更早 | `15fb76f` Flatpak 崩溃修复（上游历史） |

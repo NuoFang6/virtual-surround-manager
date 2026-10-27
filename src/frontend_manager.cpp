@@ -25,9 +25,12 @@ FrontendManager::FrontendManager(PipeWireManager *pipewire_manager, KConfig *con
 
     load_hrir_wav_files();
 
-    // Remove the channel setting of versions that still supported 5.1 output
-    if (m_config_settings.hasKey("channels")) {
+    // Remove settings that no longer have any behaviour. `channels` belonged to
+    // versions that still supported 5.1 output; `lfe_bypass` was the old toggle
+    // for HRIR-colored LFE, which is now always bypassed through the delta IR.
+    if (m_config_settings.hasKey("channels") || m_config_settings.hasKey("lfe_bypass")) {
         m_config_settings.deleteEntry("channels");
+        m_config_settings.deleteEntry("lfe_bypass");
         m_config->sync();
     }
 
