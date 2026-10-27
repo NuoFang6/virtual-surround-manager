@@ -5,6 +5,7 @@
 #include <QObject>
 #include <QSet>
 #include <QString>
+#include <QTimer>
 #include <array>
 #include <atomic>
 #include <pipewire/extensions/metadata.h>
@@ -70,6 +71,25 @@ class PipeWireManager : public QObject {
     //
     void disable_routing();
 
+    //
+    // Mutes every stream currently routed to the virtual sink, remembering each
+    // stream's own mute state. Returns false when any stream could not be silenced,
+    // meaning a loud fallback cannot be excluded and the user should be asked first.
+    // Must be called from the GUI thread without the thread loop lock held.
+    //
+    bool silence_routed_streams();
+
+    //
+    // Restores the mute states captured by silence_routed_streams() after a delay
+    // long enough for the graph swap to settle.
+    //
+    void schedule_unsilence();
+
+    //
+    // Unmute and forget all captured streams. Takes the thread loop lock itself.
+    //
+    void unsilence_streams();
+
     Q_SIGNAL void error_occurred(const QString &message);
 
   private:
@@ -120,6 +140,25 @@ class PipeWireManager : public QObject {
     qint64 pin_routes_until_ms = 0;
     // Last pin write per node, to keep a possible ping-pong with WirePlumber bounded
     QHash<uint32_t, qint64> last_pin_ms;
+
+    // Silencing of the routed streams while the graph is swapped. Muting at the
+    // stream is the only thing that stays silent no matter which sink WirePlumber
+    // ends up linking it to, so it covers the "stream falls back to the device" case.
+    // The entries live on the heap: pw_node_add_listener links the spa_hook into the
+    // object, so a StreamSilence must never be moved by a container rehash.
+    struct StreamSilence {
+        struct pw_proxy *proxy = nullptr;
+        struct pw_node *node = nullptr;
+        struct spa_hook listener;
+        // True while a Props read is in flight for this entry; only one read runs
+        // at a time, so the reply belongs to it
+        bool awaiting = false;
+        bool has_report = false;
+        bool reported_mute = false;
+        bool muted_by_us = false;
+    };
+    QHash<uint32_t, StreamSilence *> silenced_streams;
+    QTimer *unsilence_timer = nullptr;
 
     // Written from the PipeWire thread, read from the UI thread
     std::atomic<bool> audio_playing{false};
@@ -219,6 +258,41 @@ class PipeWireManager : public QObject {
     // Destroys all deferred modules. Must be called with the thread loop lock held.
     //
     void destroy_pending_modules_locked();
+
+    //
+    // Unmutes and forgets every captured stream. The caller must already hold the
+    // thread loop lock (unsilence_streams() takes it).
+    //
+    void unsilence_streams_now();
+
+    //
+    // Writes the mute property to a bound stream node.
+    //
+    static void write_stream_mute(struct pw_node *node, bool mute);
+
+    //
+    // Requests the Props of one silenced stream and blocks until the client answers,
+    // releasing the lock while waiting. Returns false if nothing came back within
+    // timeout_ms or the answer carries no mute property. Lock must be held.
+    //
+    bool read_stream_mute(StreamSilence *state, int timeout_ms);
+
+    //
+    // Removes a stream proxy and its listener. Lock must be held.
+    //
+    void release_stream_proxy(uint32_t id);
+
+    //
+    // Reads the Props of a bound stream node to learn its current mute state.
+    //
+    static void on_stream_param(void *data, int seq, uint32_t id, uint32_t index, uint32_t next,
+                                const struct spa_pod *param);
+
+    const struct pw_node_events stream_silence_events = {
+        .version = PW_VERSION_NODE_EVENTS,
+        .info = nullptr,
+        .param = on_stream_param,
+    };
 
     //
     // Builds the libpipewire-module-filter-chain JSON arguments for the given

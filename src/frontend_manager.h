@@ -5,6 +5,7 @@
 #include <QObject>
 #include <QString>
 #include <QStringList>
+#include <functional>
 
 class PipeWireManager;
 
@@ -27,6 +28,10 @@ class FrontendManager : public QObject {
     Q_PROPERTY(bool virtualSurroundAutoEnabled READ get_virtual_surround_auto_enabled WRITE set_virtual_surround_auto_enabled NOTIFY virtual_surround_auto_enabled_changed)
     // Whether stereo audio is upmixed to surround (PSD) or not
     Q_PROPERTY(bool upmixEnabled READ get_upmix_enabled WRITE set_upmix_enabled NOTIFY upmix_enabled_changed)
+
+    // Set while a profile/upmix switch waits for the user to accept the risk of a
+    // briefly louder output, because the playing streams could not be muted first
+    Q_PROPERTY(bool switchNeedsConfirm READ get_switch_needs_confirm NOTIFY switch_needs_confirm_changed)
 
   public:
     explicit FrontendManager(PipeWireManager *pipewire_manager, KConfig *config, QObject *parent = nullptr);
@@ -71,6 +76,12 @@ class FrontendManager : public QObject {
     // True while audio is actually playing through the virtual surround sink
     Q_INVOKABLE bool is_audio_playing() const;
 
+    bool get_switch_needs_confirm() const;
+    Q_SIGNAL void switch_needs_confirm_changed();
+
+    // Answers the confirmation request announced by switchNeedsConfirm
+    Q_INVOKABLE void resolve_switch_confirm(bool proceed);
+
   private:
     bool m_virtual_surround_enabled = false;
     QString m_error_message;
@@ -81,6 +92,9 @@ class FrontendManager : public QObject {
     bool m_autostart_enabled = false;
     bool m_virtual_surround_auto_enabled = false;
     bool m_upmix_enabled = false;
+    bool m_switch_needs_confirm = false;
+    std::function<void()> m_pending_switch_apply;
+    std::function<void()> m_pending_switch_cancel;
 
     PipeWireManager *m_pipewire_manager;
     KConfig *m_config;
@@ -102,4 +116,22 @@ class FrontendManager : public QObject {
     // and re-routing all streams.
     //
     void rebuild_module();
+
+    //
+    // Runs a change that needs the filter graph rebuilt. While audio plays, the
+    // routed streams are muted first - the mute follows them onto whatever sink they
+    // end up linked to - then applied, then undone once the swap has settled. When
+    // they cannot all be muted, a loud fallback cannot be excluded, so the setting
+    // change is held back and the UI asks the user instead; cancel() then takes the
+    // already-announced setting back.
+    //
+    void run_switch(std::function<void()> apply, std::function<void()> cancel);
+
+    //
+    // Applies a rolled-back setting to the state and the config file only. Used when
+    // the user declined a switch: the running graph was never touched, so rebuilding
+    // it (and asking again) would be wrong.
+    //
+    void rollback_upmix_enabled(bool value);
+    void rollback_hrir_selection(int index);
 };

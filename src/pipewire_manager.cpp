@@ -11,6 +11,9 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <spa/param/props.h>
+#include <spa/pod/builder.h>
+#include <spa/pod/iter.h>
 #include <string_view>
 #include <time.h>
 
@@ -891,7 +894,7 @@ void PipeWireManager::schedule_module_destroy(pw_impl_module *old_module) {
 
     pending_destroy.append(old_module);
 
-    QTimer::singleShot(2000, this, [this, old_module]() {
+    QTimer::singleShot(1200, this, [this, old_module]() {
         // The shutdown path or a following replace may have collected it already
         if (!pending_destroy.removeOne(old_module) || !thread_loop)
             return;
@@ -924,6 +927,176 @@ void PipeWireManager::destroy_pending_modules_locked() {
     for (pw_impl_module *m : std::as_const(pending_destroy))
         pw_impl_module_destroy(m);
     pending_destroy.clear();
+}
+
+void PipeWireManager::write_stream_mute(struct pw_node *node, bool mute) {
+    if (!node)
+        return;
+
+    uint8_t buffer[512];
+    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+    // The value type comes from the vararg protocol as a *string* tag ("b" for bool),
+    // not as a SPA_TYPE_* id - passing the id here walks garbage and crashes
+    const struct spa_pod *pod = reinterpret_cast<const struct spa_pod *>(
+        spa_pod_builder_add_object(&b,
+                                   SPA_TYPE_OBJECT_Props, SPA_PARAM_Props,
+                                   SPA_POD_Prop(SPA_PROP_mute, SPA_POD_Bool(mute))));
+
+    pw_node_set_param(node, SPA_PARAM_Props, 0, pod);
+}
+
+void PipeWireManager::release_stream_proxy(uint32_t id) {
+    auto it = silenced_streams.find(id);
+    if (it == silenced_streams.end())
+        return;
+    StreamSilence *state = it.value();
+    if (state->proxy) {
+        spa_hook_remove(&state->listener);
+        pw_proxy_destroy(state->proxy);
+    }
+    delete state;
+    silenced_streams.erase(it);
+}
+
+void PipeWireManager::on_stream_param(void *data, int seq, uint32_t id,
+                                      [[maybe_unused]] uint32_t index, uint32_t next,
+                                      const struct spa_pod *param) {
+    PipeWireManager *manager = static_cast<PipeWireManager *>(data);
+
+    for (StreamSilence *state : manager->silenced_streams) {
+        // Only one read is in flight, so any Props answer belongs to it
+        if (!state->awaiting || id != SPA_PARAM_Props)
+            continue;
+
+        // A null pod or a non-object one is a removal notification: an answer too,
+        // it just carries no mute value (and must not be walked as a pod object)
+        if (param != nullptr && SPA_POD_TYPE(param) == SPA_TYPE_Object) {
+            const struct spa_pod_prop *prop =
+                spa_pod_object_find_prop(reinterpret_cast<const struct spa_pod_object *>(param), nullptr, SPA_PROP_mute);
+            if (prop && spa_pod_get_bool(&prop->value, &state->reported_mute) == 0)
+                state->has_report = true;
+        }
+
+        if (next == SPA_ID_INVALID)
+            state->awaiting = false;
+        break;
+    }
+
+    qDebug("on_stream_param: node event seq=%d id=%u next=%u", seq, id, next);
+}
+
+bool PipeWireManager::read_stream_mute(StreamSilence *state, int timeout_ms) {
+    state->awaiting = true;
+    state->has_report = false;
+    state->reported_mute = false;
+
+    // The reply is not identified by the sequence number (the server reports its own),
+    // so exactly one read may be in flight and its answer is the next Props event
+    pw_node_enum_params(state->node, 0, SPA_PARAM_Props, 0, SPA_ID_INVALID, nullptr);
+
+    struct timespec abstime;
+    clock_gettime(CLOCK_REALTIME, &abstime);
+    abstime.tv_sec += timeout_ms / 1000;
+    abstime.tv_nsec += static_cast<long>(timeout_ms % 1000) * 1000 * 1000;
+    if (abstime.tv_nsec >= 1000000000) {
+        abstime.tv_sec += 1;
+        abstime.tv_nsec -= 1000000000;
+    }
+    // Waiting releases the lock, so the PipeWire thread can still deliver the reply
+    while (state->awaiting && pw_thread_loop_timed_wait_full(thread_loop, &abstime) == 0)
+        ;
+    state->awaiting = false;
+
+    return state->has_report;
+}
+
+bool PipeWireManager::silence_routed_streams() {
+    if (!thread_loop || !registry)
+        return false;
+
+    const QList<uint32_t> ids = routed_node_ids.values();
+    if (ids.isEmpty())
+        return true;
+
+    bool all_silenced = true;
+
+    pw_thread_loop_lock(thread_loop);
+    for (const uint32_t id : ids) {
+        if (silenced_streams.contains(id))
+            continue;
+
+        StreamSilence *state = new StreamSilence();
+        state->proxy = reinterpret_cast<pw_proxy *>(
+            pw_registry_bind(registry, id, PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, 0));
+        if (!state->proxy) {
+            qWarning("silence_routed_streams: Cannot bind stream node %u", id);
+            delete state;
+            all_silenced = false;
+            continue;
+        }
+        state->node = reinterpret_cast<pw_node *>(state->proxy);
+        spa_zero(state->listener);
+        pw_node_add_listener(state->node, &state->listener, &stream_silence_events, this);
+        silenced_streams.insert(id, state);
+
+        // Remember what the user had set, so it is restored exactly afterwards
+        if (!read_stream_mute(state, 300)) {
+            qWarning("silence_routed_streams: Stream node %u does not report its mute state", id);
+            all_silenced = false;
+            continue;
+        }
+        if (state->reported_mute) {
+            // Silent already: nothing to write here and nothing to restore later
+            continue;
+        }
+
+        write_stream_mute(state->node, true);
+        state->muted_by_us = true;
+
+        // Believe the mute only once the client confirms it. A stream that ignores the
+        // property would still land on the device at full level when the graph swaps,
+        // which is exactly what this is supposed to prevent.
+        if (!read_stream_mute(state, 300) || !state->reported_mute) {
+            qWarning("silence_routed_streams: Stream node %u did not confirm the mute", id);
+            all_silenced = false;
+        }
+    }
+    pw_thread_loop_unlock(thread_loop);
+
+    if (!silenced_streams.isEmpty())
+        qInfo("silence_routed_streams: Silenced %d stream(s) for the graph swap", silenced_streams.size());
+
+    return all_silenced;
+}
+
+void PipeWireManager::schedule_unsilence() {
+    if (!unsilence_timer) {
+        unsilence_timer = new QTimer(this);
+        unsilence_timer->setSingleShot(true);
+        connect(unsilence_timer, &QTimer::timeout, this, &PipeWireManager::unsilence_streams);
+    }
+    // Covers the deferred teardown of the replaced graph plus settling time
+    unsilence_timer->start(1800);
+}
+
+void PipeWireManager::unsilence_streams() {
+    if (!thread_loop)
+        return;
+    pw_thread_loop_lock(thread_loop);
+    unsilence_streams_now();
+    pw_thread_loop_unlock(thread_loop);
+}
+
+void PipeWireManager::unsilence_streams_now() {
+    for (StreamSilence *state : std::as_const(silenced_streams)) {
+        if (state->muted_by_us && state->node)
+            write_stream_mute(state->node, false);
+    }
+    const QList<uint32_t> ids = silenced_streams.keys();
+    for (const uint32_t id : ids)
+        release_stream_proxy(id);
+    if (!ids.isEmpty())
+        qInfo("unsilence_streams_now: Restored %d stream(s)", ids.size());
 }
 
 bool PipeWireManager::is_audio_playing() const {
@@ -1148,6 +1321,9 @@ PipeWireManager::~PipeWireManager() {
 
     if (thread_loop) {
         pw_thread_loop_lock(thread_loop);
+
+        // Never leave routed streams muted when this connection goes away
+        unsilence_streams_now();
 
         // Destroy the metadata proxy while holding the lock: its listener can
         // still be dispatched on the PipeWire thread until the loop is stopped

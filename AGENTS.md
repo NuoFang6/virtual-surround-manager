@@ -20,7 +20,7 @@
 | 通道 | 8ch，FL FR FC LFE RL RR SL SR | 标准 7.1 顺序 |
 | `audio.rate` | 48000（capture/playback 两端都锁） | HRIR 原生 48k，避免重采样 |
 | `node.latency` | `1024/48000` | 防止低延迟应用把 quantum 拉低导致 xrun |
-| 路由 | 应用通过 metadata 把所有播放流强制改道到虚拟 sink | 产品行为 |
+| 路由 | 应用通过 metadata 把所有播放流强制改道到虚拟 sink；切换预设时**先逐个静音这些流**，换图后过静音窗口再恢复（见 §4-11） | 产品行为 |
 
 ### 上混（可选，FreeSurround，label `freesurround71_auto`）
 | 控制 | 值 | 出处 |
@@ -98,8 +98,12 @@ copyLFE → 低通 120 Hz LR4（两只 Q=0.7071 biquad 级联）→ 增益（见
 8. 新增 **LFE 直通模式**（δ IR 等长方案）。用户试听结论：低频密度感/力度感明显改善，其他频率无差异 → **2026-10-27 晚用户决定固化：直通成为唯一行为，旧卷积路径与开关全部删除**。
 9. HRIR 通道映射：确定现有值正确（见 §5）。
 10. 环路实测全部通过（见 §6）。
-11. **切换 HRIR/上混开关时的"变响 + 播放器暂停"修复**：旧流程先 `disable_routing` 再销毁模块，流短暂回落到物理设备（无 0.30 衰减、设备音量不同）导致电平跳变，sink 消失触发播放器暂停。改为**重叠重建**：先用带世代后缀的节点名创建新模块 → metadata 把已路由流直接改指新虚拟 sink（全程虚拟→虚拟）→ 再销毁旧模块。实测：mpv 全程不暂停、无电平尖峰；残余代价仅上混开启时约 130 ms 断音（FreeSurround FFT 延迟线重新灌注，固有）。
-12. **播放中操作的二次确认**：GUI 关闭音效开关、托盘关闭开关、退出应用（托盘 Quit / 无托盘时关窗）在检测到正在播放时弹确认框。播放检测 = 已路由流的 node state == RUNNING（自动维护的 atomic 标志，`FrontendManager::is_audio_playing()`）。
+11. **切换 HRIR/上混开关时的"变响 + 播放器暂停"修复（两轮迭代，最终以"流静音"收尾）**：根因是旧流程先 `disable_routing` 再销毁模块，流短暂回落到物理设备（无 0.30 衰减、设备音量不同）→ 电平跳变约 +12 dB，且 sink 消失触发播放器暂停。
+    - 第一轮（已被证明不足）：**重叠重建** —— 先用带世代后缀的节点名建新模块 → metadata 把已路由流改指新 sink → 延迟销毁旧模块 + 短窗内"钉回"路由。实测失败：WirePlumber 在旧 sink 消失后会把流重连到默认设备**且不写 metadata**（`schedule_module_destroy: Node N target is '(default)'` 即证据），钉回逻辑拦不住；改去静音物理设备也不可靠（设备节点查找屡次落空），实测仍有约 6 s 的双电平窗口。
+    - 第二轮（当前实现）：切换前**逐个静音已路由的流节点**（`SPA_PARAM_Props` 的 `SPA_PROP_mute`）。流的 mute 跟着流走，无论 WirePlumber 把它重连到哪个 sink 都静音 → 从根上消除跳变。随后立即换图（重叠重建的代码路径保留），旧模块 1200 ms 后销毁，1800 ms 后统一解除静音（只解除我们静音过的；静音前先用 `pw_node_enum_params` 读回原状态，用户自己静音的流不动）。静音是否生效**用二次读回验证**：客户端不确认 → 视为静音失败。
+    - 失败兜底（用户明确要求）：**静音失败时不直接切换**，置 `switchNeedsConfirm` 弹确认框，文案说明"可能短暂变响 + 部分应用需手动把输出切回 Virtual Surround"；用户取消则回滚已写入的设置（`rollback_hrir_selection` / `rollback_upmix_enabled`，只改状态与配置文件，不重建图），同意则再尽力静音一次并立即执行。
+    - 实测代价与效果（`/tmp/vsm_test/run_silence_test.sh` + `analyze.py`，2 ch 录 `vsm_test_sink.monitor`）：三次切换各产生 **约 1.9–2.0 s 静音段**，无 3× 基线以上的电平尖峰（最大偏离 +3.2 dB，属乐曲自身动态），mpv `pause=false` 全程不变；切换后两条流仍链接在新一代图上（`wpctl status` 佐证）。
+12. **播放中操作的二次确认**：GUI 关闭音效开关、托盘关闭开关、退出应用（托盘 Quit / 无托盘时关窗）在检测到正在播放时弹确认框。播放检测 = 已路由流的 node state == RUNNING（自动维护的 atomic 标志，`FrontendManager::is_audio_playing()`）。托盘切预置时若需要确认，会自动唤起主窗口（`TrayIcon::on_profile_selected`）。GUI 侧的"取消后开关/高亮回退"依赖 `Qt.binding()` 重建绑定——用户点击会把 `checked` 的绑定替换成普通值，只 emit 信号不会恢复显示。
 
 ## 5. HRIR 通道映射（已解决，勿再猜）
 
@@ -128,6 +132,16 @@ Copy:    L0=LVI R1=LVI SL0=SLVI SR1=SLVI RL0=RLVI RR1=RLVI C0=CVI
 - 手写 WAV 头必须与数据编码一致；声明 PCM 却装 float32 会被解码成 7 倍电平 + 失真的垃圾（本项目实测 0.1 正弦变成 0.48）。测试信号建议直接写 16-bit PCM（WAVEFORMATEXTENSIBLE，subformat 0x0001，mask 0x63F）。
 - 交叉验证：任何"通道路由"结论必须能在文件域或同一次录音内的相对时序上复现，不能依赖跨次录音的绝对时间。
 
+**PipeWire 原生 API 的血泪坑（2026-10-27 排查静音功能时踩到，别再踩）**：
+- 构造 Props pod 时值类型要传**字符串标签**：`SPA_POD_Prop(SPA_PROP_mute, SPA_POD_Bool(mute))`（`SPA_POD_Bool(v)` 展开为 `"b", v`）。写成 `SPA_TYPE_Bool, mute ? 1 : 0` 会让 vararg 解析器把整数当 `const char*` 读 → **SIGSEGV**（`spa_pod_builder_add` 内）。本项目曾因这个 bug 崩溃三次、并被我误判成"客户端不支持 mute"。
+- `spa_node_events.param` 回调里 `param` **可能为 NULL**（表示该 param 被移除），`SPA_POD_TYPE` 也**可能不是 Object**；直接 `reinterpret_cast<spa_pod_object*>` 后遍历会崩。先判空 + 判 `SPA_TYPE_Object`。
+- **param id 是 `enum spa_param_type` 的小整数**：`SPA_PARAM_Props == 2`（0.28.0 起就是顺序枚举），**不是** fourcc。`id=2` 就是 Props 回复，`next=1` 表示"还要继续枚举 PropInfo"，只有 `next == SPA_ID_INVALID` 才是结束。
+- 回复**不携带我们请求时的 seq**（服务端用自己的同步号），所以"哪个回复对应哪个请求"不能靠 seq 匹配 → 改成**一次只允许一个在途读**（`awaiting` 标志），读回后再等 `pw_thread_loop_timed_wait_full`（它会临时释放锁并在本线程派发事件，`sync_with_core` 同理有效）。
+- mute 能力实测：pipewire-pulse 的 sink-input 与原生 pw_stream（mpv `--ao=pulse` / `--ao=pipewire`）**都支持** `SPA_PARAM_Props` 的读与写；`wpctl set-mute <node-id> 1` 可作旁证（录到 RMS 从 0.0111 → 0.0000）。
+- `pw-dump` 的参数在 `info.params`（按名字典），**不是**顶层 `params` 数组；按顶层 key 解析会得到"全部为空"的假结论。
+- 应用自身的 Qt 日志走 **journald**（stdout 常为空，别以为程序没输出）：用 `journalctl _PID=<pid>` 取；`QT_LOGGING_RULES='*.debug=true'` 会连带灌入 harfbuzz 噪声，临时调试用 `qWarning` 更省事。
+- 进程名截断到 15 字符（`virtual-surroun`）：清场用 `pkill -x virtual-surroun` / `pkill -x mpv`。**绝对不要**在同一行命令里既写 `pgrep -f <二进制路径>` 又跑它——模式会匹配到自己的 shell 并把自己杀掉（本会话栽过 3 次，AGENTS.md §9 的重启方法同理慎用 `pgrep -f`）。
+
 **非 14 通道 HRIR**：`oal_dflt.wav`（7 通道）选中后**不会报错**（PipeWire 容忍越界通道号），但空间像错误。README 已注明；可选改进：加载列表过滤非 14ch 文件。
 
 ## 6. 实测验证结果（2026-10-27，null-sink 环路）
@@ -145,6 +159,7 @@ Copy:    L0=LVI R1=LVI SL0=SLVI SR1=SLVI RL0=RLVI RR1=RLVI C0=CVI
 | Headroom 0.30 | 0.07125 峰值 | 0.0713 | ✅ |
 | 插件冒烟测试（`BUILD_LADSPA_TEST_HOST=ON`） | 440Hz→FC、60Hz→LFE | 0.66 / 0.71 | ✅ |
 | HRIR 在 60 Hz 相对 δ 的衰减 | — | −2.84 dB（用户"密度感"来源） | 数据 |
+| 播放中切换预设的听感安全 | 无电平尖峰、播放器不暂停 | 3 次切换：0 个 >3× 基线的窗（最大 +3.2 dB 是乐曲自身动态）、mpv `pause=false` 全程不变 | ✅（静音方案，代价见 §7-6） |
 
 ## 7. 已知问题与优化清单（按优先级）
 
@@ -159,7 +174,7 @@ Copy:    L0=LVI R1=LVI SL0=SLVI SR1=SLVI RL0=RLVI RR1=RLVI C0=CVI
 
 **准问题（生态固有）**
 5. HRIR 预设是特定耳机测量，通用预设对任意耳机是近似。
-6. 上混开启时，图重建（换 HRIR 预设/改上混开关）会有 **~130 ms 断音**：FreeSurround 的 128 ms FFT 延迟线在每次重建后重新灌注，固有。上混关闭时重建完全无缝（实测 10 ms 分辨率下零中断）。可选缓解：双图交叉淡化、缩小 FFT 块。
+6. **播放中切换预设/上混开关会有约 2 s 静音**（2026-10-27 实测 1.91/1.97/2.02 s）：这是"先静音流再换图"的**刻意代价**——用静音窗口换掉原来的 +12 dB 爆音与播放器暂停。窗口长度 = 旧模块延迟销毁 1200 ms + 解除静音定时 1800 ms（后者必须晚于销毁与重连抖动，目前没有可靠的"重连已完成"信号，WirePlumber 会把 target 清成 `(default)` 再由我们钉回）。上混开启时另有 FreeSurround 128 ms 延迟线重新灌注（固有，被上面的窗口覆盖）。想缩短：把解除静音改成"观察到所有流的 target 稳定指向新 sink 后触发"，或缩短销毁延迟——都需要重新实测电平。上混关闭时若不播放音频，切换完全无缝。
 
 **优化想法（未实施）**
 7. HRIR 预设响度归一化（换预设音量跳变）。社区做法：HeSuVi/EqAPO 用户将 Preamp 调到 **Peak gain ≈ −0.1 dB**（按 IR 峰值校准），而我们的 0.30 固定值恰好等于"预留 10 dB headroom（×0.3）"的经验法则——可作为可选的自适应 preamp。
@@ -185,7 +200,9 @@ Copy:    L0=LVI R1=LVI SL0=SLVI SR1=SLVI RL0=RLVI RR1=RLVI C0=CVI
 - **录音**：必须用 `parec --device=vsm_test_sink.monitor --format=float32le --rate=48000 --channels=2 --raw` 走管道读固定字节数（timeout/SIGTERM 会截断 wav 文件）。`pw-record` 无法按名字连接 monitor，且目标不匹配会静默录麦克风——**务必先验证连接**（`pw-dump` 查 Link 对象确认）。
 - **测试信号**：8ch WAV，WAVEFORMATEXTENSIBLE + PCM(0x0001) 16-bit，通道掩码 0x63F；往返校验电平。
 - 项目自带：`ctest --test-dir build`（目前只有 appstream）；插件冒烟：`cmake -B build -DBUILD_LADSPA_TEST_HOST=ON && cmake --build build --target freesurround_ladspa_test && ./build/bin/freesurround_ladspa_test build/bin/freesurround_ladspa.so`。
-- 应用重启：`kill $(pgrep -f "^/usr/bin/virtual-surround-manager")`，再 `setsid nohup /usr/bin/virtual-surround-manager &`。
+- 应用重启：`kill $(pgrep -f "^/usr/bin/virtual-surround-manager")`，再 `setsid nohup /usr/bin/virtual-surround-manager &`。启动实例前先 `ps -eo pid,comm` 看清 PID，别把上一轮的测试实例留在后台。
+- **播放中切换的实测脚本**（本次用过，可直接复用）：`/tmp/vsm_test/run_silence_test.sh <tag>`（起应用+mpv `--ao=pulse|pipewire`+录 `vsm_test_sink.monitor`，每 3 s 采样 mpv `pause`），`/tmp/vsm_test/analyze.py <raw>`（10 ms 窗的 RMS/峰值包络，报" >3× 基线"的电平尖峰与静音段）。脚本用 `VSM_TEST_AUTO_REBUILD=1` 触发 `FrontendManager` 构造函数里的临时钩子（8/16/24 s 自动切预设/翻上混）——**该钩子只用于测量，提交前必须删除**（本机是 Wayland，Computer Use 无法点 UI，所以用钩子走同一条代码路径）。
+- Wayland 会话下 GUI 自动化不可用（`xdotool` 查不到 X11 窗口），验证一律回到"同一条代码路径 + 环路实测"。
 - 配置改动后需重启应用才生效（除 GUI 内开关，会即时重建模块）。
 
 ## 10. 工作规则（用户偏好，务必遵守）
@@ -204,4 +221,5 @@ Copy:    L0=LVI R1=LVI SL0=SLVI SR1=SLVI RL0=RLVI RR1=RLVI C0=CVI
 | `c755918` | LFE 通路按行业依据重构（70/90、分源增益、120 LR4）、打包用户 HRIR、AppImage 修复 |
 | `3ea3091` | HeSuVi 通道映射权威说明 + IR 级验证（README/注释） |
 | `cc6fde6` | LFE 直通模式（δ IR + GUI 开关） |
+| 本次（直通固化 + 切换静音之后） | 播放中切换改为"先静音流、静音失败才弹确认"（§4-11）；LFE 直通固化为唯一行为；补 §5 的 PipeWire pod/param 坑与 §9 实测脚本 |
 | 更早 | `15fb76f` Flatpak 崩溃修复（上游历史） |

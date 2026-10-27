@@ -167,15 +167,15 @@ void FrontendManager::set_hrir_wav_file_name_index(int index) {
     if (m_hrir_wav_file_name_index == index)
         return;
 
+    const int previous_index = m_hrir_wav_file_name_index;
     m_hrir_wav_file_name_index = index;
-
-    rebuild_module();
+    Q_EMIT hrir_wav_file_name_index_changed();
 
     // Write to config file
     m_config_settings.writeEntry("hrir_wav_file_path", m_hrir_wav_file_paths.value(index));
     m_config->sync();
 
-    Q_EMIT hrir_wav_file_name_index_changed();
+    run_switch([this]() { rebuild_module(); }, [this, previous_index]() { rollback_hrir_selection(previous_index); });
 }
 
 void FrontendManager::load_hrir_wav_files() {
@@ -389,19 +389,93 @@ bool FrontendManager::get_upmix_enabled() const {
 void FrontendManager::set_upmix_enabled(bool value) {
     if (m_upmix_enabled == value)
         return;
-    m_upmix_enabled = value;
 
-    // The upmix flag is baked into the filter graph, so rebuild the module (this
-    // also applies the change to already routed streams). This must happen even
-    // while disabled: the module survives a disable, and leaving it stale here
-    // would resurrect the old upmix setting on the next enable.
-    rebuild_module();
+    const bool previous_value = m_upmix_enabled;
+    m_upmix_enabled = value;
+    Q_EMIT upmix_enabled_changed();
 
     // Write to config file
     m_config_settings.writeEntry("upmix_enabled", m_upmix_enabled);
     m_config->sync();
 
+    // The upmix flag is baked into the filter graph, so rebuild the module (this
+    // also applies the change to already routed streams). This must happen even
+    // while disabled: the module survives a disable, and leaving it stale here
+    // would resurrect the old upmix setting on the next enable.
+    run_switch([this]() { rebuild_module(); }, [this, previous_value]() { rollback_upmix_enabled(previous_value); });
+}
+
+void FrontendManager::run_switch(std::function<void()> apply, std::function<void()> cancel) {
+    // Nothing can be heard while the graph is off or nothing is playing
+    if (!m_virtual_surround_enabled || !m_pipewire_manager->is_audio_playing()) {
+        apply();
+        return;
+    }
+
+    if (m_pipewire_manager->silence_routed_streams()) {
+        apply();
+        m_pipewire_manager->schedule_unsilence();
+        return;
+    }
+
+    // A stream that cannot be muted may come back loud, so this is the user's call
+    m_pipewire_manager->unsilence_streams();
+    m_pending_switch_apply = std::move(apply);
+    m_pending_switch_cancel = std::move(cancel);
+    m_switch_needs_confirm = true;
+    Q_EMIT switch_needs_confirm_changed();
+}
+
+bool FrontendManager::get_switch_needs_confirm() const {
+    return m_switch_needs_confirm;
+}
+
+void FrontendManager::resolve_switch_confirm(bool proceed) {
+    if (!m_switch_needs_confirm)
+        return;
+
+    m_switch_needs_confirm = false;
+    Q_EMIT switch_needs_confirm_changed();
+
+    std::function<void()> apply = std::move(m_pending_switch_apply);
+    std::function<void()> cancel = std::move(m_pending_switch_cancel);
+    m_pending_switch_apply = nullptr;
+    m_pending_switch_cancel = nullptr;
+
+    if (!proceed) {
+        if (cancel)
+            cancel();
+        return;
+    }
+
+    // Still worth trying: every stream that mutes now is one that cannot come back
+    // loud after the swap
+    m_pipewire_manager->silence_routed_streams();
+    if (apply)
+        apply();
+    m_pipewire_manager->schedule_unsilence();
+}
+
+void FrontendManager::rollback_upmix_enabled(bool value) {
+    if (m_upmix_enabled == value)
+        return;
+    m_upmix_enabled = value;
+
+    m_config_settings.writeEntry("upmix_enabled", m_upmix_enabled);
+    m_config->sync();
+
     Q_EMIT upmix_enabled_changed();
+}
+
+void FrontendManager::rollback_hrir_selection(int index) {
+    if (m_hrir_wav_file_name_index == index)
+        return;
+    m_hrir_wav_file_name_index = index;
+
+    m_config_settings.writeEntry("hrir_wav_file_path", m_hrir_wav_file_paths.value(index));
+    m_config->sync();
+
+    Q_EMIT hrir_wav_file_name_index_changed();
 }
 
 bool FrontendManager::is_audio_playing() const {

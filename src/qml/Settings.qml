@@ -67,6 +67,18 @@ FormCard.FormCardPage {
             checkable: true
             checked: frontendManager.upmixEnabled
             onToggled: frontendManager.upmixEnabled = checked
+
+            Connections {
+                target: frontendManager
+                function onUpmixEnabledChanged() {
+                    // The toggle above replaced this binding with a plain value, so
+                    // re-create it on every change - a switch the user refused has to
+                    // show the old state again
+                    upmixEnabled.checked = Qt.binding(function () {
+                        return frontendManager.upmixEnabled;
+                    })
+                }
+            }
         }
     }
 }
