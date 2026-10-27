@@ -27,9 +27,17 @@ Local patches (not yet in Real3D-VST):
 
 - `freesurround71_auto` re-engages upmixing only after sustained pure-stereo
   input (`kStereoTolerance` consecutive blocks) instead of on the first silent
-  block. Every bypass↔processing switch flushes the plugin's FIFOs, which is
-  audible as a short click; the hysteresis keeps content hovering at the
-  detection threshold from toggling the detector.
+  block. The hysteresis keeps content hovering at the detection threshold from
+  toggling the detector.
+- Both paths stay primed: the bypass delay ring is written in both modes, and
+  the upmix core is fed (with its output discarded) while bypassing. A
+  stereo↔multichannel content switch therefore starts with real audio instead
+  of flushing a 128 ms silent/stale buffer. (Before this patch the switch had a
+  measured 128 ms zero gap into bypass and a ~75 ms one back into upmix.)
+- The bypass branch applies the native-LFE makeup: the LFE output is 2x the
+  input LFE (+6 dB). The filter graph uses unity LFE gain while upmix is enabled
+  (extracted bass must not be boosted), so native 5.1/7.1 LFE needs the same
+  makeup HeSuVi's `lfc.txt` applies. Bass extracted by the upmixer stays at 1x.
 - The silence floor for the stereo detection is -90 dBFS (`3e-5`) instead of
   the VST's `-120 dBFS` (`1e-6`): dummy 8-channel output that carries only
   dither-level noise on the non-L/R channels (browsers, games) still counts as

@@ -205,6 +205,17 @@ struct UpmixCore {
 
     bool hasOutput(unsigned long n) const { return outFifoFill >= n; }
 
+    // Advance the output FIFO without emitting anything. Used while the plugin
+    // is bypassing so the upmix core stays primed: on the next switch to upmix
+    // the FIFO already holds the processed audio and the output does not start
+    // with a silent fill-up period.
+    void discardOutput(unsigned long n) {
+        const std::size_t outSize = outFifo[0].size();
+        const std::size_t take = std::min<std::size_t>(n, outFifoFill);
+        outFifoReadIdx = (outFifoReadIdx + take) % outSize;
+        outFifoFill -= take;
+    }
+
     void writeOut(LADSPA_Data *out[kNumOut], unsigned long n) {
         const std::size_t outSize = outFifo[0].size();
         for (int port = 0; port < kNumOut; ++port) {
@@ -286,6 +297,22 @@ struct AutoInstance {
     bool wasBypassed = false;
     int nonStereoBlocks = 0;
     int stereoBlocks = 0;
+
+    // Write the newest samples of every input channel into the bypass delay
+    // ring. Kept current in *both* modes: otherwise switching to bypass emits
+    // the stale contents (initially zeros), i.e. a full 128 ms hole.
+    void updateBypassRing(unsigned long n) {
+        const std::size_t kLat = (std::size_t)kLatency;
+        const unsigned long m = std::min<unsigned long>(n, kLatency);
+        const std::size_t start = (bypassWriteIdx + (n - m)) % kLat;
+        for (int c = 0; c < kNumOut; ++c) {
+            std::vector<float> &buf = bypass[c];
+            const LADSPA_Data *src = in[c];
+            for (unsigned long j = 0; j < m; ++j)
+                buf[(start + j) % kLat] = src ? src[n - m + j] : 0.0f;
+        }
+        bypassWriteIdx = (bypassWriteIdx + n) % kLat;
+    }
 };
 
 LADSPA_Handle autoInstantiate(const LADSPA_Descriptor *, unsigned long sampleRate) {
@@ -354,49 +381,49 @@ void autoRun(LADSPA_Handle handle, unsigned long n) {
         isActuallyStereo = false;
 
     if (!isActuallyStereo) {
-        // ---- bypass path: pass the (delayed) input through unchanged ----
-        if (!self->wasBypassed) {
-            self->core.reset();
-            self->wasBypassed = true;
-        }
+        // ---- bypass path: pass the delayed input through ----
+        // The delay ring is kept current in both modes, so a switch from upmix
+        // to bypass starts with real audio instead of the stale/zero ring.
         // Delay-line semantics: dst[s] = src[s - kLatency], with samples from
-        // before this run taken from the ring buffer. Reads and writes are done
-        // in separate passes so this stays correct even when the block length n
-        // exceeds the delay length (a single read/write-per-index pass would
-        // wrap around and emit samples from this very run at the wrong delay).
+        // before this run taken from the ring buffer. Read before writing so
+        // this stays correct even when n exceeds the delay length.
         const std::size_t kLat = (std::size_t)kLatency;
-        const unsigned long m = std::min<unsigned long>(n, (unsigned long)kLatency);
-        const std::size_t start = (self->bypassWriteIdx + (n - m)) % kLat;
         for (int c = 0; c < kNumOut; ++c) {
             if (!self->out[c]) continue;
             std::vector<float> &buf = self->bypass[c];
-            LADSPA_Data *src = self->in[c];
+            const LADSPA_Data *src = self->in[c];
             LADSPA_Data *dst = self->out[c];
-            // read pass: outputs older than kLatency samples come from the ring,
-            // the rest can be taken directly from this run's input
+            // Native LFE is recorded 10 dB low. While upmix is enabled the graph
+            // applies unity gain to the LFE path (extracted bass must not get the
+            // makeup), so the native-channel +6 dB (= 2x, HeSuVi lfc.txt) is
+            // applied here, only in the bypass branch.
+            const float gain = (c == 3) ? 2.0f : 1.0f;
             if (n < (unsigned long)kLatency) {
                 for (unsigned long s = 0; s < n; ++s)
-                    dst[s] = buf[(self->bypassWriteIdx + s) % kLat];
+                    dst[s] = gain * buf[(self->bypassWriteIdx + s) % kLat];
             } else {
                 for (unsigned long s = 0; s < (unsigned long)kLatency; ++s)
-                    dst[s] = buf[(self->bypassWriteIdx + s) % kLat];
+                    dst[s] = gain * buf[(self->bypassWriteIdx + s) % kLat];
                 for (unsigned long s = (unsigned long)kLatency; s < n; ++s)
-                    dst[s] = src ? src[s - kLatency] : 0.0f;
+                    dst[s] = gain * (src ? src[s - kLatency] : 0.0f);
             }
-            // write pass: the ring keeps the last m samples of this run
-            for (unsigned long j = 0; j < m; ++j)
-                buf[(start + j) % kLat] = src ? src[n - m + j] : 0.0f;
         }
-        self->bypassWriteIdx = (self->bypassWriteIdx + n) % kLat;
+        self->updateBypassRing(n);
+
+        // Keep the upmix core primed (output discarded). Re-engaging upmixing
+        // then starts with processed audio already in its FIFOs instead of a
+        // silent fill-up period.
+        self->core.feed(self->in[0], self->in[1], n);
+        self->core.discardOutput(n);
+        self->wasBypassed = true;
         return;
     }
 
     // ---- processing path ----
-    if (self->wasBypassed) {
-        self->core.reset();
-        self->wasBypassed = false;
-    }
+    self->wasBypassed = false;
     self->core.feed(self->in[0], self->in[1], n);
+    // Keep the bypass delay ring current for a future switch to bypass
+    self->updateBypassRing(n);
     if (!self->core.hasOutput(n)) {
         for (int c = 0; c < kNumOut; ++c)
             if (self->out[c]) std::memset(self->out[c], 0, sizeof(LADSPA_Data) * n);

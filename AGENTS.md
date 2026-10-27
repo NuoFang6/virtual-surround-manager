@@ -54,8 +54,11 @@ copyLFE → 低通 120 Hz LR4（两只 Q=0.7071 biquad 级联）→ 增益（见
 | 项 | 值 | 出处 |
 |---|---|---|
 | 低通 | 120 Hz，LR4（24 dB/oct），Q=0.7071×2 | Dolby LFE 频带上限 + LR 专业标准（实测频响与理论逐位吻合） |
-| 增益 | 上混开 → 1.0；上混关 → 2.0 | UA/Apollo：+10 dB 补偿只适用于原生 LFE 通道 |
+| 增益 | 上混开 → 图里 1.0；上混关 → 图里 2.0 | UA/Apollo：+10 dB 补偿只适用于原生 LFE 通道 |
+| 原生 LFE 补偿（上混开时） | auto 插件在 **bypass 分支给 LFE ×2**（2026-10-28） | 图里的 LFE 增益在上混开时必须保持 1.0（提取低音不能加 2×）；原生 7.1 被插件旁路，由插件补上 2×，等效于上混关时的 2.0 |
 | 渲染 | **固定直通**（δ IR 等长方案，无开关、无旧卷积路径） | 专利 CN107770718A 的虚拟化器惯例（LFE 不卷积 + 等量 L/R + 延迟对齐）；用户试听确认低频密度/力度改善 |
+
+- **插件 bypass 的 LFE 补偿实测**：原生 7.1（仅 LFE 40 Hz 0.25）在上混开（插件 2× + 图 1.0）与上混关（图 2.0）下输出 RMS 0.10686 vs 0.10532（差 0.25 dB，修复前上混开低 6 dB）。
 
 ### 卷积与输出
 - **HRIR**：HeSuVi 14 通道 WAV，48 kHz，格式 24/32-bit（`src/assets/hrir_wav/`，含用户自有的 6 个预设，构建时默认打包）。
@@ -127,6 +130,9 @@ copyLFE → 低通 120 Hz LR4（两只 Q=0.7071 biquad 级联）→ 增益（见
 16. **`disable_routing` 自回声 bug（2026-10-28 修复）**：清 target 后，应用自己的 metadata 回调看到"target 被移除"就把流 **重新路由回桥 sink**（EasyEffects 兼容逻辑）。结果流从未离开桥，500 ms 等待超时后销毁 sink → 正常退出也触发 MPRIS Pause（实测 SIGTERM 后 524 ms 收到 Pause）。修复：写清除前先把流从 `routed_node_ids` 摘掉，自回声不再命中重路由分支。
 17. **验收实测（隔离 PipeWire/WirePlumber/D-Bus + null sink + 假 MPRIS 播放器，mpv 作为其子进程）**：6 次切换（预置/上混交替，含 24-bit 预置）0 个 >3× 基线的窗、0 个 ≥20 ms 静音段（上混开启的延迟线灌注被旧 HRIR 长尾覆盖，仅出现 <20 ms 的瞬时下陷）、MPRIS **0 次 Pause**、mpv `pause=false` 全程；正常 SIGTERM 退出 0 次 Pause；对照 `kill -9` 强杀应用（sink 在流仍链接时消失）**10 ms 内收到 Pause**，证明测试能捕获用户描述的症状。
 18. **重启后流的过期 target（2026-10-28 实机发现）**：WirePlumber 会按流状态恢复上一次的 `target.object`（通常是旧 sink 的 **object.serial**，如 17494）。旧实例的 sink 已不存在时，新实例的 `resolve_sink_name()` 解析为空，原逻辑把它当成"已分配给别的设备"而永久放弃接管——实测重启后 Edge 停在物理设备直出，必须手动切回。现在把**无法解析的 target 视为跟随默认设备**并路由到桥（与"旧世代虚拟 sink 名字前缀"同一语义）；实机重启后 Edge 自动回到 `effect_input.virtual-surround-manager`。代价：若目标设备只是尚未出现在 registry，可能被提前接管；按本产品的虚拟化语义接受。
+19. **auto 插件内容切换的 128 ms / 75 ms 空洞（2026-10-28 修复）**：宿主机回归测试发现，上混→旁路时旁路延迟环从未在上混期间写入，切换后输出 12 个 512 块（6144 样本≈128 ms）全零；旁路→上混时核心被 reset，输出 FIFO 重新灌注，约 7 个块（≈75 ms）全零；另外旁路 LFE 仍是 1×。修复：**两种模式都持续写旁路延迟环**，旁路期间**持续 feed 上混核心并 discard 输出**，不再 reset；旁路 LFE ×2。宿主测试现在断言切换块不为零、原生 LFE 比例 2.0、FC 比例 1.0（`OK (0 failures)`）。
+20. **非 14 通道 HRIR（2026-10-28 修复）**：`write_lfe_bypass_delta` 现在拒绝 `channels != 14`；7 通道 `oal_dflt.wav` 在启动/切换时都会报 "has 7 channels, expected 14"，旧图保留、设置回滚，不再生成空间像错误的图。实测启动被拒绝时无任何 `virtual-surround` 节点。
+21. **短 IR + 上混 OFF→ON 的剩余缺口（2026-10-28 实测）**：用只含 `27_95_142.wav`（218 帧≈4.5 ms）的测试列表强制先翻上混，上混 OFF→ON 出现 **90 ms 静音**（6.43–6.52 s）。原因：旧图是上混关、没有 FreeSurround 128 ms 延迟线可覆盖新图的灌注；长 HeSuVi IR（~1 s）的尾巴能覆盖，所以常规预设不受影响。这是图重建的固有限制，未用交叉淡化（会引入 128 ms 时间错位/回声）；文档如实记录，用户的短 IR 下翻上混会听到约 90 ms 空档。
 
 ## 5. HRIR 通道映射（已解决，勿再猜）
 
@@ -198,7 +204,9 @@ Copy:    L0=LVI R1=LVI SL0=SLVI SR1=SLVI RL0=RLVI RR1=RLVI C0=CVI
 | 切换耗时（6 次，桥→新效果 sink 的 Link 确认） | 越快越好 | **27 / 30 / 31 / 31 / 37 / 40 / 44 / 45 / 47 ms**（历次） | ✅ |
 | 切换电平尖峰（10 ms 窗，null sink monitor） | 0 个 >3× 基线 | **0 个**；最大 1.85× 基线（乐曲/预置自身动态） | ✅ |
 | 切换静音段（10 ms 窗，RMS <0.05× 基线） | 越短越好 | **0 个 ≥20 ms**；上混开/关切换有 <20 ms 的瞬时下陷（旧 HRIR 1 s 长尾/旧 FreeSurround 延迟线覆盖新图 128 ms 灌注） | ✅ |
-| 短 IR（`27_95_142.wav`，218 帧≈4.5 ms）切换 | 无长静音、无 >3× 尖峰 | ON→ON 无 ≥20 ms 静音（仅 10 ms 级下陷）；OFF→ON 实测无 ≥20 ms 静音；**ON→OFF 有约 128 ms 的旧延迟线重叠**，峰值 1.5–2.3× 基线（相位相关，<3×） | ✅/残留 |
+| 短 IR（`27_95_142.wav`，218 帧≈4.5 ms）切换 | 无长静音、无 >3× 尖峰 | 预置 ON→ON 无 ≥20 ms 静音（仅 10 ms 级下陷）；**ON→OFF 有约 128 ms 的旧延迟线重叠**，峰值 1.5–2.3× 基线（相位相关，<3×）；**上混 OFF→ON（旧图也是短 IR）有 90 ms 静音**（§4-21） | ✅/已知残留 |
+| auto 插件宿主回归（`freesurround_ladspa_test`） | 0 failures | 440 Hz→FC 0.660、60 Hz→LFE 0.719；切换块无零；原生 LFE 2.0、FC 1.0 | ✅ §4-19 |
+| 原生 7.1 LFE 集成（上混开 vs 关） | 电平一致 | RMS 0.10686 vs 0.10532（0.25 dB）；修复前上混开 0.0530（−6 dB） | ✅ §4-19/§2 |
 | 切换时 MPRIS 暂停 | 0 次 | 6 次切换 **0 次 Pause**；mpv `pause=false` 全程 | ✅ |
 | 正常退出（SIGTERM）时 MPRIS 暂停 | 0 次 | **0 次**（等流离开桥后才删 sink） | ✅ §4-16 |
 | 重启后过期 target 的接管（实机 Edge） | 自动回到桥 sink | 修复前 `left alone`（物理直出）；修复后 `routed to effect_input.virtual-surround-manager` | ✅ §4-18 |
@@ -210,8 +218,6 @@ Copy:    L0=LVI R1=LVI SL0=SLVI SR1=SLVI RL0=RLVI RR1=RLVI C0=CVI
 **真问题**
 1. **上混延迟 128 ms**（FreeSurround 固有）——对游戏/交互是硬伤。方向：直通路径免延迟（需迟滞防抖）、缩小 FFT 块 4096→2048（需听感验证）。
 2. **延迟未传播到 sink 输入端口**——应用侧（mpv 等）看到 0 → 音画同步风险。输出端口有 6144，输入端口 0。疑似 PipeWire filter-chain 传播限制，可尝试上报上游；播放时复测确认。
-3. **混合内容增益缺口**——上混开关为 ON 时，原生 7.1 的 LFE 也只吃 1.0 增益（Apollo 规则要求 2.0）。静态图无法区分内容类型；可选方案：GUI 增加"强制原生 LFE 增益"选项。
-4. **非 14ch HRIR 文件**（见 §5）。
 
 **已关闭的疑虑**
 - "卷积器内部延迟未上报"：**PipeWire ≥1.4 的 convolver 是 0-latency 两段式 FFT 卷积**（小 FFT 处理头部 + 大 FFT 处理长尾，官方 1.4 release notes），不存在需要上报的卷积器延迟。实测互相关 −1 样本亦印证。唯一未传播到输入端口的是 LADSPA 的 128 ms（输出端口已报 6144）。
@@ -220,10 +226,16 @@ Copy:    L0=LVI R1=LVI SL0=SLVI SR1=SLVI RL0=RLVI RR1=RLVI C0=CVI
 - **播放中切换预设/上混开关的"变响 + 暂停"与 2 s 静音**：根因是删除 sink 触发 WirePlumber 的 MPRIS 暂停 + 流回落默认设备；静音方案只是遮住电平。现改为稳定桥 sink，实测 27–44 ms 完成、0 尖峰、0 ≥20 ms 静音、0 MPRIS 暂停（§4-13~17、§6）。
 - **24-bit HRIR 导致效果图静音**：δ IR 头格式错误，已修（§4-15）。
 - **正常退出时也会暂停播放器**：`disable_routing` 自回声把流重新路由回桥，已修（§4-16）。
+- **混合内容增益缺口**：auto 插件 bypass 分支现在给原生 LFE 补 2×；上混开/关的原生 7.1 LFE 实测只差 0.25 dB（§4-19）。
+- **非 14ch HRIR**：现在直接拒绝并回滚，不再生成错误空间像（§4-20）。
+- **auto 插件内容切换的 128 ms / 75 ms 空洞**：旁路延迟环和上混核心保持预热，宿主回归测试 0 空洞（§4-19）。
 
 **准问题（生态固有）**
 5. HRIR 预设是特定耳机测量，通用预设对任意耳机是近似。
-6. **上混 ON→OFF 切换有约 128 ms 的旧延迟线重叠**：旧效果图的 FreeSurround 延迟线在新图开始输出后还会把最后 128 ms 音频放完，与新图实时输出叠加。实测峰值 **1.5–2.3× 基线（+3.5~+7 dB，相位相关，低于 3× 尖峰阈值）**，听感是短暂的"双声/隆起"，不是原来的持续 +10.5 dB 跳变；ON→ON、OFF→ON 没有这个问题（旧延迟线正好盖住新图灌注）。彻底消除需要双效果图交叉淡化（未实施，复杂度高）。
+6. **上混 ON→OFF 的 128 ms 重叠 / OFF→ON 的短 IR 缺口**：
+   - ON→OFF：旧效果图的 FreeSurround 延迟线在新图开始输出后还会把最后 128 ms 音频放完，与新图实时输出叠加。实测峰值 **1.5–2.3× 基线（+3.5~+7 dB，相位相关，低于 3× 尖峰阈值）**，听感是短暂的"双声/隆起"，不是原来的持续 +10.5 dB 跳变。
+   - OFF→ON：新图需要 FreeSurround 的 128 ms 延迟线灌注；旧图（上混关）没有这条延迟线，只有 HRIR 尾巴。长 HeSuVi IR（~1 s）能覆盖；**短 IR（如 `27_95_142.wav`，4.5 ms）实测有 90 ms 静音**（§4-21）。
+   - 彻底消除需要双效果图交叉淡化（会引入 128 ms 时间错位/回声）或切换时主动短静音；当前未实施。
 
 **优化想法（未实施）**
 7. HRIR 预设响度归一化（换预设音量跳变）。社区做法：HeSuVi/EqAPO 用户将 Preamp 调到 **Peak gain ≈ −0.1 dB**（按 IR 峰值校准），而我们的 0.30 固定值恰好等于"预留 10 dB headroom（×0.3）"的经验法则——可作为可选的自适应 preamp。
@@ -248,7 +260,7 @@ Copy:    L0=LVI R1=LVI SL0=SLVI SR1=SLVI RL0=RLVI RR1=RLVI C0=CVI
 - **隔离测试**：`pactl load-module module-null-sink sink_name=vsm_test_sink` → `pactl set-default-sink` → 重启应用（filter-chain 在创建时连默认设备）→ 测完恢复默认设备并卸载 null sink。
 - **录音**：必须用 `parec --device=vsm_test_sink.monitor --format=float32le --rate=48000 --channels=2 --raw` 走管道读固定字节数（timeout/SIGTERM 会截断 wav 文件）。`pw-record` 无法按名字连接 monitor，且目标不匹配会静默录麦克风——**务必先验证连接**（`pw-dump` 查 Link 对象确认）。
 - **测试信号**：8ch WAV，WAVEFORMATEXTENSIBLE + PCM(0x0001) 16-bit，通道掩码 0x63F；往返校验电平。
-- 项目自带：`ctest --test-dir build`（目前只有 appstream）；插件冒烟：`cmake -B build -DBUILD_LADSPA_TEST_HOST=ON && cmake --build build --target freesurround_ladspa_test && ./build/bin/freesurround_ladspa_test build/bin/freesurround_ladspa.so`。
+- 项目自带：`ctest --test-dir build`（目前只有 appstream）；插件回归（必需，覆盖 auto 切换和 LFE 补偿）：`cmake -B build -DBUILD_LADSPA_TEST_HOST=ON && cmake --build build --target freesurround_ladspa_test && ./build/bin/freesurround_ladspa_test build/bin/freesurround_ladspa.so`，期望 `OK (0 failures)`（440Hz→FC 0.66、60Hz→LFE 0.719、切换块无零、原生 LFE 2.0、FC 1.0）。
 - 应用重启：先 `ps -eo pid,comm | grep virtual-surroun` 看清 PID，再 `kill <pid>`，然后 `setsid nohup /usr/bin/virtual-surround-manager &`。**不要用 `pgrep -f` 拼在同一行**（会匹配到自己的 shell，§5 已栽过）。
 - **播放中切换的验收方法（2026-10-28 定稿，可复现）**：完全隔离的 PipeWire + WirePlumber + pipewire-pulse + D-Bus 会话，null sink 做默认输出，假 MPRIS 播放器（Python dbus，mpv 作为子进程）播放稳定正弦，应用用 `VSM_TEST_AUTO_SWITCH_MS=4000` 自动切预置/上混，`parec` 录 null sink monitor，numpy 做 10 ms 窗 RMS/峰值包络；再看假播放器的 Pause 日志。
   - 启动骨架（`/tmp/vsm_pw/run_audio_test.sh` 已有一份可直接跑的版本；`fake_mpris.py` = 假播放器，`mpv_poll.py` = IPC 轮询）：
@@ -287,5 +299,6 @@ Copy:    L0=LVI R1=LVI SL0=SLVI SR1=SLVI RL0=RLVI RR1=RLVI C0=CVI
 | `3ea3091` | HeSuVi 通道映射权威说明 + IR 级验证（README/注释） |
 | `cc6fde6` | LFE 直通模式（δ IR + GUI 开关） |
 | `270d51c` / `0846c25` / `9837ecd` | 上一个 LLM 的切换修复尝试（重叠重建 / 钉路由 / 流静音 + 确认框）；**2026-10-28 已证明不足，mute/confirm/pin 代码全部删除**，见 §4-11/13 |
-| 本次（2026-10-28，未提交） | 稳定桥 sink + 只重建效果图（§4-14）；WirePlumber MPRIS 暂停根因；24-bit δ IR 头修复（§4-15）；`disable_routing` 自回声修复（§4-16）；隔离会话 + 假 MPRIS 验收（§4-17、§6）；重启过期 target 接管修复（§4-18）；删除静音/确认/回滚/钉路由机制；加默认关闭的 `VSM_TEST_AUTO_SWITCH_MS` 测量钩子；实机安装并验证 Edge 经新桥路由 |
+| `86c5cc5` | 稳定桥 sink + 只重建效果图（§4-14）；WirePlumber MPRIS 暂停根因；24-bit δ IR 头修复（§4-15）；`disable_routing` 自回声修复（§4-16）；隔离会话 + 假 MPRIS 验收（§4-17、§6）；重启过期 target 接管修复（§4-18）；删除静音/确认/回滚/钉路由机制；加默认关闭的 `VSM_TEST_AUTO_SWITCH_MS` 测量钩子；实机安装并验证 Edge 经新桥路由 |
+| 本次（2026-10-28 审计提交） | auto 插件内容切换无空洞 + 原生 LFE bypass 2×（§4-19）；非 14ch HRIR 拒绝（§4-20）；短 IR OFF→ON 90ms 缺口记录（§4-21）；插件宿主回归测试升级；README/AGENTS 的 LFE/切换文档同步（含旧 `convLFE` 表修正） |
 | 更早 | `15fb76f` Flatpak 崩溃修复（上游历史） |

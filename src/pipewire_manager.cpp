@@ -106,6 +106,14 @@ static bool write_lfe_bypass_delta(const string &hrir_path, const string &delta_
     if (!parse_wav_format(hrir_path, channels, rate, block_align, bits, format_tag, frames))
         return false;
 
+    // The graph maps all 14 HeSuVi channels; a file with fewer channels would
+    // silently produce a wrong spatial image (PipeWire tolerates out-of-range
+    // channel indices), so reject it before the graph is built.
+    if (channels != 14) {
+        qWarning("write_lfe_bypass_delta: '%s' has %u channels, expected 14", hrir_path.c_str(), channels);
+        return false;
+    }
+
     // Keep a sane cap so a broken header cannot produce a huge file
     if (frames > rate * 2)
         frames = rate * 2;
@@ -573,9 +581,9 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
         QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/lfe_bypass_delta.wav");
     QDir().mkpath(QFileInfo(delta_file).absolutePath());
     if (!write_lfe_bypass_delta(hrir_wav_path, delta_file.toStdString())) {
-        qWarning("build_module_args: Could not create LFE bypass impulse for '%s'", hrir_wav_path.c_str());
-        Q_EMIT error_occurred(QStringLiteral("Could not create the LFE bypass impulse response. "
-                                             "The selected HRIR file could not be parsed."));
+        qWarning("build_effects_module_args: Could not create LFE bypass impulse for '%s'", hrir_wav_path.c_str());
+        Q_EMIT error_occurred(QStringLiteral("Could not use the selected HRIR. It must be a valid "
+                                             "14-channel HeSuVi WAV file (see the profile list notes)."));
         return {};
     }
     const string lfe_delta_path = json_escape(delta_file.toStdString());
@@ -592,7 +600,7 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
     if (upmix_enabled) {
         const QString plugin_path = find_ladspa_plugin();
         if (plugin_path.isEmpty()) {
-            qWarning("build_module_args: FreeSurround LADSPA plugin not found");
+            qWarning("build_effects_module_args: FreeSurround LADSPA plugin not found");
             Q_EMIT error_occurred(QStringLiteral("The FreeSurround upmix plugin (freesurround_ladspa.so) "
                                                  "was not found. Reinstall this application or copy the "
                                                  "plugin into a LADSPA directory like /usr/lib/ladspa."));
@@ -930,6 +938,8 @@ bool PipeWireManager::replace_virtual_surround_module(const string &hrir_wav_pat
         effects_generation = old_generation;
         pw_thread_loop_unlock(thread_loop);
         qWarning("replace_virtual_surround_module: Failed to load the new effects module, keeping the old one");
+        Q_EMIT error_occurred(QStringLiteral("Could not switch the virtual surround profile. "
+                                             "The previous one is still active; check the selected HRIR file."));
         return false;
     }
 

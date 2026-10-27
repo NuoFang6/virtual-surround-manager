@@ -154,17 +154,23 @@ The naming is `[family prefix][ear][slot]`, so the resulting WAV channel map is:
 | 3  | SL | R | convSL_R |
 | 4  | RL | L | convRL_L |
 | 5  | RL | R | convRL_R |
-| 6  | C  | L | convFC_L (and convLFE_L) |
+| 6  | C  | L | convFC_L |
 | 7  | FR | R | convFR_R |
 | 8  | FR | L | convFR_L |
 | 9  | SR | R | convSR_R |
 | 10 | SR | L | convSR_L |
 | 11 | RR | R | convRR_R |
 | 12 | RR | L | convRR_L |
-| 13 | C  | R | convFC_R (and convLFE_R) |
+| 13 | C  | R | convFC_R |
 
 Channels 7-12 look "shuffled" only because HeSuVi lists the right-ear IRs of
 the right-side speakers in that block.
+
+The LFE channel is **not** convolved with the center HRIR anymore. It uses a
+runtime-generated unit-impulse IR of the same length and format as the selected
+HRIR (`convLFE_L`/`convLFE_R`), so the LFE bypasses the HRIR coloring, is mixed
+equally into both ears, and keeps the same convolver timing as the other
+channels. Its 120 Hz LR4 lowpass and source-dependent gain are described below.
 
 This was verified **from the IR files themselves** (no recordings involved):
 for every real-measurement preset, the near-ear channel leads with the
@@ -174,10 +180,11 @@ presets (Apple/Atmos) carry only the level asymmetry and zero ITD. To re-check
 any preset, cross-correlate the channel pairs listed above instead of trusting
 recording-side channel maps - those are frequently wrong.
 
-Note: the mapping assumes a 14-channel HRIR. Files with fewer channels (e.g.
-the bundled `oal_dflt.wav`, which has 7) still load - the module is created -
-but the out-of-range channel requests cannot produce the intended per-ear IRs,
-so the spatial image will be wrong. Use 14-channel HeSuVi WAVs.
+Note: the mapping requires a 14-channel HRIR. Files with fewer channels (e.g.
+the bundled `oal_dflt.wav`, which has 7) are rejected with an error and the
+previous profile stays active; otherwise PipeWire would tolerate the
+out-of-range channel indices and produce a wrong spatial image. Use 14-channel
+HeSuVi WAVs.
 
 ### Stereo upmixing
 
@@ -185,7 +192,24 @@ The stereo-to-7.1 upmixer is the bundled FreeSurround LADSPA plugin
 (`freesurround71_auto` label). It upmixes only while all non-L/R input
 channels are silent; as soon as any other channel carries signal, real
 multichannel content is assumed and the signal is passed through unchanged
-(with matching latency compensation).
+(the native-LFE makeup described below still applies). The bypass delay ring
+and the upmix core's FIFOs are kept primed, so switching between stereo and
+multichannel content is gap-free instead of flushing a silent buffer.
+
+### LFE / bass management
+
+Bass below the 70-90 Hz transition is extracted from stereo by the upmixer and
+moved to the LFE channel (the main channels are attenuated by the same amount,
+so there is no doubled bass). The LFE path is lowpassed at 120 Hz with a
+4th-order Linkwitz-Riley filter, rendered without HRIR coloring as equal L/R,
+and gets the standard native-channel makeup:
+
+- Bass extracted from stereo: unity gain (it is at full level already).
+- Native LFE from 5.1/7.1 content: 2x (+6 dB), the same makeup HeSuVi's
+  `lfc.txt` applies, because the LFE channel is recorded 10 dB low.
+
+The auto upmixer applies the 2x to native LFE in its bypass branch; the graph
+itself uses the corresponding unity/2x gain when upmixing is on/off.
 
 ### Crackling / brief dropouts
 
@@ -197,9 +221,16 @@ Two known sources of short interruptions during playback are addressed:
   quanta where the convolver chain is prone to xruns, and every quantum
   renegotiation is audible.
 - The upmix plugin applies hysteresis before re-engaging upmixing after a
-  bypass period (see `third_party/freesurround_ladspa/README.md`): every
-  bypass↔processing switch flushes the plugin's FIFOs, which would otherwise
-  be audible as a click on content hovering at the stereo detection threshold.
+  bypass period (see `third_party/freesurround_ladspa/README.md`): this keeps
+  content hovering at the stereo detection threshold from toggling the
+  detector. The delay ring and upmix FIFOs stay primed, so the actual
+  content-type switch itself is gap-free.
+- Toggling upmixing on rebuilds the effect graph and needs a fresh 128 ms
+  delay line. A normal HeSuVi HRIR is about 1 s long and its tail covers that
+  refill, so changing profiles stays seamless. A very short HRIR (<128 ms,
+  e.g. `27_95_142.wav`) leaves a ~90 ms gap when upmixing is switched on;
+  upmixing off is a short overlap of the old delay line. This is a property of
+  the FreeSurround latency, not a routing problem.
 
 ## Acknowledgements
 
