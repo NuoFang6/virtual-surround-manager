@@ -310,12 +310,16 @@ Copy:    L0=LVI R1=LVI SL0=SLVI SR1=SLVI RL0=RLVI RR1=RLVI C0=CVI
 
 ## 8. 打包与分发
 
-- **AppImage**：`dist/appimage/build_virtual_surround_manager.sh`（quick-sharun）。已修复并验证的坑：
-  - 脚本会把**本机 VS Code**（`/usr/share/code`，近 1 GB）误打包——二进制字符串匹配 "code" 导致。打包前删除。
-  - GPU 驱动（NVIDIA/Mesa/libLLVM，~350 MB）与 `libQt6WebEngineCore` 应清除。
-  - **dlopen 的 PipeWire 模块和 SPA 插件必须手动补**：`libpipewire-module-filter-chain.so` 与 `spa-0.2/filter-graph/`（ldd 收集不到）。否则报 "Error creating virtual surround device"。
-  - 成品：~210 MB（x86-64-v3，`-DCMAKE_C_FLAGS/-DCMAKE_CXX_FLAGS="-march=x86-64-v3"`），朋友机器需 Mesa/NVIDIA 正常驱动。
-- 朋友版 AppImage 构建于 LFE 重构**之前**，且早于 2026-10-28 的稳定桥/24-bit δ IR 修复；需要重新打包（否则切换预置仍会变响/暂停，24-bit 预置会静音）。
+- **AppImage（2026-10-28 重建）**：`dist/appimage/build_virtual_surround_manager.sh`（quick-sharun），x86-64-v3，产物 `build_appimage/virtual-surround-manager-0.0.1-x86_64-v3.AppImage`（约 101 MB，SHA-256 `320cad4d0b0cb2f3dbb7055699bd24e9ad5ea8a006c04ebef2b52f6cce55b5f5`；精简后 AppDir 约 362 MB）。
+  - 脚本使用独立目录：`build-appimage`（编译）、`build_appimage/install`（安装树）、`AppDir-appimage`（打包根），不污染本机 `build/`；版本从 `project(... VERSION ...)` 读取。
+  - x86_64 上强制 `-march=x86-64-v3`（要求 AVX2 级别 CPU，CachyOS 默认），插件与应用同批编译。
+  - 依赖扫描设 `QT_QPA_PLATFORM=offscreen` 与空的 `PIPEWIRE_RUNTIME_DIR`，不碰用户正在播放的 PipeWire 会话，也不需要 xvfb。
+  - **dlopen 的 PipeWire 模块和 SPA 插件必须手动补**：`libpipewire-module-filter-chain.so` 与 `spa-0.2/filter-graph/`。路径必须用 `pkg-config --variable=moduledir libpipewire-0.3` / `plugindir libspa-0.2` 获取；Arch/CachyOS 实际在 `/usr/lib/pipewire-0.3`、`/usr/lib/spa-0.2`，不在 libpipewire-0.3.so 旁边（旧脚本的 `dirname $(ldd ...)` 是错的）。
+  - quick-sharun 会误带 `/usr/share/code`（近 1 GB）、WebEngine、GPU 驱动、Plasma/QML 与媒体库。脚本把 QML 裁到本应用实际 import 的模块，然后做一次 ELF 可达性闭包：删除未被任何可执行文件/Qt 插件/QML 插件引用的库，并校验可达根没有缺失依赖。GPU 厂商库和 DRI 不打包，使用目标机器的 Mesa/NVIDIA，避免版本/内核不匹配。
+  - 内置：Qt 6.12/Kirigami、Qt Wayland 插件、PipeWire 1.6.10 客户端 + filter-chain 模块 + SPA filter-graph、FreeSurround LADSPA、全部 HRIR。依赖目标机器有运行中的 PipeWire + WirePlumber（CachyOS 默认）和 FUSE；无 FUSE 时用 `APPIMAGE_EXTRACT_AND_RUN=1` 或 `--appimage-extract-and-run`。
+  - niri 下直接运行 AppImage 即可；启用“登录时自动启动”时，应用会把 desktop 文件的 `Exec` 改成 AppImage 绝对路径（`$APPIMAGE`）。
+  - 隔离 PipeWire + null sink 验收（2026-10-28）：AppImage 内创建 `effect_input.virtual-surround-manager` 与 `….effects.1`；LADSPA 从 AppImage 的 `/usr/lib/ladspa` 加载；1 kHz 立体声被识别为“检测到立体声，上混已生效”；录音 RMS 0.03819、峰值 0.05585，与 AppDir 运行一致。上混关闭路径 RMS 0.02904。完整运行日志无缺库/启动错误。
+  - 旧 `virtual-surround-manager-15fb76f-x86-64-v3.AppImage`（201 MB）构建于 LFE 重构之前，早于稳定桥/24-bit δ IR 修复，**不要再分发**。
 - 应用配置：`~/.config/virtual-surround-manager`（**单文件**，非目录；新增 `lfe_mode=balanced|reference|impact`）；HRIR 用户目录：`~/.local/share/virtual-surround-manager/hrir_wav/`；直通 δ 文件：`~/.local/share/virtual-surround-manager/lfe_bypass_delta.wav`（每次创建模块按当前 HRIR 重新生成）。
 
 ## 9. 测试方法与环境速查

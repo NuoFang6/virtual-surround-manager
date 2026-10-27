@@ -11,6 +11,8 @@ pacman -Syu --noconfirm \
 	extra-cmake-modules \
 	cmake \
 	patchelf \
+	pkgconf \
+	python \
 	kirigami \
 	ki18n \
 	kcoreaddons \

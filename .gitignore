@@ -9,3 +9,4 @@ quick-sharun.sh
 flatpak-build
 repo
 build-appimage
+AppDir-*

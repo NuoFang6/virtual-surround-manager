@@ -125,9 +125,15 @@ The build also compiles the bundled **FreeSurround (Real3D) LADSPA upmix plugin*
 
 1. Clone repository: `git clone https://github.com/Berny23/virtual-surround-manager.git`
 2. Change directory: `cd virtual-surround-manager`
-3. Build the AppImage: `./dist/appimage/build_virtual_surround_manager.sh`
-4. Make executable: `chmod +x ./build_appimage/virtual-surround-manager-unknown-x86_64.AppImage`
-5. Run the program: `./build_appimage/virtual-surround-manager-unknown-x86_64.AppImage`
+3. Build the AppImage: `./dist/appimage/build_virtual_surround_manager.sh` (x86-64-v3 on x86_64)
+4. Make executable: `chmod +x ./build_appimage/virtual-surround-manager-*-x86_64-v3.AppImage`
+5. Run the program: `./build_appimage/virtual-surround-manager-*-x86_64-v3.AppImage`
+
+The AppImage bundles Qt/Kirigami, the PipeWire filter-chain module and SPA
+plugins, the FreeSurround LADSPA plug-in and the HRIR presets. It still uses the
+host's PipeWire/WirePlumber session and GPU driver; in a minimal session, start
+PipeWire/WirePlumber first (or use `--appimage-extract-and-run` when FUSE is not
+available).
 
 ## Development notes
 
