@@ -134,15 +134,50 @@ The build also compiles the bundled **FreeSurround (Real3D) LADSPA upmix plugin*
 ### HRIR channel mapping
 
 The channel indices of the HeSuVi 14-channel HRIR WAV files used in the filter
-graph (see `create_virtual_surround_module` in `src/pipewire_manager.cpp`) were
-**determined empirically, by ear, not from the documented channel labels**.
+graph (see `create_virtual_surround_module` in `src/pipewire_manager.cpp`)
+follow **HeSuVi's own convolution channel order**. Stock HeSuVi 2.0.0.1
+(`hesuvi.txt`) feeds its convolvers in this order:
 
-If you ever want to verify or change them: **do not trust recordings.** The
-channel map reported on the recording side of recording tools (e.g. when
-recording the WAV playback or the virtual device with an audio recorder) is
-very likely wrong, which is exactly why the indices used here deviate from
-what the labels suggest. Changing these values based on a naive recording will
-break the spatial rendering.
+```
+Channel: L0 R1 SL0 SR1 RL0 RR1 C0 R0 L1 SR0 SL1 RR0 RL1 C1
+Copy:    L0=LVI R1=LVI SL0=SLVI SR1=SLVI RL0=RLVI RR1=RLVI C0=CVI
+         R0=RVI L1=RVI SR0=SRVI SL1=SRVI RR0=RRVI RL1=RRVI C1=CVI
+```
+
+The naming is `[family prefix][ear][slot]`, so the resulting WAV channel map is:
+
+| ch | speaker | ear | graph node |
+|----|---------|-----|------------|
+| 0  | FL | L | convFL_L |
+| 1  | FL | R | convFL_R |
+| 2  | SL | L | convSL_L |
+| 3  | SL | R | convSL_R |
+| 4  | RL | L | convRL_L |
+| 5  | RL | R | convRL_R |
+| 6  | C  | L | convFC_L (and convLFE_L) |
+| 7  | FR | R | convFR_R |
+| 8  | FR | L | convFR_L |
+| 9  | SR | R | convSR_R |
+| 10 | SR | L | convSR_L |
+| 11 | RR | R | convRR_R |
+| 12 | RR | L | convRR_L |
+| 13 | C  | R | convFC_R (and convLFE_R) |
+
+Channels 7-12 look "shuffled" only because HeSuVi lists the right-ear IRs of
+the right-side speakers in that block.
+
+This was verified **from the IR files themselves** (no recordings involved):
+for every real-measurement preset, the near-ear channel leads with the
+physically expected ITD (front ~0.2 ms, rear ~0.3 ms, side ~0.5-0.7 ms) and is
+louder by 6-12 dB; the center pair shows zero ITD and equal level. Synthesized
+presets (Apple/Atmos) carry only the level asymmetry and zero ITD. To re-check
+any preset, cross-correlate the channel pairs listed above instead of trusting
+recording-side channel maps - those are frequently wrong.
+
+Note: the mapping assumes a 14-channel HRIR. Files with fewer channels (e.g.
+the bundled `oal_dflt.wav`, which has 7) still load - the module is created -
+but the out-of-range channel requests cannot produce the intended per-ear IRs,
+so the spatial image will be wrong. Use 14-channel HeSuVi WAVs.
 
 ### Stereo upmixing
 

@@ -1,6 +1,10 @@
 #include "pipewire_manager.h"
 
+#include <QDir>
 #include <QFile>
+#include <QFileInfo>
+#include <QStandardPaths>
+#include <QtEndian>
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -27,6 +31,122 @@ static string json_escape(const string &value) {
         }
     }
     return escaped;
+}
+
+//
+// Parses a RIFF/WAVE header far enough to learn the frame count and format of
+// the impulse response. Returns false on anything this minimal parser does not
+// understand (only plain PCM / IEEE float files are accepted, which covers all
+// HeSuvi-style HRIRs).
+//
+static bool parse_wav_format(const string &path, uint32_t &channels, uint32_t &rate,
+                             uint32_t &block_align, uint16_t &bits, uint32_t &frames) {
+    QFile file(QString::fromStdString(path));
+    if (!file.open(QIODevice::ReadOnly))
+        return false;
+    const QByteArray data = file.readAll();
+    file.close();
+
+    if (data.size() < 12 || memcmp(data.constData(), "RIFF", 4) != 0 ||
+        memcmp(data.constData() + 8, "WAVE", 4) != 0)
+        return false;
+
+    bool have_fmt = false;
+    uint16_t format_tag = 0;
+    size_t offset = 12;
+    while (offset + 8 <= static_cast<size_t>(data.size())) {
+        const char *id = data.constData() + offset;
+        const uint32_t size = qFromLittleEndian<uint32_t>(data.constData() + offset + 4);
+        const QByteArray body = data.mid(offset + 8, size);
+
+        if (memcmp(id, "fmt ", 4) == 0 && size >= 16) {
+            format_tag = qFromLittleEndian<uint16_t>(body.constData() + 0);
+            channels = qFromLittleEndian<uint16_t>(body.constData() + 2);
+            rate = qFromLittleEndian<uint32_t>(body.constData() + 4);
+            block_align = qFromLittleEndian<uint16_t>(body.constData() + 12);
+            bits = qFromLittleEndian<uint16_t>(body.constData() + 14);
+            // WAVE_FORMAT_EXTENSIBLE: real bits per sample live in the extension
+            if (format_tag == 0xFFFE && size >= 40)
+                bits = qFromLittleEndian<uint16_t>(body.constData() + 18);
+            have_fmt = true;
+        } else if (memcmp(id, "data", 4) == 0 && have_fmt) {
+            if (block_align == 0 || channels == 0)
+                return false;
+            frames = size / block_align;
+            // Only plain PCM or float (the formats the convolver accepts anyway)
+            return (format_tag == 1 || format_tag == 3) && rate > 0 && frames > 0;
+        }
+        offset += 8 + size + (size % 2);
+    }
+    return false;
+}
+
+//
+// Writes a "dirac delta" impulse response with the exact format and length of
+// the selected HRIR: a single full-scale sample at t = 0 followed by silence.
+// Convolving the LFE path with this instead of the HRIR leaves the signal
+// uncolored (equal L/R, no spatial processing) while keeping the convolver
+// branch identical in IR length - and therefore in processing latency - to the
+// convolved channels it sums with. This mirrors the conventional design in
+// headphone virtualizers where the LFE channel bypasses BRIR convolution and
+// is time-aligned with an extra delay.
+//
+static bool write_lfe_bypass_delta(const string &hrir_path, const string &delta_path) {
+    uint32_t channels = 0, rate = 0, block_align = 0, frames = 0;
+    uint16_t bits = 0;
+    if (!parse_wav_format(hrir_path, channels, rate, block_align, bits, frames))
+        return false;
+
+    // Keep a sane cap so a broken header cannot produce a huge file
+    if (frames > rate * 2)
+        frames = rate * 2;
+
+    // Mono file, same encoding as the source IR
+    const uint32_t frame_size = bits / 8;
+    const uint32_t data_size = frames * frame_size;
+
+    QFile file(QString::fromStdString(delta_path));
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return false;
+
+    auto le32 = [](uint32_t v) { return QByteArray(reinterpret_cast<const char *>(&v), 4); };
+    auto le16 = [](uint16_t v) { return QByteArray(reinterpret_cast<const char *>(&v), 2); };
+
+    QByteArray fmt;
+    fmt += le16(3);      // IEEE float
+    fmt += le16(1);      // mono
+    fmt += le32(rate);
+    fmt += le32(rate * frame_size);
+    fmt += le16(frame_size);
+    fmt += le16(bits);
+
+    QByteArray header;
+    header += QByteArray("RIFF", 4);
+    header += le32(4 + 8 + 16 + 8 + data_size);
+    header += QByteArray("WAVE", 4);
+    header += QByteArray("fmt ", 4);
+    header += le32(16);
+    header += fmt;
+    header += QByteArray("data", 4);
+    header += le32(data_size);
+
+    QByteArray samples(data_size, '\0');
+    if (bits == 32) {
+        const float full_scale = 1.0f;
+        memcpy(samples.data(), &full_scale, 4);
+    } else if (bits == 16) {
+        const int16_t full_scale = 32767;
+        memcpy(samples.data(), &full_scale, 2);
+    } else if (bits == 24) {
+        const uint8_t full_scale[3] = {0xFF, 0xFF, 0x7F};
+        memcpy(samples.data(), full_scale, 3);
+    } else {
+        return false;
+    }
+
+    const bool ok = file.write(header) == header.size() && file.write(samples) == samples.size();
+    file.close();
+    return ok;
 }
 
 QString PipeWireManager::find_ladspa_plugin() {
@@ -339,7 +459,7 @@ void PipeWireManager::detach_binding_listener(NodeBinding *binding) {
     binding->listener_attached = false;
 }
 
-bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled) {
+bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled, bool lfe_bypass) {
     if (!is_valid()) {
         Q_EMIT error_occurred(QStringLiteral("Failed connecting to PipeWire audio service."));
         return false;
@@ -353,11 +473,29 @@ bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path
         return false;
     }
 
-    qInfo("create_virtual_surround_module: Creating module with WAV path '%s' and upmixing %s",
-          hrir_wav_path.c_str(), upmix_enabled ? "enabled" : "disabled");
+    qInfo("create_virtual_surround_module: Creating module with WAV path '%s', upmixing %s, LFE bypass %s",
+          hrir_wav_path.c_str(), upmix_enabled ? "enabled" : "disabled", lfe_bypass ? "enabled" : "disabled");
 
     // The path is interpolated into the JSON module arguments, so escape it
     const string hrir_path = json_escape(hrir_wav_path);
+
+    // Generate the impulse IR used to bypass HRIR coloring on the LFE path. It must
+    // be regenerated per HRIR because its length determines the convolver latency.
+    string lfe_delta_path;
+    if (lfe_bypass) {
+        const QString delta_file =
+            QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/lfe_bypass_delta.wav");
+        QDir().mkpath(QFileInfo(delta_file).absolutePath());
+        if (!write_lfe_bypass_delta(hrir_wav_path, delta_file.toStdString())) {
+            qWarning("create_virtual_surround_module: Could not create LFE bypass impulse for '%s'", hrir_wav_path.c_str());
+            Q_EMIT error_occurred(QStringLiteral("Could not create the LFE bypass impulse response. "
+                                                 "The selected HRIR file could not be parsed."));
+            return false;
+        }
+        lfe_delta_path = json_escape(delta_file.toStdString());
+    }
+    const string lfe_channel_l = lfe_bypass ? "0" : "6";
+    const string lfe_channel_r = lfe_bypass ? "0" : "13";
 
     // The FreeSurround upmixer is only part of the graph while upmixing is enabled;
     // without it the graph inputs are the copy nodes directly and the bundled
@@ -437,10 +575,13 @@ bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path
         { type = builtin label = copy name = copyLFE }
 
         # apply hrir - HeSuVi 14-channel WAV (not the *-.wav variants) (note: 44 in HeSuVi are the same, but resampled to 44100)
-        # The channel indices below were determined empirically (see "HRIR channel
-        # mapping" in README.md). CAUTION: do not "fix" them based on recordings -
-        # the channel map reported on the recording side of recording tools is very
-        # likely wrong, which is exactly why these values deviate from the labels.
+        # Channel order follows HeSuVi's convolution channel line
+        # (L0 R1 SL0 SR1 RL0 RR1 C0 R0 L1 SR0 SL1 RR0 RL1 C1 from the stock
+        # hesuvi.txt): channels 7-12 interleave the right-ear IRs of the
+        # right-side speakers, which is why the indices look shuffled against
+        # the speaker labels. Independently verified via the ITD and level
+        # asymmetry of the IR files themselves (see "HRIR channel mapping" in
+        # README.md) - do not "fix" these based on recordings.
         { type = builtin label = convolver name = convFL_L config = { filename = ")" +
                                     hrir_path + R"(" channel =  0 } }
         { type = builtin label = convolver name = convFL_R config = { filename = ")" +
@@ -471,10 +612,16 @@ bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path
                                         hrir_path + R"(" channel = 13 } }
 
         # treat LFE as FC
+        # With lfe_bypass enabled, the LFE path skips HRIR convolution entirely
+        # (conventional headphone-virtualizer design for the LFE channel): it is
+        # rendered as equal L/R by convolving with a unit impulse of the exact same
+        # length as the selected HRIR, so both convolver branches stay time-aligned
         { type = builtin label = convolver name = convLFE_L config = { filename = ")" +
-                                        hrir_path + R"(" channel =  6 } }
+                                        (lfe_bypass ? lfe_delta_path : hrir_path) + R"(" channel = )" +
+                                        lfe_channel_l + R"( } }
         { type = builtin label = convolver name = convLFE_R config = { filename = ")" +
-                                        hrir_path + R"(" channel = 13 } }
+                                        (lfe_bypass ? lfe_delta_path : hrir_path) + R"(" channel = )" +
+                                        lfe_channel_r + R"( } }
 
         # LFE path lowpass: 4th-order Linkwitz-Riley (two cascaded Butterworth biquads,
         # in-phase flat recombination - the professional crossover standard) at 120 Hz,
