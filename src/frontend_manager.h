@@ -1,31 +1,15 @@
 #pragma once
 
-#include "pipewire_manager.h"
 #include <KConfig>
 #include <KConfigGroup>
-#include <QDesktopServices>
 #include <QObject>
-#include <qcontainerfwd.h>
-#include <qdebug.h>
-#include <qdir.h>
-#include <qhashfunctions.h>
-#include <qlogging.h>
-#include <qstandardpaths.h>
-#include <qthread.h>
-#include <qtmetamacros.h>
-#include <qurl.h>
+#include <QString>
+#include <QStringList>
 
-#ifdef IS_FLATPAK
-#include <glib.h>
-#include <glibconfig.h>
-#include <libportal-qt6/portal-qt6.h>
-#include <libportal/background.h>
-#endif
+class PipeWireManager;
 
 class FrontendManager : public QObject {
     Q_OBJECT
-    // The amount of channels to create
-    Q_PROPERTY(QString channels READ get_channels WRITE set_channels NOTIFY channels_changed)
     // Whether virtual surround sound is enabled or not
     Q_PROPERTY(bool virtualSurroundEnabled READ get_virtual_surround_enabled WRITE set_virtual_surround_enabled NOTIFY virtual_surround_enabled_changed)
     // The error message to show in the UI
@@ -41,15 +25,13 @@ class FrontendManager : public QObject {
     Q_PROPERTY(bool autostartEnabled READ get_autostart_enabled WRITE set_autostart_enabled NOTIFY autostart_enabled_changed)
     // Whether virtual surround sound is enabled automatically or not
     Q_PROPERTY(bool virtualSurroundAutoEnabled READ get_virtual_surround_auto_enabled WRITE set_virtual_surround_auto_enabled NOTIFY virtual_surround_auto_enabled_changed)
+    // Whether stereo audio is upmixed to surround (PSD) or not
+    Q_PROPERTY(bool upmixEnabled READ get_upmix_enabled WRITE set_upmix_enabled NOTIFY upmix_enabled_changed)
 
   public:
     explicit FrontendManager(PipeWireManager *pipewire_manager, KConfig *config, QObject *parent = nullptr);
 
-    QString get_channels() const;
-    void set_channels(const QString &value);
-    Q_SIGNAL void channels_changed();
-
-    bool get_virtual_surround_enabled();
+    bool get_virtual_surround_enabled() const;
     void set_virtual_surround_enabled(bool value);
     Q_SIGNAL void virtual_surround_enabled_changed();
 
@@ -74,17 +56,20 @@ class FrontendManager : public QObject {
     void set_startup_ui(const QString &value);
     Q_SIGNAL void startup_ui_changed();
 
-    bool get_autostart_enabled();
+    bool get_autostart_enabled() const;
     void set_autostart_enabled(bool value);
     Q_SIGNAL void autostart_enabled_changed();
 
-    bool get_virtual_surround_auto_enabled();
+    bool get_virtual_surround_auto_enabled() const;
     void set_virtual_surround_auto_enabled(bool value);
     Q_SIGNAL void virtual_surround_auto_enabled_changed();
 
+    bool get_upmix_enabled() const;
+    void set_upmix_enabled(bool value);
+    Q_SIGNAL void upmix_enabled_changed();
+
   private:
     bool m_virtual_surround_enabled = false;
-    QString m_channels;
     QString m_error_message;
     QStringList m_hrir_wav_file_names;
     QStringList m_hrir_wav_file_paths;
@@ -92,6 +77,7 @@ class FrontendManager : public QObject {
     QString m_startup_ui;
     bool m_autostart_enabled = false;
     bool m_virtual_surround_auto_enabled = false;
+    bool m_upmix_enabled = false;
 
     PipeWireManager *m_pipewire_manager;
     KConfig *m_config;
@@ -100,4 +86,17 @@ class FrontendManager : public QObject {
     QString hrir_wav_subpath = QStringLiteral("/hrir_wav");
 
     bool does_hrir_wav_file_exist(const QString &file_path);
+
+    //
+    // Creates the virtual surround module from the current settings and starts
+    // routing if it is enabled. Returns false (with an error message set) if the
+    // module could not be created.
+    //
+    bool create_module();
+
+    //
+    // Rebuilds the virtual surround module with the current settings, releasing
+    // and re-routing all streams.
+    //
+    void rebuild_module();
 };

@@ -1,22 +1,31 @@
 #include "frontend_manager.h"
-#include <qhashfunctions.h>
+#include "pipewire_manager.h"
+
+#include <QDesktopServices>
+#include <QDir>
+#include <QFile>
+#include <QStandardPaths>
+#include <QTextStream>
+#include <QUrl>
+
+#ifdef IS_FLATPAK
+#include <libportal-qt6/portal-qt6.h>
+#include <libportal/background.h>
+#endif
 
 FrontendManager::FrontendManager(PipeWireManager *pipewire_manager, KConfig *config, QObject *parent) : QObject(parent) {
     m_pipewire_manager = pipewire_manager;
     m_config = config;
     m_config_settings = m_config->group(QStringLiteral("Settings"));
-    connect(m_pipewire_manager, &PipeWireManager::error_occured, this, &FrontendManager::set_error_message);
+    connect(m_pipewire_manager, &PipeWireManager::error_occurred, this, &FrontendManager::set_error_message);
 
     // Initialize UI values
 
     load_hrir_wav_files();
 
-    m_channels = m_config_settings.readEntry("channels", QString());
-    // Fallback for malformed config value
-    QStringList allowed_channels_values = {QStringLiteral("5.1"), QStringLiteral("7.1")};
-    if (!allowed_channels_values.contains(m_channels)) {
-        m_channels = QStringLiteral("7.1");
-        m_config_settings.writeEntry("channels", m_channels);
+    // Remove the channel setting of versions that still supported 5.1 output
+    if (m_config_settings.hasKey("channels")) {
+        m_config_settings.deleteEntry("channels");
         m_config->sync();
     }
 
@@ -31,10 +40,17 @@ FrontendManager::FrontendManager(PipeWireManager *pipewire_manager, KConfig *con
 
     m_autostart_enabled = m_config_settings.readEntry("autostart_enabled", bool());
 
+    m_upmix_enabled = m_config_settings.readEntry("upmix_enabled", bool());
+
     m_virtual_surround_auto_enabled = m_config_settings.readEntry("virtual_surround_auto_enabled", bool());
     if (m_virtual_surround_auto_enabled) {
         // This line gets intentionally skipped if auto-enabling is disabled
         set_virtual_surround_enabled(true);
+    }
+
+    // Show why enabling virtual surround sound is impossible on a broken PipeWire connection
+    if (!m_pipewire_manager->is_valid()) {
+        set_error_message(QStringLiteral("Failed connecting to PipeWire audio service."));
     }
 }
 
@@ -47,54 +63,56 @@ bool FrontendManager::does_hrir_wav_file_exist(const QString &file_path) {
     return true;
 }
 
-QString FrontendManager::get_channels() const {
-    return m_channels;
-}
+bool FrontendManager::create_module() {
+    // A fresh attempt invalidates any error message from a previous failure
+    set_error_message(QString());
 
-void FrontendManager::set_channels(const QString &value) {
-    m_channels = value;
-
-    // First, disable routing to prevent disruption of playing audio if the virtual surround sound is enabled
-    if (m_virtual_surround_enabled)
-        m_pipewire_manager->disable_routing();
-
-    // We need to wait a little bit or the audio just stops completely when destroying the module too fast
-    QThread::msleep(100);
-    m_pipewire_manager->remove_virtual_surround_module();
+    if (m_hrir_wav_file_names.isEmpty()) {
+        qWarning("create_module: No virtualization profiles available");
+        set_error_message(QStringLiteral("No virtualization profiles found. Add HRIR WAV files to the folder below and press Reload."));
+        return false;
+    }
 
     QString path = m_hrir_wav_file_paths.value(m_hrir_wav_file_name_index);
     if (!does_hrir_wav_file_exist(path))
-        return;
-
-    m_pipewire_manager->create_virtual_surround_module(path.toStdString(), m_channels.toStdString());
-
-    // At last, enable routing again if the virtual surround sound is enabled
+        return false;
+    if (!m_pipewire_manager->create_virtual_surround_module(path.toStdString(), m_upmix_enabled))
+        return false;
     if (m_virtual_surround_enabled)
         m_pipewire_manager->enable_routing();
-
-    // Write to config file
-    m_config_settings.writeEntry("channels", m_channels);
-    m_config->sync();
-
-    Q_EMIT channels_changed();
+    return true;
 }
 
-bool FrontendManager::get_virtual_surround_enabled() {
+void FrontendManager::rebuild_module() {
+    // First, disable routing to prevent disruption of playing audio
+    if (m_virtual_surround_enabled)
+        m_pipewire_manager->disable_routing();
+
+    // Removing waits for the server to tear the module down (no blind sleeps)
+    m_pipewire_manager->remove_virtual_surround_module();
+
+    // Keep the enabled state truthful when the module could not be recreated
+    if (!create_module() && m_virtual_surround_enabled) {
+        m_virtual_surround_enabled = false;
+        Q_EMIT virtual_surround_enabled_changed();
+    }
+}
+
+bool FrontendManager::get_virtual_surround_enabled() const {
     return m_virtual_surround_enabled;
 }
 
 void FrontendManager::set_virtual_surround_enabled(bool value) {
     if (m_virtual_surround_enabled == value)
         return;
-    m_virtual_surround_enabled = value;
 
-    if (m_virtual_surround_enabled) {
-        QString path = m_hrir_wav_file_paths.value(m_hrir_wav_file_name_index);
-        if (!does_hrir_wav_file_exist(path))
-            return;
-        if (m_pipewire_manager->create_virtual_surround_module(path.toStdString(), m_channels.toStdString()))
-            m_pipewire_manager->enable_routing();
+    if (value) {
+        m_virtual_surround_enabled = true;
+        // Roll back on failure so the UI and tray do not claim to be enabled
+        if (!create_module())
+            m_virtual_surround_enabled = false;
     } else {
+        m_virtual_surround_enabled = false;
         m_pipewire_manager->disable_routing();
     }
 
@@ -106,6 +124,8 @@ QString FrontendManager::get_error_message() const {
 }
 
 void FrontendManager::set_error_message(const QString &message) {
+    if (m_error_message == message)
+        return;
     m_error_message = message;
     Q_EMIT error_message_changed();
 }
@@ -119,8 +139,6 @@ int FrontendManager::get_hrir_wav_file_name_index() const {
 }
 
 void FrontendManager::set_hrir_wav_file_name_index(int index) {
-    qDebug("set_hrir_wav_file_name_index: %u", index);
-
     // Check if the index is valid
     if (index < 0 || index >= m_hrir_wav_file_names.size())
         return;
@@ -129,26 +147,10 @@ void FrontendManager::set_hrir_wav_file_name_index(int index) {
 
     m_hrir_wav_file_name_index = index;
 
-    // First, disable routing to prevent disruption of playing audio if the virtual surround sound is enabled
-    if (m_virtual_surround_enabled)
-        m_pipewire_manager->disable_routing();
-
-    // We need to wait a little bit or the audio just stops completely when destroying the module too fast
-    QThread::msleep(100);
-    m_pipewire_manager->remove_virtual_surround_module();
-
-    QString path = m_hrir_wav_file_paths.value(m_hrir_wav_file_name_index);
-    if (!does_hrir_wav_file_exist(path))
-        return;
-
-    m_pipewire_manager->create_virtual_surround_module(path.toStdString(), m_channels.toStdString());
-
-    // At last, enable routing again if the virtual surround sound is enabled
-    if (m_virtual_surround_enabled)
-        m_pipewire_manager->enable_routing();
+    rebuild_module();
 
     // Write to config file
-    m_config_settings.writeEntry("hrir_wav_file_path", m_hrir_wav_file_paths.value(m_hrir_wav_file_name_index));
+    m_config_settings.writeEntry("hrir_wav_file_path", m_hrir_wav_file_paths.value(index));
     m_config->sync();
 
     Q_EMIT hrir_wav_file_name_index_changed();
@@ -225,16 +227,18 @@ void FrontendManager::load_hrir_wav_files() {
     Q_EMIT hrir_wav_file_names_changed();
 
     // Try to restore the old file selection if it still exists
-    if (!old_path.isEmpty()) {
-        const int new_index = m_hrir_wav_file_paths.indexOf(old_path);
-        if (new_index >= 0 && new_index != m_hrir_wav_file_name_index) {
-            m_hrir_wav_file_name_index = new_index;
-            Q_EMIT hrir_wav_file_name_index_changed();
-            qDebug("Restored previous file selection");
-        }
-    } else {
-        // Set to first entry if no selection has been made
-        m_hrir_wav_file_name_index = 0;
+    int new_index = 0;
+    if (!old_path.isEmpty())
+        new_index = m_hrir_wav_file_paths.indexOf(old_path);
+
+    // Clamp the selection so it always points at an existing file
+    if (new_index < 0 || new_index >= m_hrir_wav_file_paths.size())
+        new_index = 0;
+
+    if (new_index != m_hrir_wav_file_name_index) {
+        m_hrir_wav_file_name_index = new_index;
+        Q_EMIT hrir_wav_file_name_index_changed();
+        qDebug("Restored previous file selection");
     }
 }
 
@@ -254,6 +258,8 @@ QString FrontendManager::get_startup_ui() const {
 }
 
 void FrontendManager::set_startup_ui(const QString &value) {
+    if (m_startup_ui == value)
+        return;
     m_startup_ui = value;
 
     // Write to config file
@@ -263,7 +269,7 @@ void FrontendManager::set_startup_ui(const QString &value) {
     Q_EMIT startup_ui_changed();
 }
 
-bool FrontendManager::get_autostart_enabled() {
+bool FrontendManager::get_autostart_enabled() const {
     return m_autostart_enabled;
 }
 
@@ -300,7 +306,16 @@ void FrontendManager::set_autostart_enabled(bool value) {
         // Native or AppImage: Just copy the desktop file to the user's autostart folder (e. g. ~/.config/autostart)
         // Creates directory with all parents, mkpath skips existing folders
         QDir().mkpath(QFileInfo(destination).path());
-        QFile::copy(source, destination);
+        QFile::remove(destination); // QFile::copy never overwrites
+        if (!QFile::copy(source, destination)) {
+            // Without the desktop file autostart would silently not work, so
+            // roll the setting back instead of persisting a broken state
+            qWarning("set_autostart_enabled: Failed to copy desktop file from '%s' to '%s'", source.toStdString().c_str(), destination.toStdString().c_str());
+            set_error_message(QStringLiteral("Could not enable autostart: copying the desktop file from '%1' failed.").arg(source));
+            m_autostart_enabled = false;
+            Q_EMIT autostart_enabled_changed();
+            return;
+        }
         qDebug("set_autostart_enabled: Copied desktop file from '%s' to '%s'", source.toStdString().c_str(), destination.toStdString().c_str());
 #endif
 #ifdef IS_APPIMAGE
@@ -329,7 +344,7 @@ void FrontendManager::set_autostart_enabled(bool value) {
     Q_EMIT autostart_enabled_changed();
 }
 
-bool FrontendManager::get_virtual_surround_auto_enabled() {
+bool FrontendManager::get_virtual_surround_auto_enabled() const {
     return m_virtual_surround_auto_enabled;
 }
 
@@ -343,4 +358,26 @@ void FrontendManager::set_virtual_surround_auto_enabled(bool value) {
     m_config->sync();
 
     Q_EMIT virtual_surround_auto_enabled_changed();
+}
+
+bool FrontendManager::get_upmix_enabled() const {
+    return m_upmix_enabled;
+}
+
+void FrontendManager::set_upmix_enabled(bool value) {
+    if (m_upmix_enabled == value)
+        return;
+    m_upmix_enabled = value;
+
+    // The upmix flag is baked into the filter graph, so rebuild the module (this
+    // also applies the change to already routed streams). This must happen even
+    // while disabled: the module survives a disable, and leaving it stale here
+    // would resurrect the old upmix setting on the next enable.
+    rebuild_module();
+
+    // Write to config file
+    m_config_settings.writeEntry("upmix_enabled", m_upmix_enabled);
+    m_config->sync();
+
+    Q_EMIT upmix_enabled_changed();
 }

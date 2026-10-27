@@ -1,22 +1,21 @@
 #pragma once
 
-#include "frontend_manager.h"
-
-#include <KLocalizedString>
-#include <QAction>
-#include <QActionGroup>
-#include <QApplication>
-#include <QIcon>
-#include <QMenu>
 #include <QObject>
-#include <QQuickWindow>
-#include <QSystemTrayIcon>
+#include <QString>
+
+class QAction;
+class QActionGroup;
+class FrontendManager;
+class QMenu;
+class QQuickWindow;
+class QSystemTrayIcon;
 
 class TrayIcon : public QObject {
     Q_OBJECT
 
   public:
     explicit TrayIcon(QObject *parent = nullptr);
+    ~TrayIcon() override;
 
     void set_frontend_manager(FrontendManager *frontend_manager);
     void setup(const QString &icon_name);
@@ -42,7 +41,6 @@ class TrayIcon : public QObject {
     QMenu *m_profile_menu = nullptr;
     QActionGroup *m_profile_action_group = nullptr;
     QAction *m_toggle_action = nullptr;
-    bool m_called_update_profile_menu = false;
 
     FrontendManager *m_frontend_manager = nullptr;
     QQuickWindow *m_main_window = nullptr;

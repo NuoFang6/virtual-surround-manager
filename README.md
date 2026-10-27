@@ -16,11 +16,12 @@
 
 - Enable or disable seemlessly, without changing your default device
 - Drop in your own **HRIR WAV files** as virtualization presets, same as **HeSuVi** on Windows
+- Optional **stereo-to-7.1 upmixing** (FreeSurround/Real3D, bundled with the app): stereo audio is upmixed with Passive Surround Decoding, while real multichannel audio is detected and passed through unchanged
 - Can be run in the background with a **system tray icon** (check the app's settings)
 - Compatible with **EasyEffects** (and most similar apps)
 - Written entirely using the **PipeWire C API**, so no config files or annoying service restarts are required
 - Modern user interface, built with **KDE's Kirigami 6 framework**
-- Available languages are English, German, Russian, Italian and French
+- Available languages are English and Simplified Chinese
 - This project is **not using** vibe coding, AI agents or similar tools for generating unmaintainable slop
 
 ## Screenshot
@@ -111,6 +112,8 @@ For other distributions, just look up how the packages are called in your distro
 4. Build the project: `cmake --build build --config Debug`
 5. Install the project: `cmake --install build --config Debug`
 
+The build also compiles the bundled **FreeSurround (Real3D) LADSPA upmix plugin** from `third_party/freesurround_ladspa` and installs it next to the app into the system LADSPA directory (e.g. `/usr/lib/ladspa` or `/usr/lib64/ladspa`). It is only needed while stereo upmixing is enabled; without upmixing the plugin is not used at all. See `third_party/freesurround_ladspa/README.md` for details.
+
 ### Flatpak
 
 1. Clone repository: `git clone https://github.com/Berny23/virtual-surround-manager.git`
@@ -126,7 +129,45 @@ For other distributions, just look up how the packages are called in your distro
 4. Make executable: `chmod +x ./build_appimage/virtual-surround-manager-unknown-x86_64.AppImage`
 5. Run the program: `./build_appimage/virtual-surround-manager-unknown-x86_64.AppImage`
 
+## Development notes
+
+### HRIR channel mapping
+
+The channel indices of the HeSuVi 14-channel HRIR WAV files used in the filter
+graph (see `create_virtual_surround_module` in `src/pipewire_manager.cpp`) were
+**determined empirically, by ear, not from the documented channel labels**.
+
+If you ever want to verify or change them: **do not trust recordings.** The
+channel map reported on the recording side of recording tools (e.g. when
+recording the WAV playback or the virtual device with an audio recorder) is
+very likely wrong, which is exactly why the indices used here deviate from
+what the labels suggest. Changing these values based on a naive recording will
+break the spatial rendering.
+
+### Stereo upmixing
+
+The stereo-to-7.1 upmixer is the bundled FreeSurround LADSPA plugin
+(`freesurround71_auto` label). It upmixes only while all non-L/R input
+channels are silent; as soon as any other channel carries signal, real
+multichannel content is assumed and the signal is passed through unchanged
+(with matching latency compensation).
+
+### Crackling / brief dropouts
+
+Two known sources of short interruptions during playback are addressed:
+
+- The virtual device nodes set `node.latency = "1024/48000"`, which keeps the
+  PipeWire graph quantum at 1024 samples or more whenever the chain is active.
+  Without it, a low-latency application can drag the whole graph down to tiny
+  quanta where the convolver chain is prone to xruns, and every quantum
+  renegotiation is audible.
+- The upmix plugin applies hysteresis before re-engaging upmixing after a
+  bypass period (see `third_party/freesurround_ladspa/README.md`): every
+  bypass↔processing switch flushes the plugin's FIFOs, which would otherwise
+  be audible as a click on content hovering at the stereo detection threshold.
+
 ## Acknowledgements
 
 - The [EasyEffects](https://github.com/wwmm/easyeffects) project for research on the API, because the PipeWire docs are quite lacking for beginners
 - The [HeSuVi](https://hesuvi.net) project for their awesome collection of HRIR WAV files
+- The [Real3D-VST](https://github.com/NuoFang6/Real3D-VST) project and Christian Kothe's original FreeSurround decoder for the stereo upmixing plugin

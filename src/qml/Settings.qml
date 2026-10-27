@@ -60,14 +60,13 @@ FormCard.FormCardPage {
     }
 
     FormCard.FormCard {
-        FormCard.FormComboBoxDelegate {
-            id: channels
-            text: i18nc("@label:combobox", "Virtual channels")
-            description: i18nc("@info:description", "Useful for games that only support 5.1 surround sound. Applied instantly.")
-            displayMode: FormCard.FormComboBoxDelegate.ComboBox
-            model: ["7.1", "5.1"]
-            Component.onCompleted: currentIndex = indexOfValue(frontendManager.channels)
-            onCurrentValueChanged: frontendManager.channels = currentValue
+        FormCard.FormSwitchDelegate {
+            id: upmixEnabled
+            text: i18nc("@label:switch", "Upmix stereo to surround sound")
+            description: i18nc("@info:description", "Upmix stereo audio to the virtual 7.1 channels using Passive Surround Decoding (LFE low-pass at 111 Hz). Native multi-channel audio is passed through unchanged. Applied instantly.")
+            checkable: true
+            checked: frontendManager.upmixEnabled
+            onToggled: frontendManager.upmixEnabled = checked
         }
     }
 }

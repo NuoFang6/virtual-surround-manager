@@ -63,6 +63,7 @@
     <ul>
       <li>Enable/Disable seemlessly, <em>without</em> changing your default device, writing config files or restarting the audio service</li>
       <li>Drop in your own <em>HRIR WAV files</em> as virtualization presets, same as <em>HeSuVi</em> on Windows</li>
+      <li>Optional <em>stereo-to-7.1 upmixing</em> (bundled FreeSurround plugin) that automatically bypasses real multichannel audio</li>
       <li>Run it in the background with a <em>system tray icon</em> (enable it in the app's settings)</li>
       <li>Compatible with <em>EasyEffects</em> and most similar apps</li>
     </ul>
@@ -70,82 +71,14 @@
   </description>
 
   <releases>
-    <release version="1.3.1" date="2026-07-13">
+    <release version="0.0.1" date="2026-10-26">
       <description>
+        <p>Hard fork of virtual-surround-manager, version numbering starts fresh.</p>
         <ul>
-          <li>Fixed enabling autostart for native packages</li>
+          <li>Virtual surround output is now 7.1 only (the 5.1 device option was removed; games can still output 5.1)</li>
+          <li>Optional stereo-to-7.1 upmixing using the bundled FreeSurround (Real3D) LADSPA plugin, with automatic stereo detection</li>
+          <li>Simplified Chinese translation</li>
         </ul>
-      </description>
-    </release>
-    <release version="1.3.0" date="2026-07-11">
-      <description>
-        <ul>
-          <li>New setting to select the number of virtual channels (7.1 or 5.1), useful for games that only support 5.1 surround sound</li>
-          <li>Changed app name and subtitle in the app itself and its metadata to match FlatHub</li>
-          <li>Made the info boxes closable</li>
-          <li>Added desktop file translations</li>
-        </ul>
-      </description>
-    </release>
-    <release version="1.2.2" date="2026-07-09">
-      <description>
-        <ul>
-          <li>Ignore notification sounds to prevent crackling and potential crashes</li>
-          <li>Fixed an issue with the profile selection</li>
-          <li>Use radio buttons instead of checkboxes in the system tray menu</li>
-        </ul>
-      </description>
-    </release>
-    <release version="1.2.1" date="2026-07-07">
-      <description>
-        <ul>
-          <li>Now re-routing only those streams intended for the default audio device. Leaving all other devices unaffected. This is useful if you use a separate one for Discord, game chats etc.</li>
-          <li>Added French translation</li>
-          <li>Fixed problems with selecting WAV files after scrolling the list</li>
-        </ul>
-      </description>
-    </release>
-    <release version="1.2.0" date="2026-07-04">
-      <description>
-        <ul>
-          <li>New icon design</li>
-          <li>Disabled tray icon by default, because some desktop environments don't support these out of the box (you can enable it in the app's settings)</li>
-          <li>Fixed PipeWire being unable to read WAV files</li>
-          <li>Added Italian translation</li>
-          <li>Added some web links, screenshots, brand colors, keywords and a better app description</li>
-        </ul>
-      </description>
-    </release>
-    <release version="1.1.2" date="2026-07-02">
-      <description>
-        <ul>
-          <li>Fixed the permissions for PipeWire when running in a Flatpak, making this the very first Flatpak release</li>
-          <li>Fixed system tray icon for Flatpak</li>
-          <li>Added autostart feature for Flatpak</li>
-        </ul>
-      </description>
-    </release>
-    <release version="1.1.1" date="2026-06-20">
-      <description>
-        <ul>
-          <li>Fixed autostart and system tray icon on systems where the default directories are missing</li>
-          <li>Added Russian translation</li>
-        </ul>
-      </description>
-    </release>
-    <release version="1.1.0" date="2026-06-12">
-      <description>
-        <ul>
-          <li>System tray icon, so you can keep the app in the background</li>
-          <li>Setting for auto-enabling virtual surround sound on app startup</li>
-          <li>Setting for autostarting the app</li>
-          <li>Setting for showing or hiding the tray icon</li>
-        </ul>
-      </description>
-    </release>
-    <release version="1.0.0" date="2026-04-24">
-      <description>
-        <p>Initial release of the app.</p>
       </description>
     </release>
   </releases>

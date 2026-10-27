@@ -3,22 +3,25 @@
 #include "tray_icon.h"
 #include <KAboutData>
 #include <KIconTheme>
-#include <KLocalizedContext>
+#include <KLocalizedQmlContext>
 #include <KLocalizedString>
 #include <QApplication>
+#include <QFile>
+#include <QFileInfo>
 #include <QIcon>
+#include <QLockFile>
 #include <QQmlApplicationEngine>
 #include <QQuickStyle>
+#include <QQuickWindow>
+#include <QSocketNotifier>
+#include <QStandardPaths>
 #include <QUrl>
 #include <QtQml>
-#include <kaboutdata.h>
-#include <qapplication.h>
-#include <qhashfunctions.h>
-#include <qjsengine.h>
-#include <qjsvalue.h>
-#include <qqml.h>
-#include <qqmlengine.h>
-#include <qstringview.h>
+#include <csignal>
+#include <fcntl.h>
+#include <filesystem>
+#include <memory>
+#include <unistd.h>
 
 //
 // This checks for an already running application.
@@ -27,7 +30,7 @@
 static std::unique_ptr<QLockFile> get_lock_file() {
     auto sys_path = std::filesystem::exists("/.flatpak-info") ? QStandardPaths::TempLocation : QStandardPaths::RuntimeLocation;
 
-    auto lock_file = std::make_unique<QLockFile>(QString::fromStdString(QStandardPaths::writableLocation(sys_path).toStdString() + "/virtual-surround-manager.lock"));
+    auto lock_file = std::make_unique<QLockFile>(QStandardPaths::writableLocation(sys_path) + QStringLiteral("/virtual-surround-manager.lock"));
 
     lock_file->setStaleLockTime(0);
 
@@ -62,6 +65,34 @@ int main(int argc, char *argv[]) {
     KIconTheme::initTheme();
     QApplication app(argc, argv);
 
+    // Quit cleanly on SIGTERM/SIGINT (logout, manual kill): only a clean exit
+    // runs the PipeWire teardown, which releases routed streams. A hard kill
+    // leaves their target.object pointing at a dead node and every stream then
+    // has to migrate devices on its own - audible as an interruption.
+    static int signal_pipe[2] = {-1, -1};
+    if (pipe2(signal_pipe, O_CLOEXEC | O_NONBLOCK) == 0) {
+        auto *notifier = new QSocketNotifier(signal_pipe[0], QSocketNotifier::Read, &app);
+        QObject::connect(notifier, &QSocketNotifier::activated, &app, [notifier]() {
+            char c;
+            while (read(signal_pipe[0], &c, 1) == 1) {
+            }
+            notifier->setEnabled(false);
+            QCoreApplication::quit();
+        });
+
+        struct sigaction sa = {};
+        sa.sa_handler = [](int) {
+            if (signal_pipe[1] >= 0) {
+                const char c = 1;
+                (void)write(signal_pipe[1], &c, 1);
+            }
+        };
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_RESTART;
+        sigaction(SIGTERM, &sa, nullptr);
+        sigaction(SIGINT, &sa, nullptr);
+    }
+
     // App information
     KLocalizedString::setApplicationDomain("virtual-surround-manager");
     QApplication::setOrganizationDomain(QStringLiteral("berny23.de"));
@@ -78,7 +109,7 @@ int main(int argc, char *argv[]) {
     // Credits
     KAboutData aboutData(QStringLiteral("virtual-surround-manager"),
                          i18nc("@title", "Virtual Surround"),
-                         QStringLiteral("1.3"),
+                         QStringLiteral(PROJECT_VERSION),
                          i18nc("@subtitle", "3D sound for headphones"),
                          KAboutLicense::MIT,
                          QStringLiteral("© 2026, Berny23"));
@@ -118,28 +149,29 @@ int main(int argc, char *argv[]) {
     // Create PipeWire and frontend manager
     PipeWireManager pipewire_manager;
     KConfig config(QStringLiteral("virtual-surround-manager"));
-    KConfigGroup config_settings = config.group(QStringLiteral("Settings"));
-    FrontendManager *frontend_manager = new FrontendManager(&pipewire_manager, &config);
+    // Stack object: destroyed (in reverse declaration order) before the config
+    // and the PipeWire manager it points to, and after the QML engine below
+    FrontendManager frontend_manager(&pipewire_manager, &config);
 
     // Create TrayIcon and expose to QML
     auto tray_icon = new TrayIcon(&app);
-    tray_icon->set_frontend_manager(frontend_manager);
+    tray_icon->set_frontend_manager(&frontend_manager);
     tray_icon->setup(QStringLiteral("de.berny23.virtual_surround_manager"));
     // Update state in case the user set up auto-enabling virtual surround sound on startup
     tray_icon->update_toggle_action_state();
 
     // Set tray icon visibility depending on user setting
-    tray_icon->set_visibility(config_settings.readEntry("startup_ui", QString()) != QStringLiteral("hideTray"));
+    tray_icon->set_visibility(frontend_manager.get_startup_ui() != QStringLiteral("hideTray"));
 
     // Connect some frontend manager signals for updating the tray icon ui state
-    QObject::connect(frontend_manager, &FrontendManager::virtual_surround_enabled_changed, tray_icon, &TrayIcon::update_toggle_action_state);
-    QObject::connect(frontend_manager, &FrontendManager::hrir_wav_file_names_changed, tray_icon, &TrayIcon::update_profile_menu);
-    QObject::connect(frontend_manager, &FrontendManager::hrir_wav_file_name_index_changed, tray_icon, &TrayIcon::update_profile_menu);
+    QObject::connect(&frontend_manager, &FrontendManager::virtual_surround_enabled_changed, tray_icon, &TrayIcon::update_toggle_action_state);
+    QObject::connect(&frontend_manager, &FrontendManager::hrir_wav_file_names_changed, tray_icon, &TrayIcon::update_profile_menu);
+    QObject::connect(&frontend_manager, &FrontendManager::hrir_wav_file_name_index_changed, tray_icon, &TrayIcon::update_profile_menu);
 
     // Add main page and supply context
     QQmlApplicationEngine engine;
-    engine.rootContext()->setContextObject(new KLocalizedContext(&engine));
-    engine.rootContext()->setContextProperty(QStringLiteral("frontendManager"), frontend_manager);
+    engine.rootContext()->setContextObject(new KLocalizedQmlContext(&engine));
+    engine.rootContext()->setContextProperty(QStringLiteral("frontendManager"), &frontend_manager);
     engine.rootContext()->setContextProperty(QStringLiteral("trayIcon"), tray_icon);
     engine.loadFromModule("de.berny23.virtual_surround_manager", "Main");
 
@@ -153,7 +185,7 @@ int main(int argc, char *argv[]) {
         tray_icon->set_main_window(main_window);
     }
 
-    if (config_settings.readEntry("startup_ui", QString()) == QStringLiteral("showTrayHideWindow"))
+    if (frontend_manager.get_startup_ui() == QStringLiteral("showTrayHideWindow"))
         tray_icon->hide_main_window();
 
     // Show GUI

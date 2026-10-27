@@ -1,5 +1,63 @@
 #include "pipewire_manager.h"
 
+#include <QFile>
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <string_view>
+#include <time.h>
+
+//
+// Escapes a path for embedding into a JSON string value of the module
+// arguments, so quotes or backslashes in a file name cannot break the config.
+//
+static string json_escape(const string &value) {
+    string escaped;
+    escaped.reserve(value.size());
+    for (const char c : value) {
+        switch (c) {
+        case '\\':
+            escaped += "\\\\";
+            break;
+        case '"':
+            escaped += "\\\"";
+            break;
+        default:
+            escaped += c;
+        }
+    }
+    return escaped;
+}
+
+QString PipeWireManager::find_ladspa_plugin() {
+    QStringList candidates;
+
+#ifdef IS_APPIMAGE
+    // The AppImage is mounted at a random temporary path, resolved via $APPDIR
+    const QString appdir = qEnvironmentVariable("APPDIR");
+    if (!appdir.isEmpty()) {
+        candidates << appdir + QStringLiteral("/usr/lib/ladspa/freesurround_ladspa.so")
+                   << appdir + QStringLiteral("/usr/lib64/ladspa/freesurround_ladspa.so");
+    }
+#endif
+#ifndef IS_APPIMAGE
+    // Where this application installed the plugin to (absolute path set at build time)
+    candidates << QStringLiteral(VSM_LADSPA_PLUGIN_PATH);
+#endif
+
+    // Distro or manually installed copies in the usual LADSPA directories
+    candidates << QStringLiteral("/usr/lib64/ladspa/freesurround_ladspa.so")
+               << QStringLiteral("/usr/lib/ladspa/freesurround_ladspa.so")
+               << QStringLiteral("/usr/local/lib/ladspa/freesurround_ladspa.so");
+
+    for (const QString &candidate : candidates) {
+        if (QFile::exists(candidate)) {
+            return candidate;
+        }
+    }
+    return {};
+}
+
 string PipeWireManager::parse_default_sink_name(const char *value) {
     if (!value)
         return {};
@@ -37,6 +95,11 @@ bool PipeWireManager::stream_follows_default(uint32_t id, const string &props_ta
     if (target.empty())
         return true;
 
+    // Streams that still target our virtual sink - e.g. routed by a previous instance of
+    // this application - keep being managed instead of being treated as assigned elsewhere.
+    if (target == capture_node_name)
+        return true;
+
     const string sink = resolve_sink_name(target);
     if (sink.empty())
         return false;
@@ -52,9 +115,9 @@ void PipeWireManager::decide_stream(uint32_t id, const string &props_target) {
     if (stream_follows_default(id, props_target)) {
         pw_metadata_set_property(metadata, id, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", capture_node_name);
         routed_node_ids.insert(id);
-        qDebug("decide_stream: Node %u routed to sink '%s'", id, capture_node_name);
+        qInfo("decide_stream: Node %u routed to sink '%s'", id, capture_node_name);
     } else {
-        qDebug("decide_stream: Node %u left alone (assigned to another device)", id);
+        qInfo("decide_stream: Node %u left alone (assigned to another device)", id);
     }
 }
 
@@ -68,8 +131,10 @@ void PipeWireManager::on_node_info(void *data, const struct pw_node_info *info) 
     const char *target = spa_dict_lookup(info->props, PW_KEY_TARGET_OBJECT);
     if (!target)
         target = spa_dict_lookup(info->props, "target.node");
-    const string props_target = (target && strlen(target) > 0) ? target : "";
-    manager->decide_stream(binding->id, props_target);
+    binding->props_target = (target && strlen(target) > 0) ? target : "";
+    manager->decide_stream(binding->id, binding->props_target);
+    if (manager->decided_streams.contains(binding->id))
+        manager->detach_binding_listener(binding);
 }
 
 int PipeWireManager::on_metadata_property(void *data,
@@ -141,12 +206,36 @@ void PipeWireManager::registry_event_global(void *data,
                 manager->metadata = nullptr;
             }
 
+            // State of the previous metadata object does not apply to the new one
+            manager->metadata_targets.clear();
+            manager->metadata_global_id = id;
+
             // Save the metadata object for reuse later
             manager->metadata = static_cast<pw_metadata *>(
                 pw_registry_bind(manager->registry, id, type, PW_VERSION_METADATA, 0));
+            if (!manager->metadata) {
+                qWarning("registry_event_global: Failed to bind metadata object with ID %u", id);
+                manager->metadata_global_id = SPA_ID_INVALID;
+                return;
+            }
             // Add listener for changes to node metadata
             spa_zero(manager->metadata_listener);
             pw_metadata_add_listener(manager->metadata, &manager->metadata_listener, &manager->metadata_events, manager);
+
+            // Streams that were tracked before the metadata object appeared have not
+            // been decided yet, so decide them now that routing is possible
+            for (auto it = manager->node_bindings.cbegin(); it != manager->node_bindings.cend(); ++it) {
+                manager->decide_stream(it.key(), it.value()->props_target);
+                if (manager->decided_streams.contains(it.key()))
+                    manager->detach_binding_listener(it.value());
+            }
+
+            // Routing we wrote into a previous metadata object was stored there and
+            // is gone with it (e.g. after a WirePlumber restart), so re-assert it
+            for (const uint32_t node_id : manager->routed_node_ids) {
+                pw_metadata_set_property(manager->metadata, node_id, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", manager->capture_node_name);
+                qDebug("registry_event_global: Re-routed node %u to sink '%s' after metadata change", node_id, manager->capture_node_name);
+            }
         }
     }
 
@@ -163,7 +252,7 @@ void PipeWireManager::registry_event_global(void *data,
         return;
 
     // Ignore system notification sounds, they are very short and can cause crackling or even a crash
-    if (std::ranges::find(ignored_node_names, node_name) != ignored_node_names.end())
+    if (node_name && std::ranges::find(ignored_node_names, std::string_view(node_name)) != ignored_node_names.end())
         return;
 
     // Track output sinks to resolve stream targets to a device
@@ -195,10 +284,12 @@ void PipeWireManager::registry_event_global(void *data,
         return;
     }
 
-    NodeBinding *binding = new NodeBinding{manager, id, proxy, {}};
+    NodeBinding *binding = new NodeBinding{manager, id, proxy, {}, {}};
     spa_zero(binding->listener);
-    pw_node_add_listener(reinterpret_cast<pw_node *>(binding->proxy), &binding->listener, &manager->node_events, binding);
+    // Insert before adding the listener: add_listener dispatches the initial node info
+    // synchronously and the handler needs to find this binding in the map already.
     manager->node_bindings.insert(id, binding);
+    pw_node_add_listener(reinterpret_cast<pw_node *>(binding->proxy), &binding->listener, &manager->node_events, binding);
 
     qDebug("registry_event_global: Tracking output stream '%s' with ID %u", node_name ? node_name : "(null)", id);
 }
@@ -206,10 +297,26 @@ void PipeWireManager::registry_event_global(void *data,
 void PipeWireManager::registry_event_global_remove(void *data, uint32_t id) {
     PipeWireManager *manager = static_cast<PipeWireManager *>(data);
 
+    // The bound metadata proxy is only marked removed by the core, not freed,
+    // so it is safe to destroy it here ourselves
+    if (id == manager->metadata_global_id) {
+        if (manager->metadata) {
+            spa_hook_remove(&manager->metadata_listener);
+            pw_proxy_destroy((pw_proxy *)manager->metadata);
+            manager->metadata = nullptr;
+        }
+        manager->metadata_global_id = SPA_ID_INVALID;
+        manager->metadata_targets.clear();
+    }
+
     manager->sinks.remove(id);
     manager->metadata_targets.remove(id);
     manager->routed_node_ids.remove(id);
     manager->decided_streams.remove(id);
+
+    // Do not let a stale ID suppress metadata handling of future nodes reusing it
+    if (manager->playback_node_id == id)
+        manager->playback_node_id = SPA_ID_INVALID;
 
     auto binding = manager->node_bindings.find(id);
     if (binding != manager->node_bindings.end()) {
@@ -219,12 +326,24 @@ void PipeWireManager::registry_event_global_remove(void *data, uint32_t id) {
 }
 
 void PipeWireManager::destroy_binding(NodeBinding *binding) {
-    spa_hook_remove(&binding->listener);
+    if (binding->listener_attached)
+        spa_hook_remove(&binding->listener);
     pw_proxy_destroy(binding->proxy);
     delete binding;
 }
 
-bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path, const string &channels) {
+void PipeWireManager::detach_binding_listener(NodeBinding *binding) {
+    if (!binding->listener_attached)
+        return;
+    spa_hook_remove(&binding->listener);
+    binding->listener_attached = false;
+}
+
+bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled) {
+    if (!is_valid()) {
+        Q_EMIT error_occurred(QStringLiteral("Failed connecting to PipeWire audio service."));
+        return false;
+    }
     if (module) {
         qInfo("create_virtual_surround_module: Virtual surround module already exists");
         return true;
@@ -234,15 +353,79 @@ bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path
         return false;
     }
 
-    qInfo("create_virtual_surround_module: Creating module with %s channels and WAV path '%s'", channels.c_str(), hrir_wav_path.c_str());
+    qInfo("create_virtual_surround_module: Creating module with WAV path '%s' and upmixing %s",
+          hrir_wav_path.c_str(), upmix_enabled ? "enabled" : "disabled");
 
-    string args = "";
+    // The path is interpolated into the JSON module arguments, so escape it
+    const string hrir_path = json_escape(hrir_wav_path);
 
+    // The FreeSurround upmixer is only part of the graph while upmixing is enabled;
+    // without it the graph inputs are the copy nodes directly and the bundled
+    // LADSPA plugin is not needed at all.
+    string upmix_nodes;
+    string upmix_links;
+    string graph_inputs = R"(  [ "copyFL:In" "copyFR:In" "copyFC:In" "copyLFE:In" "copyRL:In" "copyRR:In" "copySL:In" "copySR:In" ])";
+
+    if (upmix_enabled) {
+        const QString plugin_path = find_ladspa_plugin();
+        if (plugin_path.isEmpty()) {
+            qWarning("create_virtual_surround_module: FreeSurround LADSPA plugin not found");
+            Q_EMIT error_occurred(QStringLiteral("The FreeSurround upmix plugin (freesurround_ladspa.so) "
+                                                 "was not found. Reinstall this application or copy the "
+                                                 "plugin into a LADSPA directory like /usr/lib/ladspa."));
+            return false;
+        }
+        qInfo("create_virtual_surround_module: Using FreeSurround plugin '%s'", plugin_path.toStdString().c_str());
+
+        // FreeSurround stereo to 7.1 upmixer with the Real3D-VST auto-detection:
+        // stereo content is upmixed, real multichannel content is passed through
+        // unchanged (with matching latency compensation). Bass redirection uses a
+        // 70-90 Hz transition whose midpoint sits on the THX-standard 80 Hz bass
+        // management crossover. The LFE path's own lowpass is separate (120 Hz,
+        // Dolby LFE band limit).
+        upmix_nodes = R"(
+        # FreeSurround stereo to 7.1 upmixer with automatic stereo detection:
+        # only upmixes while all non-L/R input channels are silent
+        { type = ladspa name = fs plugin = ")" + json_escape(plugin_path.toStdString()) + R"(" label = "freesurround71_auto"
+          control = {
+              "center_image" = 0.7
+              "shift" = 0.0
+              "depth" = 1.0
+              "circular_wrap" = 90.0
+              "focus" = 0.0
+              "front_sep" = 1.0
+              "rear_sep" = 1.0
+              "bass_lo" = 70.0
+              "bass_hi" = 90.0
+              "use_lfe" = 1.0
+              "upmix_enable" = 1.0
+          }
+        }
+)";
+        upmix_links = R"(
+        # upmixer outputs feed the copy nodes (which fan out to the HRIR convolvers)
+        { output = "fs:Out FL"  input="copyFL:In"  }
+        { output = "fs:Out FR"  input="copyFR:In"  }
+        { output = "fs:Out FC"  input="copyFC:In"  }
+        { output = "fs:Out LFE" input="copyLFE:In" }
+        { output = "fs:Out RL"  input="copyRL:In"  }
+        { output = "fs:Out RR"  input="copyRR:In"  }
+        { output = "fs:Out SL"  input="copySL:In"  }
+        { output = "fs:Out SR"  input="copySR:In"  }
+)";
+        graph_inputs = R"(  [ "fs:In FL" "fs:In FR" "fs:In FC" "fs:In LFE" "fs:In RL" "fs:In RR" "fs:In SL" "fs:In SR" ])";
+    }
+
+    // LFE gain: native LFE content is recorded 10 dB low (70mm-film convention) and
+    // compensated at playback, which HeSuVi's lfc.txt does with 2x gain (EqualizerAPO's
+    // "Filter: ON LP Fc 111 Hz" plus 200% LFE). Bass extracted from stereo by the
+    // upmixer is at full level, so per the professional monitoring convention (+10 dB
+    // applies only to the native LFE channel, not redirected bass) it gets unity gain.
+    const string lfe_gain = upmix_enabled ? "1.0" : "2.0";
     // Set 7.1 filter graph for virtual surround module, automatically creating playback and capture nodes
-    if (channels == "7.1") {
-        const string filter_graph_7_1 = R"(
+    const string filter_graph = R"(
 {
-    nodes = [
+    nodes = [)" + upmix_nodes + R"(
         # duplicate inputs
         { type = builtin label = copy name = copyFL  }
         { type = builtin label = copy name = copyFR  }
@@ -254,46 +437,67 @@ bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path
         { type = builtin label = copy name = copyLFE }
 
         # apply hrir - HeSuVi 14-channel WAV (not the *-.wav variants) (note: 44 in HeSuVi are the same, but resampled to 44100)
+        # The channel indices below were determined empirically (see "HRIR channel
+        # mapping" in README.md). CAUTION: do not "fix" them based on recordings -
+        # the channel map reported on the recording side of recording tools is very
+        # likely wrong, which is exactly why these values deviate from the labels.
         { type = builtin label = convolver name = convFL_L config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel =  0 } }
+                                    hrir_path + R"(" channel =  0 } }
         { type = builtin label = convolver name = convFL_R config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel =  1 } }
+                                        hrir_path + R"(" channel =  1 } }
         { type = builtin label = convolver name = convSL_L config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel =  2 } }
+                                        hrir_path + R"(" channel =  2 } }
         { type = builtin label = convolver name = convSL_R config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel =  3 } }
+                                        hrir_path + R"(" channel =  3 } }
         { type = builtin label = convolver name = convRL_L config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel =  4 } }
+                                        hrir_path + R"(" channel =  4 } }
         { type = builtin label = convolver name = convRL_R config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel =  5 } }
+                                        hrir_path + R"(" channel =  5 } }
         { type = builtin label = convolver name = convFC_L config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel =  6 } }
+                                        hrir_path + R"(" channel =  6 } }
         { type = builtin label = convolver name = convFR_R config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel =  7 } }
+                                        hrir_path + R"(" channel =  7 } }
         { type = builtin label = convolver name = convFR_L config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel =  8 } }
+                                        hrir_path + R"(" channel =  8 } }
         { type = builtin label = convolver name = convSR_R config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel =  9 } }
+                                        hrir_path + R"(" channel =  9 } }
         { type = builtin label = convolver name = convSR_L config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel = 10 } }
+                                        hrir_path + R"(" channel = 10 } }
         { type = builtin label = convolver name = convRR_R config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel = 11 } }
+                                        hrir_path + R"(" channel = 11 } }
         { type = builtin label = convolver name = convRR_L config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel = 12 } }
+                                        hrir_path + R"(" channel = 12 } }
         { type = builtin label = convolver name = convFC_R config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel = 13 } }
+                                        hrir_path + R"(" channel = 13 } }
 
         # treat LFE as FC
         { type = builtin label = convolver name = convLFE_L config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel =  6 } }
+                                        hrir_path + R"(" channel =  6 } }
         { type = builtin label = convolver name = convLFE_R config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel = 13 } }
+                                        hrir_path + R"(" channel = 13 } }
+
+        # LFE path lowpass: 4th-order Linkwitz-Riley (two cascaded Butterworth biquads,
+        # in-phase flat recombination - the professional crossover standard) at 120 Hz,
+        # the Dolby LFE band limit (AVR "LPF of LFE" defaults to 48 dB/oct; 24 dB/oct
+        # keeps the phase rotation gentler). Then rendered through the center channel
+        # HRIRs at a level that depends on the source: 2x for native LFE channels,
+        # 1x for bass extracted by the upmixer
+        { type = builtin label = bq_lowpass name = lfeLP1 control = { "Freq" = 120.0 "Q" = 0.7071 } }
+        { type = builtin label = bq_lowpass name = lfeLP2 control = { "Freq" = 120.0 "Q" = 0.7071 } }
+        { type = builtin label = linear name = gainLFE_L control = { "Mult" = )" + lfe_gain + R"( } }
+        { type = builtin label = linear name = gainLFE_R control = { "Mult" = )" + lfe_gain + R"( } }
 
         # stereo output
         { type = builtin label = mixer name = mixL }
         { type = builtin label = mixer name = mixR }
+
+        # Output headroom, matching HeSuVi's level budget: its upmix matrix attenuates the
+        # main channels (L=0.5*L, R=0.5*R, ...) so the 8 binaural channels can sum up
+        # without clipping. Users compensate with the system volume, applied after here.
+        { type = builtin label = linear name = outGainL control = { "Mult" = 0.30 } }
+        { type = builtin label = linear name = outGainR control = { "Mult" = 0.30 } }
     ]
-    links = [
+    links = [)" + upmix_links + R"(
         # input
         { output = "copyFL:Out"  input="convFL_L:In"  }
         { output = "copyFL:Out"  input="convFL_R:In"  }
@@ -309,8 +513,12 @@ bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path
         { output = "copyRR:Out"  input="convRR_R:In"  }
         { output = "copyRR:Out"  input="convRR_L:In"  }
         { output = "copyFC:Out"  input="convFC_R:In"  }
-        { output = "copyLFE:Out" input="convLFE_L:In" }
-        { output = "copyLFE:Out" input="convLFE_R:In" }
+        { output = "copyLFE:Out" input="lfeLP1:In" }
+        { output = "lfeLP1:Out" input="lfeLP2:In" }
+        { output = "lfeLP2:Out" input="gainLFE_L:In" }
+        { output = "lfeLP2:Out" input="gainLFE_R:In" }
+        { output = "gainLFE_L:Out" input="convLFE_L:In" }
+        { output = "gainLFE_R:Out" input="convLFE_R:In" }
 
         # output
         { output = "convFL_L:Out"  input="mixL:In 1" }
@@ -329,157 +537,64 @@ bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path
         { output = "convRR_L:Out"  input="mixL:In 7" }
         { output = "convLFE_R:Out" input="mixR:In 8" }
         { output = "convLFE_L:Out" input="mixL:In 8" }
+        { output = "mixL:Out" input="outGainL:In" }
+        { output = "mixR:Out" input="outGainR:In" }
     ]
-    inputs  = [ "copyFL:In" "copyFR:In" "copyFC:In" "copyLFE:In" "copyRL:In" "copyRR:In", "copySL:In", "copySR:In" ]
-    outputs = [ "mixL:Out" "mixR:Out" ]
+    inputs  = )" + graph_inputs + R"(
+    outputs = [ "outGainL:Out" "outGainR:Out" ]
 }
         )";
 
-        // Set capture properties for virtual surround module
-        const string capture_props_7_1 = R"(
+    // Set capture properties for virtual surround module
+    // node.latency keeps the graph quantum at 1024 samples or more while this
+    // device is active: without it, a low-latency app can drag the whole chain
+    // down to tiny quanta where the 14 convolvers (plus the FFT upmixer) are
+    // far more prone to xruns, and every quantum renegotiation is audible.
+    // audio.rate pins both ends of the chain to 48000 Hz: the bundled HeSuVi
+    // HRIR WAVs are 48000 Hz and while PipeWire's convolver would correctly
+    // resample them to any other graph rate (which clock.allowed-rates can
+    // switch to at runtime), running them at their native rate avoids that
+    // resampling entirely. PipeWire converts between the chain and streams or
+    // devices running at other rates.
+    const string capture_props = R"(
 {
-    node.name = )" + (string)capture_node_name +
+    node.name = )" + string(capture_node_name) +
                                          R"(
     media.class = "Audio/Sink"
+    node.latency = "1024/48000"
+    audio.rate = 48000
     audio.channels = 8
     audio.position = [ FL FR FC LFE RL RR SL SR ]
 }
         )";
 
-        // Set playback properties for virtual surround module
-        const string playback_props_7_1 = R"(
+    // Set playback properties for virtual surround module
+    const string playback_props = R"(
 {
     node.name = )" + string(playback_node_name) +
                                           R"(
     node.passive = true
+    node.latency = "1024/48000"
+    audio.rate = 48000
     audio.channels = 2
     audio.position = [ FL FR ]
 }
         )";
 
-        // Combine the properites to a single JSON string
-        args = R"(
+    // Combine the properites to a single JSON string
+    const string args = R"(
 {
-    node.description = "Virtual Surround Manager",
-    media.name = "Virtual Surround Manager",
+    node.description = "Virtual Surround Manager"
+    media.name = "Virtual Surround Manager"
     filter.graph = )" +
-               filter_graph_7_1 +
+               filter_graph +
                R"(,
     capture.props = )" +
-               capture_props_7_1 + R"(,
+               capture_props + R"(,
     playback.props = )" +
-               playback_props_7_1 + R"(
+               playback_props + R"(
 }
         )";
-    }
-    // Set 5.1 filter graph for virtual surround module, automatically creating playback and capture nodes
-    else if (channels == "5.1") {
-        const string filter_graph_5_1 = R"(
-{
-    nodes = [
-        # duplicate inputs
-        { type = builtin label = copy name = copyFL  }
-        { type = builtin label = copy name = copyFR  }
-        { type = builtin label = copy name = copySL  }
-        { type = builtin label = copy name = copySR  }
-
-        # apply hrir - HeSuVi 14-channel WAV (not the *-.wav variants) (note: 44 in HeSuVi are the same, but resampled to 44100)
-        { type = builtin label = convolver name = convFL_L config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel =  0 } }
-        { type = builtin label = convolver name = convFR_R config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel =  0 } }
-        { type = builtin label = convolver name = convFL_R config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel =  1 } }
-        { type = builtin label = convolver name = convFR_L config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel =  1 } }
-        { type = builtin label = convolver name = convFC config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel =  2 } }
-        { type = builtin label = convolver name = convLFE config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel =  3 } }
-        { type = builtin label = convolver name = convSL_L config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel =  4 } }
-        { type = builtin label = convolver name = convSR_R config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel =  4 } }
-        { type = builtin label = convolver name = convSL_R config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel =  5 } }
-        { type = builtin label = convolver name = convSR_L config = { filename = ")" +
-                                        hrir_wav_path + R"(" channel =  5 } }
-
-        # stereo output
-        { type = builtin label = mixer name = mixL }
-        { type = builtin label = mixer name = mixR }
-    ]
-    links = [
-        # input
-        { output = "copyFL:Out"  input="convFL_L:In"  }
-        { output = "copyFL:Out"  input="convFL_R:In"  }
-        { output = "copyFR:Out"  input="convFR_R:In"  }
-        { output = "copyFR:Out"  input="convFR_L:In"  }
-        { output = "copySL:Out"  input="convSL_L:In"  }
-        { output = "copySL:Out"  input="convSL_R:In"  }
-        { output = "copySR:Out"  input="convSR_R:In"  }
-        { output = "copySR:Out"  input="convSR_L:In"  }
-
-        # output
-        { output = "convFL_L:Out"  input="mixL:In 1" }
-        { output = "convFL_R:Out"  input="mixR:In 1" }
-        { output = "convFR_L:Out"  input="mixL:In 2" }
-        { output = "convFR_R:Out"  input="mixR:In 2" }
-        { output = "convFC:Out"    input="mixL:In 3" }
-        { output = "convFC:Out"    input="mixR:In 3" }
-        { output = "convLFE:Out"   input="mixL:In 4" }
-        { output = "convLFE:Out"   input="mixR:In 4" }
-        { output = "convSL_L:Out"  input="mixL:In 5" }
-        { output = "convSL_R:Out"  input="mixR:In 5" }
-        { output = "convSR_L:Out"  input="mixL:In 6" }
-        { output = "convSR_R:Out"  input="mixR:In 6" }
-    ]
-    inputs  = [ "copyFL:In" "copyFR:In" "convFC:In" "convLFE:In" "copySL:In" "copySR:In" ]
-    outputs = [ "mixL:Out" "mixR:Out" ]
-}
-        )";
-
-        // Set capture properties for virtual surround module
-        const string capture_props_5_1 = R"(
-{
-    node.name = )" + (string)capture_node_name +
-                                         R"(
-    media.class = "Audio/Sink"
-    audio.channels = 6
-    audio.position = [ FL FR FC LFE SL SR ]
-}
-        )";
-
-        // Set playback properties for virtual surround module
-        const string playback_props_5_1 = R"(
-{
-    node.name = )" + string(playback_node_name) +
-                                          R"(
-    node.passive = true
-    audio.channels = 2
-    audio.position = [ FL FR ]
-}
-        )";
-
-        // Combine the properites to a single JSON string
-        args = R"(
-{
-    node.description = "Virtual Surround Manager",
-    media.name = "Virtual Surround Manager",
-    filter.graph = )" +
-               filter_graph_5_1 +
-               R"(,
-    capture.props = )" +
-               capture_props_5_1 + R"(,
-    playback.props = )" +
-               playback_props_5_1 + R"(
-}
-        )";
-    } else {
-        qWarning("create_virtual_surround_module: Invalid channels");
-        Q_EMIT error_occured(QStringLiteral("Error creating virtual surround device. Invalid channels."));
-        return false;
-    }
 
     pw_thread_loop_lock(thread_loop);
 
@@ -492,7 +607,7 @@ bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path
     if (!module) {
         pw_thread_loop_unlock(thread_loop);
         qWarning("create_virtual_surround_module: Failed to load module into PipeWire context");
-        Q_EMIT error_occured(QStringLiteral("Error creating virtual surround device."));
+        Q_EMIT error_occurred(QStringLiteral("Error creating virtual surround device."));
         return false;
     }
 
@@ -504,12 +619,21 @@ bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path
 }
 
 void PipeWireManager::remove_virtual_surround_module() {
+    if (!thread_loop)
+        return;
+
     pw_thread_loop_lock(thread_loop);
 
     if (module) {
         pw_impl_module_destroy(module);
         module = nullptr;
     }
+    // The playback node disappears with the module; do not keep its now stale ID
+    playback_node_id = SPA_ID_INVALID;
+
+    // Wait until the server has actually destroyed the module's nodes,
+    // recreating it too fast otherwise makes the audio stop completely
+    sync_with_core(2);
 
     pw_thread_loop_unlock(thread_loop);
 
@@ -520,11 +644,12 @@ void PipeWireManager::enable_routing() {
     // Do nothing if registry listener already exists
     if (is_registry_listener_added)
         return;
+    if (!is_valid()) {
+        qWarning("enable_routing: Not connected to PipeWire");
+        return;
+    }
 
     pw_thread_loop_lock(thread_loop);
-
-    if (registry)
-        pw_proxy_destroy((pw_proxy *)registry);
 
     registry = pw_core_get_registry(core, PW_VERSION_REGISTRY, 0);
 
@@ -543,6 +668,8 @@ void PipeWireManager::disable_routing() {
     // Do nothing if registry listener does not exist
     if (!is_registry_listener_added)
         return;
+    if (!thread_loop)
+        return;
 
     pw_thread_loop_lock(thread_loop);
 
@@ -555,8 +682,6 @@ void PipeWireManager::disable_routing() {
             // Remove the target object property from the node
             int ret = pw_metadata_set_property(metadata, id, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", nullptr);
             qDebug("disable_routing: pw_metadata_set_property returned %d for node %u", ret, id);
-
-            qDebug("Removed target.object property from node with ID %u", id);
         } else {
             qDebug("disable_routing: metadata is nullptr, skipping node %u", id);
         }
@@ -571,11 +696,64 @@ void PipeWireManager::disable_routing() {
     sinks.clear();
     decided_streams.clear();
 
+    // The registry is re-created on the next enable_routing()
+    if (registry) {
+        pw_proxy_destroy((pw_proxy *)registry);
+        registry = nullptr;
+    }
+
     is_registry_listener_added = false;
 
     pw_thread_loop_unlock(thread_loop);
 
     qDebug("Disabled routing");
+}
+
+bool PipeWireManager::is_valid() const {
+    return thread_loop && context && core;
+}
+
+void PipeWireManager::on_core_done(void *data, [[maybe_unused]] uint32_t id, int seq) {
+    PipeWireManager *manager = static_cast<PipeWireManager *>(data);
+
+    if (seq == manager->sync_seq) {
+        manager->sync_done = true;
+        pw_thread_loop_signal(manager->thread_loop, false);
+    }
+}
+
+void PipeWireManager::on_core_error(void *data, uint32_t id, [[maybe_unused]] int seq, int res, const char *message) {
+    PipeWireManager *manager = static_cast<PipeWireManager *>(data);
+
+    qWarning("on_core_error: id %u, res %d (%s)", id, res, message ? message : "?");
+
+    // Only surface core-level failures (e.g. a lost connection); errors for
+    // individual objects are usually benign races with disappearing nodes
+    if (id == PW_ID_CORE && res < 0) {
+        // Emitted from the PipeWire thread: the connection to FrontendManager
+        // is automatically queued across threads
+        Q_EMIT manager->error_occurred(QString::asprintf("PipeWire error: %s", message && message[0] ? message : strerror(-res)));
+    }
+}
+
+bool PipeWireManager::sync_with_core(int timeout_sec) {
+    if (!core || !thread_loop)
+        return false;
+
+    sync_done = false;
+    sync_seq = pw_core_sync(core, PW_ID_CORE, sync_seq + 1);
+
+    struct timespec abstime;
+    clock_gettime(CLOCK_REALTIME, &abstime);
+    abstime.tv_sec += timeout_sec;
+
+    while (!sync_done) {
+        if (pw_thread_loop_timed_wait_full(thread_loop, &abstime) != 0) {
+            qWarning("sync_with_core: Timed out after %d seconds", timeout_sec);
+            return false;
+        }
+    }
+    return true;
 }
 
 PipeWireManager::PipeWireManager() {
@@ -587,15 +765,24 @@ PipeWireManager::PipeWireManager() {
           "Linked with libpipewire %s\n",
           pw_get_headers_version(), pw_get_library_version());
 
+    // Errors emitted as a signal here are lost: no slots are connected yet during
+    // construction. The frontend queries is_valid() instead and shows its own message.
+    const auto fail = [](const char *message) {
+        qWarning("%s", message);
+    };
+
     // Create some initial stuff for PipeWire to work
     thread_loop = pw_thread_loop_new("main", nullptr);
     if (!thread_loop) {
-        qWarning("Failed to create PipeWire thread loop");
-        Q_EMIT error_occured(QStringLiteral("Failed connecting to PipeWire audio service."));
+        fail("Failed to create PipeWire thread loop");
         return;
     }
 
     pw_properties *props = pw_properties_new(nullptr, nullptr);
+    if (!props) {
+        fail("Failed to create PipeWire properties");
+        return;
+    }
     pw_properties_set(props, PW_KEY_MEDIA_TYPE, "Audio");
     pw_properties_set(props, PW_KEY_MEDIA_ROLE, "Music");
 
@@ -604,9 +791,7 @@ PipeWireManager::PipeWireManager() {
 
     context = pw_context_new(pw_thread_loop_get_loop(thread_loop), props, 0);
     if (!context) {
-        pw_thread_loop_unlock(thread_loop);
-        qWarning("Failed to create PipeWire context");
-        Q_EMIT error_occured(QStringLiteral("Failed connecting to PipeWire audio service."));
+        fail("Failed to create PipeWire context");
         return;
     }
 
@@ -616,23 +801,17 @@ PipeWireManager::PipeWireManager() {
     core = pw_context_connect(context, nullptr, 0);
     if (!core) {
         pw_thread_loop_unlock(thread_loop);
-        qWarning("Failed to connect to PipeWire daemon");
-        Q_EMIT error_occured(QStringLiteral("Failed connecting to PipeWire audio service."));
+        fail("Failed to connect to PipeWire daemon");
         return;
     }
 
-    registry = pw_core_get_registry(core, PW_VERSION_REGISTRY, 0);
-    if (!registry) {
-        pw_thread_loop_unlock(thread_loop);
-        qWarning("Failed to get PipeWire registry");
-        Q_EMIT error_occured(QStringLiteral("Failed connecting to PipeWire audio service."));
-        return;
-    }
+    // Listen for core roundtrip acknowledgements (see sync_with_core)
+    spa_zero(core_listener);
+    pw_core_add_listener(core, &core_listener, &core_events, this);
 
     if (pw_thread_loop_start(thread_loop) < 0) {
         pw_thread_loop_unlock(thread_loop);
-        qWarning("Failed to start the thread loop.");
-        Q_EMIT error_occured(QStringLiteral("Failed connecting to PipeWire audio service."));
+        fail("Failed to start the PipeWire thread loop");
         return;
     }
 
@@ -641,13 +820,33 @@ PipeWireManager::PipeWireManager() {
 
 PipeWireManager::~PipeWireManager() {
     disable_routing();
-    // We need to wait a little bit or the audio just stops completely when destroying too fast
-    QThread::msleep(100);
 
-    // Clean up PipeWire stuff
-    pw_thread_loop_stop(thread_loop);
-    pw_core_disconnect(core);
-    pw_context_destroy(context);
-    pw_thread_loop_destroy(thread_loop);
+    if (thread_loop) {
+        pw_thread_loop_lock(thread_loop);
+
+        // Destroy the metadata proxy while holding the lock: its listener can
+        // still be dispatched on the PipeWire thread until the loop is stopped
+        if (metadata) {
+            spa_hook_remove(&metadata_listener);
+            pw_proxy_destroy((pw_proxy *)metadata);
+            metadata = nullptr;
+        }
+
+        // Make sure the server has processed the target clears above before the
+        // connection goes away
+        sync_with_core(2);
+
+        pw_thread_loop_unlock(thread_loop);
+    }
+
+    // Clean up PipeWire stuff, tolerating a failed construction
+    if (thread_loop)
+        pw_thread_loop_stop(thread_loop);
+    if (core)
+        pw_core_disconnect(core);
+    if (context)
+        pw_context_destroy(context);
+    if (thread_loop)
+        pw_thread_loop_destroy(thread_loop);
     pw_deinit();
 }

@@ -35,6 +35,18 @@ target_include_directories(virtual-surround-manager PRIVATE ${PIPEWIRE_INCLUDE_D
 target_compile_options(virtual-surround-manager PRIVATE ${PIPEWIRE_CFLAGS_OTHER})
 target_link_libraries(virtual-surround-manager PRIVATE ${PIPEWIRE_LIBRARIES})
 
+# Expose the project version and the installation path of the bundled
+# FreeSurround LADSPA plugin to the code (the plugin path is not stable in
+# AppImages, which resolve it via $APPDIR at runtime instead)
+target_compile_definitions(virtual-surround-manager PRIVATE
+    PROJECT_VERSION="${PROJECT_VERSION}"
+)
+if(NOT IS_APPIMAGE)
+    target_compile_definitions(virtual-surround-manager PRIVATE
+        VSM_LADSPA_PLUGIN_PATH="${KDE_INSTALL_FULL_LIBDIR}/ladspa/freesurround_ladspa.so"
+    )
+endif()
+
 # Flatpak stuff
 if(IS_FLATPAK)
     message(STATUS "Flatpak build")
@@ -67,7 +79,15 @@ install(
     DESTINATION ${KDE_INSTALL_DATADIR}/icons/hicolor/scalable/apps
 )
 
-add_subdirectory(qml)
+# QML sources are registered here and not from qml/ because
+# qt6_target_qml_sources must run in the same directory scope as the target
+# definition, otherwise configuring with the default Unix Makefiles generator
+# fails (only Ninja tolerates the cross-scope call)
+ecm_target_qml_sources(virtual-surround-manager
+    SOURCES
+    qml/Main.qml
+    qml/Settings.qml
+)
 
 # Install binary to default system path
 install(TARGETS virtual-surround-manager ${KDE_INSTALL_TARGETS_DEFAULT_ARGS})

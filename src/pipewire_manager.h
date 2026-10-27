@@ -1,29 +1,15 @@
 #pragma once
 
-#include "pipewire/context.h"
-#include "pipewire/impl-module.h"
-#include "pipewire/thread-loop.h"
-#include <QDebug>
 #include <QMap>
 #include <QObject>
-#include <pipewire/context.h>
-#include <pipewire/core.h>
+#include <QSet>
+#include <QString>
+#include <array>
 #include <pipewire/extensions/metadata.h>
-#include <pipewire/filter.h>
 #include <pipewire/impl-module.h>
-#include <pipewire/impl-node.h>
-#include <pipewire/keys.h>
-#include <pipewire/main-loop.h>
-#include <pipewire/node.h>
 #include <pipewire/pipewire.h>
-#include <pipewire/properties.h>
-#include <qcontainerfwd.h>
-#include <qdebug.h>
-#include <qhashfunctions.h>
-#include <qlogging.h>
-#include <qthread.h>
-#include <qtmetamacros.h>
 #include <string>
+#include <string_view>
 
 using std::string;
 
@@ -32,13 +18,22 @@ class PipeWireManager : public QObject {
 
   public:
     PipeWireManager();
-    ~PipeWireManager();
+    ~PipeWireManager() override;
 
     //
-    // Creates a new virtual surround module. Does nothing if a module already exists.
-    // Call this before enable_routing().
+    // True if the connection to the PipeWire audio service was established.
+    // While this is false, the routing methods are no-ops and creating the
+    // virtual surround module fails with an error message.
     //
-    bool create_virtual_surround_module(const string &hrir_wav_path, const string &channels);
+    bool is_valid() const;
+
+    //
+    // Creates a new 7.1 virtual surround module. Does nothing if a module already exists.
+    // Call this before enable_routing().
+    // When upmix_enabled is set, stereo streams are upmixed to 7.1 by the bundled
+    // FreeSurround LADSPA plugin (see find_ladspa_plugin()).
+    //
+    bool create_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled);
 
     //
     // Removes the virtual surround module.
@@ -55,7 +50,7 @@ class PipeWireManager : public QObject {
     //
     void disable_routing();
 
-    Q_SIGNAL void error_occured(const QString &message);
+    Q_SIGNAL void error_occurred(const QString &message);
 
   private:
     struct pw_thread_loop *thread_loop = nullptr;
@@ -63,9 +58,16 @@ class PipeWireManager : public QObject {
     struct pw_core *core = nullptr;
     struct pw_registry *registry = nullptr;
     struct pw_metadata *metadata = nullptr;
+    struct spa_hook core_listener;
     struct spa_hook registry_listener;
     struct spa_hook metadata_listener;
-    struct spa_hook core_listener;
+
+    // State for sync_with_core()
+    int sync_seq = 0;
+    bool sync_done = false;
+
+    // Global ID of the bound "default" metadata object, SPA_ID_INVALID while unbound
+    uint32_t metadata_global_id = SPA_ID_INVALID;
 
     const char *capture_node_name = "effect_input.virtual-surround-manager";
     const char *playback_node_name = "effect_output.virtual-surround-manager";
@@ -93,8 +95,44 @@ class PipeWireManager : public QObject {
         uint32_t id;
         struct pw_proxy *proxy;
         struct spa_hook listener;
+        // Last seen target.object of the node, kept so streams that were tracked
+        // before the metadata object appeared can still be decided later
+        string props_target;
+        // False once the listener was detached after the stream was decided
+        bool listener_attached = true;
     };
     QMap<uint32_t, NodeBinding *> node_bindings;
+
+    //
+    // Returns the path of the FreeSurround LADSPA plugin used for stereo upmixing,
+    // or an empty string if it was not found anywhere.
+    //
+    static QString find_ladspa_plugin();
+
+    //
+    // Blocks until the PipeWire server has processed everything sent so far,
+    // or until the timeout (in seconds) expires. Must be called with the thread
+    // loop lock held. Replaces blind sleeps after module teardown: audio just
+    // stopping when destroying too fast is really just missing synchronization.
+    //
+    bool sync_with_core(int timeout_sec);
+
+    //
+    // Called when the server acknowledges a sync_with_core() roundtrip.
+    //
+    static void on_core_done(void *data, uint32_t id, int seq);
+
+    //
+    // Called on core-level errors (e.g. a lost connection to the PipeWire
+    // service). Without this, such failures went completely unnoticed.
+    //
+    static void on_core_error(void *data, uint32_t id, int seq, int res, const char *message);
+
+    const struct pw_core_events core_events = {
+        .version = PW_VERSION_CORE_EVENTS,
+        .done = on_core_done,
+        .error = on_core_error,
+    };
 
     //
     // Parses the node name out of the default.audio.sink metadata value, e.g. {"name":"alsa_output..."}.
@@ -105,6 +143,14 @@ class PipeWireManager : public QObject {
     // Removes a node binding's listener and destroys its proxy.
     //
     void destroy_binding(NodeBinding *binding);
+
+    //
+    // Detaches a still-attached node binding's listener. Called once the stream
+    // was decided: no further node events are needed, but the proxy itself is
+    // only destroyed on global_remove/disable_routing because destroying a
+    // proxy from inside its own event callback is not safe.
+    //
+    void detach_binding_listener(NodeBinding *binding);
 
     //
     // Resolves a target (node name or object serial) to a known sink's node name.

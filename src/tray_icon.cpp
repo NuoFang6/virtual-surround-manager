@@ -1,5 +1,18 @@
 #include "tray_icon.h"
-#include <qhashfunctions.h>
+#include "frontend_manager.h"
+
+#include <KLocalizedString>
+#include <QAction>
+#include <QActionGroup>
+#include <QApplication>
+#include <QFile>
+#include <QFileInfo>
+#include <QDir>
+#include <QIcon>
+#include <QMenu>
+#include <QQuickWindow>
+#include <QStandardPaths>
+#include <QSystemTrayIcon>
 
 TrayIcon::TrayIcon(QObject *parent) : QObject(parent) {
     m_tray_icon = new QSystemTrayIcon(this);
@@ -27,6 +40,12 @@ TrayIcon::TrayIcon(QObject *parent) : QObject(parent) {
                      });
 }
 
+TrayIcon::~TrayIcon() {
+    // The menu has no QWidget parent (QSystemTrayIcon is only a QObject), so
+    // it would leak at exit; its submenus and actions are destroyed with it
+    delete m_menu;
+}
+
 void TrayIcon::set_frontend_manager(FrontendManager *frontend_manager) {
     m_frontend_manager = frontend_manager;
     update_profile_menu();
@@ -34,7 +53,6 @@ void TrayIcon::set_frontend_manager(FrontendManager *frontend_manager) {
 
 void TrayIcon::setup(const QString &icon_name) {
     QIcon icon = QIcon::fromTheme(icon_name);
-    // #ifdef IS_APPIMAGE
     if (icon.isNull()) {
         // The tray icon does NOT work automatically in an AppImage for unknown reasons!
         // Both fromTheme and addFile are not working, so the svg file just gets copied to ~/.local/share/icons/hicolor/scalable/apps/
@@ -48,7 +66,6 @@ void TrayIcon::setup(const QString &icon_name) {
         }
         icon.addFile(destination);
     }
-    // #endif
     m_tray_icon->setIcon(icon);
     m_tray_icon->setToolTip(i18nc("@title", "Virtual Surround"));
     m_tray_icon->setContextMenu(m_menu);
@@ -117,21 +134,15 @@ void TrayIcon::update_ui_state() {
 }
 
 void TrayIcon::update_profile_menu() {
-    if (m_called_update_profile_menu) {
-        // Prevent calling twice and causing multible checkmarks.
-        m_called_update_profile_menu = false;
-        return;
-    }
-
     if (!m_frontend_manager || !m_profile_menu) {
         qWarning() << "TrayIcon::update_profile_menu - missing manager or menu";
         return;
     }
 
     // Clear existing profile actions
-    for (auto *action : m_profile_menu->actions()) {
+    const auto old_actions = m_profile_menu->actions();
+    for (auto *action : old_actions) {
         m_profile_menu->removeAction(action);
-        QObject::disconnect(action);
         delete action;
     }
 
@@ -170,12 +181,5 @@ void TrayIcon::on_profile_selected() {
         return;
     }
 
-    m_called_update_profile_menu = true;
-
-    const int index = action->data().toInt();
-    m_frontend_manager->set_hrir_wav_file_name_index(index);
-
-    for (auto *a : m_profile_menu->actions()) {
-        a->setChecked(a == action);
-    }
+    m_frontend_manager->set_hrir_wav_file_name_index(action->data().toInt());
 }

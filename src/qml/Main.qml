@@ -79,7 +79,7 @@ Kirigami.ApplicationWindow {
                 id: errorMessage
                 Layout.fillWidth: true
                 type: Kirigami.MessageType.Error
-                text: i18nc("@label", "An error occured: %1", frontendManager.errorMessage)
+                text: i18nc("@label", "An error occurred: %1", frontendManager.errorMessage)
                 visible: frontendManager.errorMessage.length > 0
                 showCloseButton: true
             }
@@ -119,7 +119,7 @@ Kirigami.ApplicationWindow {
 
             Kirigami.InlineMessage {
                 Layout.fillWidth: true
-                text: i18nc("@message", "<b>Adding more profiles</b><br>Just open the folder and place your WAV files there. You can find hundreds of these files in the <a href=\"https://airtable.com/appayGNkn3nSuXkaz/shruimhjdSakUPg2m/tbloLjoZKWJDnLtTc\">HRTF Database<a/>.")
+                text: i18nc("@message", "<b>Adding more profiles</b><br>Just open the folder and place your WAV files there. You can find hundreds of these files in the <a href=\"https://airtable.com/appayGNkn3nSuXkaz/shruimhjdSakUPg2m/tbloLjoZKWJDnLtTc\">HRTF Database</a>.")
                 onLinkActivated: function (link) {
                     Qt.openUrlExternally(link);
                 }
