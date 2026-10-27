@@ -41,6 +41,7 @@ FrontendManager::FrontendManager(PipeWireManager *pipewire_manager, KConfig *con
     m_autostart_enabled = m_config_settings.readEntry("autostart_enabled", bool());
 
     m_upmix_enabled = m_config_settings.readEntry("upmix_enabled", bool());
+    m_lfe_bypass_enabled = m_config_settings.readEntry("lfe_bypass_enabled", bool());
 
     m_virtual_surround_auto_enabled = m_config_settings.readEntry("virtual_surround_auto_enabled", bool());
     if (m_virtual_surround_auto_enabled) {
@@ -76,7 +77,7 @@ bool FrontendManager::create_module() {
     QString path = m_hrir_wav_file_paths.value(m_hrir_wav_file_name_index);
     if (!does_hrir_wav_file_exist(path))
         return false;
-    if (!m_pipewire_manager->create_virtual_surround_module(path.toStdString(), m_upmix_enabled))
+    if (!m_pipewire_manager->create_virtual_surround_module(path.toStdString(), m_upmix_enabled, m_lfe_bypass_enabled))
         return false;
     if (m_virtual_surround_enabled)
         m_pipewire_manager->enable_routing();
@@ -380,4 +381,22 @@ void FrontendManager::set_upmix_enabled(bool value) {
     m_config->sync();
 
     Q_EMIT upmix_enabled_changed();
+}
+
+bool FrontendManager::get_lfe_bypass_enabled() const {
+    return m_lfe_bypass_enabled;
+}
+
+void FrontendManager::set_lfe_bypass_enabled(bool value) {
+    if (m_lfe_bypass_enabled == value)
+        return;
+    m_lfe_bypass_enabled = value;
+
+    // Baked into the filter graph like the upmix flag, so rebuild for live A/B
+    rebuild_module();
+
+    m_config_settings.writeEntry("lfe_bypass_enabled", m_lfe_bypass_enabled);
+    m_config->sync();
+
+    Q_EMIT lfe_bypass_enabled_changed();
 }

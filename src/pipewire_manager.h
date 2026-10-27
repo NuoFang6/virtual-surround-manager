@@ -32,8 +32,12 @@ class PipeWireManager : public QObject {
     // Call this before enable_routing().
     // When upmix_enabled is set, stereo streams are upmixed to 7.1 by the bundled
     // FreeSurround LADSPA plugin (see find_ladspa_plugin()).
+    // When lfe_bypass is set, the LFE path skips HRIR convolution entirely and is
+    // rendered as equal L/R through a unit impulse ("dirac delta") IR of the same
+    // length as the selected HRIR, matching the conventional headphone-virtualizer
+    // design for the LFE channel (time alignment via identical-length IRs).
     //
-    bool create_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled);
+    bool create_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled, bool lfe_bypass);
 
     //
     // Removes the virtual surround module.

@@ -27,6 +27,8 @@ class FrontendManager : public QObject {
     Q_PROPERTY(bool virtualSurroundAutoEnabled READ get_virtual_surround_auto_enabled WRITE set_virtual_surround_auto_enabled NOTIFY virtual_surround_auto_enabled_changed)
     // Whether stereo audio is upmixed to surround (PSD) or not
     Q_PROPERTY(bool upmixEnabled READ get_upmix_enabled WRITE set_upmix_enabled NOTIFY upmix_enabled_changed)
+    // Whether the LFE path bypasses HRIR convolution (equal L/R, no coloring) or not
+    Q_PROPERTY(bool lfeBypassEnabled READ get_lfe_bypass_enabled WRITE set_lfe_bypass_enabled NOTIFY lfe_bypass_enabled_changed)
 
   public:
     explicit FrontendManager(PipeWireManager *pipewire_manager, KConfig *config, QObject *parent = nullptr);
@@ -68,6 +70,10 @@ class FrontendManager : public QObject {
     void set_upmix_enabled(bool value);
     Q_SIGNAL void upmix_enabled_changed();
 
+    bool get_lfe_bypass_enabled() const;
+    void set_lfe_bypass_enabled(bool value);
+    Q_SIGNAL void lfe_bypass_enabled_changed();
+
   private:
     bool m_virtual_surround_enabled = false;
     QString m_error_message;
@@ -78,6 +84,7 @@ class FrontendManager : public QObject {
     bool m_autostart_enabled = false;
     bool m_virtual_surround_auto_enabled = false;
     bool m_upmix_enabled = false;
+    bool m_lfe_bypass_enabled = false;
 
     PipeWireManager *m_pipewire_manager;
     KConfig *m_config;

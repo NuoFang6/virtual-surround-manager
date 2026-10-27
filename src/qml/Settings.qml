@@ -63,10 +63,19 @@ FormCard.FormCardPage {
         FormCard.FormSwitchDelegate {
             id: upmixEnabled
             text: i18nc("@label:switch", "Upmix stereo to surround sound")
-            description: i18nc("@info:description", "Upmix stereo audio to the virtual 7.1 channels using Passive Surround Decoding (LFE low-pass at 111 Hz). Native multi-channel audio is passed through unchanged. Applied instantly.")
+            description: i18nc("@info:description", "Upmix stereo audio to the virtual 7.1 channels using Passive Surround Decoding (bass redirection at 70–90 Hz). Native multi-channel audio is passed through unchanged. Applied instantly.")
             checkable: true
             checked: frontendManager.upmixEnabled
             onToggled: frontendManager.upmixEnabled = checked
+        }
+
+        FormCard.FormSwitchDelegate {
+            id: lfeBypassEnabled
+            text: i18nc("@label:switch", "Render LFE without HRIR convolution")
+            description: i18nc("@info:description", "Low frequencies are not spatialized: the LFE path bypasses the headphone impulse response and is mixed equally into both ears, following the conventional headphone-virtualizer design for the LFE channel. Applied instantly.")
+            checkable: true
+            checked: frontendManager.lfeBypassEnabled
+            onToggled: frontendManager.lfeBypassEnabled = checked
         }
     }
 }
