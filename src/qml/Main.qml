@@ -14,15 +14,73 @@ Kirigami.ApplicationWindow {
     height: 570
     title: i18nc("@title:window", "Manager")
 
+    // Set right before quitting so the confirmation is not shown twice
+    property bool forceQuit: false
+
     // Intercept close event to minimize to tray instead of quitting
     onClosing: event => {
         // Only intercept if tray icon is visible, to prevent being unable to close app after changing tray icon setting from hidden to visible
-        if (trayIcon.is_visible()) {
+        if (trayIcon.is_visible() && !forceQuit) {
             event.accepted = false;
             if (trayIcon !== null && trayIcon.hide_main_window !== undefined) {
                 trayIcon.hide_main_window();
             }
+        } else if (!forceQuit && frontendManager.virtualSurroundEnabled && frontendManager.is_audio_playing()) {
+            // Closing really quits here (no tray icon); ask before cutting the audio
+            event.accepted = false;
+            quitConfirmDialog.open();
         }
+    }
+
+    Connections {
+        target: frontendManager
+        function onVirtualSurroundEnabledChanged() {
+            // Keep the switch in sync with toggles from the tray icon
+            toggleVirtualSurroundAction.checked = frontendManager.virtualSurroundEnabled;
+        }
+    }
+
+    Kirigami.PromptDialog {
+        id: disableConfirmDialog
+        title: i18nc("@title:dialog", "Audio is playing")
+        subtitle: i18nc("@info:dialog", "Disabling virtual surround will move the playing audio to your default output device. Do you want to continue?")
+        standardButtons: Controls.Dialog.NoButton
+        customFooterActions: [
+            Kirigami.Action {
+                text: i18nc("@action:button", "Keep enabled")
+                onTriggered: disableConfirmDialog.close()
+            },
+            Kirigami.Action {
+                text: i18nc("@action:button", "Disable")
+                icon.name: "dialog-warning-symbolic"
+                onTriggered: {
+                    frontendManager.virtualSurroundEnabled = false;
+                    disableConfirmDialog.close();
+                }
+            }
+        ]
+    }
+
+    Kirigami.PromptDialog {
+        id: quitConfirmDialog
+        title: i18nc("@title:dialog", "Audio is playing")
+        subtitle: i18nc("@info:dialog", "Closing the application will move the playing audio back to your default output device. Do you want to quit?")
+        standardButtons: Controls.Dialog.NoButton
+        customFooterActions: [
+            Kirigami.Action {
+                text: i18nc("@action:button", "Cancel")
+                onTriggered: quitConfirmDialog.close()
+            },
+            Kirigami.Action {
+                text: i18nc("@action:button", "Quit")
+                icon.name: "application-exit-symbolic"
+                onTriggered: {
+                    root.forceQuit = true;
+                    quitConfirmDialog.close();
+                    Qt.quit();
+                }
+            }
+        ]
     }
 
     // Load the additional pages
@@ -64,7 +122,19 @@ Kirigami.ApplicationWindow {
                 checkable: true
                 checked: frontendManager.virtualSurroundEnabled
                 enabled: frontendManager.hrirWavFileNames.length > 0
-                onToggled: frontendManager.virtualSurroundEnabled = checked
+                onToggled: {
+                    // Ignore the echo when the switch was synced from the manager state
+                    if (checked === frontendManager.virtualSurroundEnabled) {
+                        return;
+                    }
+                    if (!checked && frontendManager.is_audio_playing()) {
+                        // Do not cut the audio without asking; revert and confirm
+                        checked = frontendManager.virtualSurroundEnabled;
+                        disableConfirmDialog.open();
+                        return;
+                    }
+                    frontendManager.virtualSurroundEnabled = checked;
+                }
                 displayComponent: Controls.Switch {
                     action: toggleVirtualSurroundAction
                 }

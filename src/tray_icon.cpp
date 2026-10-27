@@ -10,6 +10,7 @@
 #include <QDir>
 #include <QIcon>
 #include <QMenu>
+#include <QMessageBox>
 #include <QQuickWindow>
 #include <QStandardPaths>
 #include <QSystemTrayIcon>
@@ -103,6 +104,17 @@ void TrayIcon::show_main_window() {
 }
 
 void TrayIcon::quit_application() {
+    // Quitting tears the graph down and playing streams fall back to the physical
+    // device; ask first when that would interrupt something
+    if (m_frontend_manager && m_frontend_manager->is_audio_playing()) {
+        const auto answer = QMessageBox::question(
+            nullptr, i18nc("@title:dialog", "Audio is playing"),
+            i18nc("@info:dialog", "Closing the application will move the playing audio back to your default output device. Do you want to quit?"),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (answer != QMessageBox::Yes)
+            return;
+    }
+
     m_tray_icon->hide();
     QApplication::quit();
 }
@@ -113,6 +125,17 @@ void TrayIcon::toggle_virtual_surround() {
     }
 
     const bool enabled = !m_frontend_manager->get_virtual_surround_enabled();
+    if (!enabled && m_frontend_manager->is_audio_playing()) {
+        const auto answer = QMessageBox::question(
+            nullptr, i18nc("@title:dialog", "Audio is playing"),
+            i18nc("@info:dialog", "Disabling virtual surround will move the playing audio to your default output device. Do you want to continue?"),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (answer != QMessageBox::Yes) {
+            update_ui_state();
+            return;
+        }
+    }
+
     m_frontend_manager->set_virtual_surround_enabled(enabled);
     update_ui_state();
 }

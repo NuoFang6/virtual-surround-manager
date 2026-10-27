@@ -41,7 +41,6 @@ FrontendManager::FrontendManager(PipeWireManager *pipewire_manager, KConfig *con
     m_autostart_enabled = m_config_settings.readEntry("autostart_enabled", bool());
 
     m_upmix_enabled = m_config_settings.readEntry("upmix_enabled", bool());
-    m_lfe_bypass_enabled = m_config_settings.readEntry("lfe_bypass_enabled", bool());
 
     m_virtual_surround_auto_enabled = m_config_settings.readEntry("virtual_surround_auto_enabled", bool());
     if (m_virtual_surround_auto_enabled) {
@@ -77,7 +76,7 @@ bool FrontendManager::create_module() {
     QString path = m_hrir_wav_file_paths.value(m_hrir_wav_file_name_index);
     if (!does_hrir_wav_file_exist(path))
         return false;
-    if (!m_pipewire_manager->create_virtual_surround_module(path.toStdString(), m_upmix_enabled, m_lfe_bypass_enabled))
+    if (!m_pipewire_manager->create_virtual_surround_module(path.toStdString(), m_upmix_enabled))
         return false;
     if (m_virtual_surround_enabled)
         m_pipewire_manager->enable_routing();
@@ -85,18 +84,40 @@ bool FrontendManager::create_module() {
 }
 
 void FrontendManager::rebuild_module() {
-    // First, disable routing to prevent disruption of playing audio
-    if (m_virtual_surround_enabled)
-        m_pipewire_manager->disable_routing();
+    // A fresh attempt invalidates any error message from a previous failure
+    set_error_message(QString());
 
-    // Removing waits for the server to tear the module down (no blind sleeps)
-    m_pipewire_manager->remove_virtual_surround_module();
-
-    // Keep the enabled state truthful when the module could not be recreated
-    if (!create_module() && m_virtual_surround_enabled) {
-        m_virtual_surround_enabled = false;
-        Q_EMIT virtual_surround_enabled_changed();
+    if (m_hrir_wav_file_names.isEmpty()) {
+        qWarning("rebuild_module: No virtualization profiles available");
+        set_error_message(QStringLiteral("No virtualization profiles found. Add HRIR WAV files to the folder below and press Reload."));
+        return;
     }
+
+    QString path = m_hrir_wav_file_paths.value(m_hrir_wav_file_name_index);
+    if (!does_hrir_wav_file_exist(path))
+        return;
+
+    if (m_virtual_surround_enabled) {
+        // Replace the graph in place: routed streams move directly from the old
+        // virtual sink to the new one. Tearing the module down first (the previous
+        // approach) briefly sent them to the physical device, which made the audio
+        // jump in level and caused players to pause.
+        if (m_pipewire_manager->replace_virtual_surround_module(path.toStdString(), m_upmix_enabled))
+            return;
+
+        // Fall back to a full rebuild when the in-place replacement failed
+        qWarning("rebuild_module: In-place replacement failed, rebuilding from scratch");
+        m_pipewire_manager->remove_virtual_surround_module();
+        if (!create_module()) {
+            m_virtual_surround_enabled = false;
+            Q_EMIT virtual_surround_enabled_changed();
+        }
+        return;
+    }
+
+    // Module survives a disable, keep it up to date without enabling routing
+    m_pipewire_manager->remove_virtual_surround_module();
+    create_module();
 }
 
 bool FrontendManager::get_virtual_surround_enabled() const {
@@ -383,20 +404,6 @@ void FrontendManager::set_upmix_enabled(bool value) {
     Q_EMIT upmix_enabled_changed();
 }
 
-bool FrontendManager::get_lfe_bypass_enabled() const {
-    return m_lfe_bypass_enabled;
-}
-
-void FrontendManager::set_lfe_bypass_enabled(bool value) {
-    if (m_lfe_bypass_enabled == value)
-        return;
-    m_lfe_bypass_enabled = value;
-
-    // Baked into the filter graph like the upmix flag, so rebuild for live A/B
-    rebuild_module();
-
-    m_config_settings.writeEntry("lfe_bypass_enabled", m_lfe_bypass_enabled);
-    m_config->sync();
-
-    Q_EMIT lfe_bypass_enabled_changed();
+bool FrontendManager::is_audio_playing() const {
+    return m_pipewire_manager->is_audio_playing();
 }

@@ -68,14 +68,5 @@ FormCard.FormCardPage {
             checked: frontendManager.upmixEnabled
             onToggled: frontendManager.upmixEnabled = checked
         }
-
-        FormCard.FormSwitchDelegate {
-            id: lfeBypassEnabled
-            text: i18nc("@label:switch", "Render LFE without HRIR convolution")
-            description: i18nc("@info:description", "Low frequencies are not spatialized: the LFE path bypasses the headphone impulse response and is mixed equally into both ears, following the conventional headphone-virtualizer design for the LFE channel. Applied instantly.")
-            checkable: true
-            checked: frontendManager.lfeBypassEnabled
-            onToggled: frontendManager.lfeBypassEnabled = checked
-        }
     }
 }

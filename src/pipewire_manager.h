@@ -5,6 +5,7 @@
 #include <QSet>
 #include <QString>
 #include <array>
+#include <atomic>
 #include <pipewire/extensions/metadata.h>
 #include <pipewire/impl-module.h>
 #include <pipewire/pipewire.h>
@@ -32,12 +33,26 @@ class PipeWireManager : public QObject {
     // Call this before enable_routing().
     // When upmix_enabled is set, stereo streams are upmixed to 7.1 by the bundled
     // FreeSurround LADSPA plugin (see find_ladspa_plugin()).
-    // When lfe_bypass is set, the LFE path skips HRIR convolution entirely and is
-    // rendered as equal L/R through a unit impulse ("dirac delta") IR of the same
-    // length as the selected HRIR, matching the conventional headphone-virtualizer
-    // design for the LFE channel (time alignment via identical-length IRs).
+    // The LFE path is always rendered without HRIR coloring, through a unit impulse
+    // ("dirac delta") IR of the same length as the selected HRIR, matching the
+    // conventional headphone-virtualizer design for the LFE channel.
     //
-    bool create_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled, bool lfe_bypass);
+    bool create_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled);
+
+    //
+    // Replaces the graph of the running module without interrupting routed streams:
+    // the new module is created first (under a fresh node name), all streams that were
+    // routed to the old sink are re-targeted to the new one (virtual sink to virtual
+    // sink - they never touch the physical device in between), then the old module is
+    // destroyed. Falls back to create_virtual_surround_module() when no module exists.
+    //
+    bool replace_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled);
+
+    //
+    // True while at least one of the streams routed to the virtual sink is running
+    // (i.e. audio is actually playing through this application).
+    //
+    bool is_audio_playing() const;
 
     //
     // Removes the virtual surround module.
@@ -73,8 +88,15 @@ class PipeWireManager : public QObject {
     // Global ID of the bound "default" metadata object, SPA_ID_INVALID while unbound
     uint32_t metadata_global_id = SPA_ID_INVALID;
 
-    const char *capture_node_name = "effect_input.virtual-surround-manager";
-    const char *playback_node_name = "effect_output.virtual-surround-manager";
+    const char *capture_node_name_base = "effect_input.virtual-surround-manager";
+    const char *playback_node_name_base = "effect_output.virtual-surround-manager";
+    // Graph rebuilds get fresh names ("<base>.<generation>") so the old and new
+    // module can coexist while routed streams are moved between them. Generation 0
+    // keeps the plain base names so streams routed by a previous app instance
+    // (whose target.object was persisted in the metadata) are picked up again.
+    string capture_node_name = capture_node_name_base;
+    string playback_node_name = playback_node_name_base;
+    uint32_t module_generation = 0;
     // Thanks to EasyEffects for the list
     constexpr static auto ignored_node_names = std::to_array<std::string_view>({"libcanberra", "org.gnome.VolumeControl", "GNOME Shell", "Mutter", "gsd-media-keys"});
 
@@ -83,6 +105,9 @@ class PipeWireManager : public QObject {
     QSet<uint32_t> decided_streams;
     uint32_t playback_node_id = SPA_ID_INVALID;
     pw_impl_module *module = nullptr;
+
+    // Written from the PipeWire thread, read from the UI thread
+    std::atomic<bool> audio_playing{false};
 
     string default_sink_name;
 
@@ -104,6 +129,8 @@ class PipeWireManager : public QObject {
         string props_target;
         // False once the listener was detached after the stream was decided
         bool listener_attached = true;
+        // Last seen node state, used to detect whether routed streams are playing
+        enum pw_node_state state = PW_NODE_STATE_CREATING;
     };
     QMap<uint32_t, NodeBinding *> node_bindings;
 
@@ -160,6 +187,20 @@ class PipeWireManager : public QObject {
     // Resolves a target (node name or object serial) to a known sink's node name.
     //
     string resolve_sink_name(const string &key) const;
+
+    //
+    // Recomputes audio_playing from the states of all routed stream nodes.
+    // Must be called from the PipeWire thread.
+    //
+    void update_playing_state();
+
+    //
+    // Builds the libpipewire-module-filter-chain JSON arguments for the given
+    // names. Returns an empty string (after emitting an error) if the LFE bypass
+    // impulse for the HRIR could not be generated.
+    //
+    string build_module_args(const string &hrir_wav_path, bool upmix_enabled,
+                             const string &capture_name, const string &playback_name);
 
     //
     // Returns true if a stream has no explicit target or targets the default sink.

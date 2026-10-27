@@ -215,9 +215,10 @@ bool PipeWireManager::stream_follows_default(uint32_t id, const string &props_ta
     if (target.empty())
         return true;
 
-    // Streams that still target our virtual sink - e.g. routed by a previous instance of
-    // this application - keep being managed instead of being treated as assigned elsewhere.
-    if (target == capture_node_name)
+    // Streams that still target our virtual sink (any generation) - e.g. routed by a
+    // previous instance of this application - keep being managed instead of being
+    // treated as assigned elsewhere.
+    if (target.rfind(capture_node_name_base, 0) == 0)
         return true;
 
     const string sink = resolve_sink_name(target);
@@ -233,9 +234,9 @@ void PipeWireManager::decide_stream(uint32_t id, const string &props_target) {
     decided_streams.insert(id);
 
     if (stream_follows_default(id, props_target)) {
-        pw_metadata_set_property(metadata, id, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", capture_node_name);
+        pw_metadata_set_property(metadata, id, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", capture_node_name.c_str());
         routed_node_ids.insert(id);
-        qInfo("decide_stream: Node %u routed to sink '%s'", id, capture_node_name);
+        qInfo("decide_stream: Node %u routed to sink '%s'", id, capture_node_name.c_str());
     } else {
         qInfo("decide_stream: Node %u left alone (assigned to another device)", id);
     }
@@ -248,13 +249,19 @@ void PipeWireManager::on_node_info(void *data, const struct pw_node_info *info) 
     if (!info || !info->props)
         return;
 
+    // Track the state so the application knows whether audio is actually playing
+    binding->state = info->state;
+
     const char *target = spa_dict_lookup(info->props, PW_KEY_TARGET_OBJECT);
     if (!target)
         target = spa_dict_lookup(info->props, "target.node");
     binding->props_target = (target && strlen(target) > 0) ? target : "";
     manager->decide_stream(binding->id, binding->props_target);
-    if (manager->decided_streams.contains(binding->id))
+    // Keep listening on routed streams: their state changes indicate playback.
+    // Detaching is only safe for streams that are not managed by us.
+    if (manager->decided_streams.contains(binding->id) && !manager->routed_node_ids.contains(binding->id))
         manager->detach_binding_listener(binding);
+    manager->update_playing_state();
 }
 
 int PipeWireManager::on_metadata_property(void *data,
@@ -283,7 +290,7 @@ int PipeWireManager::on_metadata_property(void *data,
         return 0;
 
     // Ignore the echo of our own routing writes
-    if (value && strcmp(value, manager->capture_node_name) == 0)
+    if (value && strcmp(value, manager->capture_node_name.c_str()) == 0)
         return 0;
 
     // WirePlumber uses "-1" to mean "no explicit target, follow the default sink"
@@ -296,11 +303,16 @@ int PipeWireManager::on_metadata_property(void *data,
     if (value == nullptr && manager->routed_node_ids.contains(subject)) {
         // Re-assert routing if a stream we virtualize had its target cleared.
         // Only react to a full removal, re-asserting on "-1" could start a write battle with WirePlumber.
-        pw_metadata_set_property(manager->metadata, subject, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", manager->capture_node_name);
-        qDebug("on_metadata_property: Node %u re-routed to sink '%s'", subject, manager->capture_node_name);
-    } else if (!no_target && manager->routed_node_ids.contains(subject)) {
+        pw_metadata_set_property(manager->metadata, subject, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", manager->capture_node_name.c_str());
+        qDebug("on_metadata_property: Node %u re-routed to sink '%s'", subject, manager->capture_node_name.c_str());
+    } else if (!no_target && manager->routed_node_ids.contains(subject) &&
+               strcmp(value, manager->capture_node_name.c_str()) != 0) {
         // The stream was explicitly moved to another device, so it is no longer ours
         manager->routed_node_ids.remove(subject);
+        auto binding = manager->node_bindings.find(subject);
+        if (binding != manager->node_bindings.end())
+            manager->detach_binding_listener(binding.value());
+        manager->update_playing_state();
         qDebug("on_metadata_property: Node %u released to target '%s'", subject, value);
     }
 
@@ -346,15 +358,15 @@ void PipeWireManager::registry_event_global(void *data,
             // been decided yet, so decide them now that routing is possible
             for (auto it = manager->node_bindings.cbegin(); it != manager->node_bindings.cend(); ++it) {
                 manager->decide_stream(it.key(), it.value()->props_target);
-                if (manager->decided_streams.contains(it.key()))
+                if (manager->decided_streams.contains(it.key()) && !manager->routed_node_ids.contains(it.key()))
                     manager->detach_binding_listener(it.value());
             }
 
             // Routing we wrote into a previous metadata object was stored there and
             // is gone with it (e.g. after a WirePlumber restart), so re-assert it
             for (const uint32_t node_id : manager->routed_node_ids) {
-                pw_metadata_set_property(manager->metadata, node_id, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", manager->capture_node_name);
-                qDebug("registry_event_global: Re-routed node %u to sink '%s' after metadata change", node_id, manager->capture_node_name);
+                pw_metadata_set_property(manager->metadata, node_id, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", manager->capture_node_name.c_str());
+                qDebug("registry_event_global: Re-routed node %u to sink '%s' after metadata change", node_id, manager->capture_node_name.c_str());
             }
         }
     }
@@ -375,9 +387,10 @@ void PipeWireManager::registry_event_global(void *data,
     if (node_name && std::ranges::find(ignored_node_names, std::string_view(node_name)) != ignored_node_names.end())
         return;
 
-    // Track output sinks to resolve stream targets to a device
+    // Track output sinks to resolve stream targets to a device (excluding our own,
+    // including sinks of previous graph generations that are still tearing down)
     if (strcmp(node_media_class, "Audio/Sink") == 0 || strcmp(node_media_class, "Audio/Duplex") == 0) {
-        if (node_name && strcmp(node_name, manager->capture_node_name) != 0) {
+        if (node_name && strncmp(node_name, manager->capture_node_name_base, strlen(manager->capture_node_name_base)) != 0) {
             const char *serial = spa_dict_lookup(props, PW_KEY_OBJECT_SERIAL);
             manager->sinks[id] = SinkInfo{node_name, serial ? serial : ""};
         }
@@ -389,7 +402,7 @@ void PipeWireManager::registry_event_global(void *data,
         return;
     if (node_media_role && strcmp(node_media_role, "Notification") == 0)
         return;
-    if (node_name && strcmp(node_name, manager->playback_node_name) == 0) {
+    if (node_name && strncmp(node_name, manager->playback_node_name_base, strlen(manager->playback_node_name_base)) == 0) {
         manager->playback_node_id = id;
         return;
     }
@@ -442,6 +455,7 @@ void PipeWireManager::registry_event_global_remove(void *data, uint32_t id) {
     if (binding != manager->node_bindings.end()) {
         manager->destroy_binding(binding.value());
         manager->node_bindings.erase(binding);
+        manager->update_playing_state();
     }
 }
 
@@ -459,43 +473,32 @@ void PipeWireManager::detach_binding_listener(NodeBinding *binding) {
     binding->listener_attached = false;
 }
 
-bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled, bool lfe_bypass) {
-    if (!is_valid()) {
-        Q_EMIT error_occurred(QStringLiteral("Failed connecting to PipeWire audio service."));
-        return false;
-    }
-    if (module) {
-        qInfo("create_virtual_surround_module: Virtual surround module already exists");
-        return true;
-    }
+string PipeWireManager::build_module_args(const string &hrir_wav_path, bool upmix_enabled,
+                                          const string &capture_name, const string &playback_name) {
     if (hrir_wav_path.empty()) {
-        qWarning("create_virtual_surround_module: No HRIR file provided");
-        return false;
+        qWarning("build_module_args: No HRIR file provided");
+        return {};
     }
-
-    qInfo("create_virtual_surround_module: Creating module with WAV path '%s', upmixing %s, LFE bypass %s",
-          hrir_wav_path.c_str(), upmix_enabled ? "enabled" : "disabled", lfe_bypass ? "enabled" : "disabled");
 
     // The path is interpolated into the JSON module arguments, so escape it
     const string hrir_path = json_escape(hrir_wav_path);
 
-    // Generate the impulse IR used to bypass HRIR coloring on the LFE path. It must
-    // be regenerated per HRIR because its length determines the convolver latency.
-    string lfe_delta_path;
-    if (lfe_bypass) {
-        const QString delta_file =
-            QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/lfe_bypass_delta.wav");
-        QDir().mkpath(QFileInfo(delta_file).absolutePath());
-        if (!write_lfe_bypass_delta(hrir_wav_path, delta_file.toStdString())) {
-            qWarning("create_virtual_surround_module: Could not create LFE bypass impulse for '%s'", hrir_wav_path.c_str());
-            Q_EMIT error_occurred(QStringLiteral("Could not create the LFE bypass impulse response. "
-                                                 "The selected HRIR file could not be parsed."));
-            return false;
-        }
-        lfe_delta_path = json_escape(delta_file.toStdString());
+    // Generate the unit impulse IR for the LFE path: it renders LFE without HRIR
+    // coloring (equal L/R, no spatial processing) while keeping the convolver
+    // branch identical in IR length - and therefore in processing latency - to the
+    // convolved channels it sums with. Regenerated per HRIR for that reason.
+    const QString delta_file =
+        QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/lfe_bypass_delta.wav");
+    QDir().mkpath(QFileInfo(delta_file).absolutePath());
+    if (!write_lfe_bypass_delta(hrir_wav_path, delta_file.toStdString())) {
+        qWarning("build_module_args: Could not create LFE bypass impulse for '%s'", hrir_wav_path.c_str());
+        Q_EMIT error_occurred(QStringLiteral("Could not create the LFE bypass impulse response. "
+                                             "The selected HRIR file could not be parsed."));
+        return {};
     }
-    const string lfe_channel_l = lfe_bypass ? "0" : "6";
-    const string lfe_channel_r = lfe_bypass ? "0" : "13";
+    const string lfe_delta_path = json_escape(delta_file.toStdString());
+    const string lfe_channel_l = "0";
+    const string lfe_channel_r = "0";
 
     // The FreeSurround upmixer is only part of the graph while upmixing is enabled;
     // without it the graph inputs are the copy nodes directly and the bundled
@@ -507,11 +510,11 @@ bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path
     if (upmix_enabled) {
         const QString plugin_path = find_ladspa_plugin();
         if (plugin_path.isEmpty()) {
-            qWarning("create_virtual_surround_module: FreeSurround LADSPA plugin not found");
+            qWarning("build_module_args: FreeSurround LADSPA plugin not found");
             Q_EMIT error_occurred(QStringLiteral("The FreeSurround upmix plugin (freesurround_ladspa.so) "
                                                  "was not found. Reinstall this application or copy the "
                                                  "plugin into a LADSPA directory like /usr/lib/ladspa."));
-            return false;
+            return {};
         }
         qInfo("create_virtual_surround_module: Using FreeSurround plugin '%s'", plugin_path.toStdString().c_str());
 
@@ -611,16 +614,15 @@ bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path
         { type = builtin label = convolver name = convFC_R config = { filename = ")" +
                                         hrir_path + R"(" channel = 13 } }
 
-        # treat LFE as FC
-        # With lfe_bypass enabled, the LFE path skips HRIR convolution entirely
-        # (conventional headphone-virtualizer design for the LFE channel): it is
-        # rendered as equal L/R by convolving with a unit impulse of the exact same
-        # length as the selected HRIR, so both convolver branches stay time-aligned
+        # LFE path: rendered without HRIR convolution (conventional headphone-virtualizer
+        # design for the LFE channel). Convolving with a unit impulse of the exact same
+        # length as the selected HRIR yields an uncolored, equal-L/R signal while keeping
+        # both convolver branches time-aligned (identical IR length -> identical latency)
         { type = builtin label = convolver name = convLFE_L config = { filename = ")" +
-                                        (lfe_bypass ? lfe_delta_path : hrir_path) + R"(" channel = )" +
+                                        lfe_delta_path + R"(" channel = )" +
                                         lfe_channel_l + R"( } }
         { type = builtin label = convolver name = convLFE_R config = { filename = ")" +
-                                        (lfe_bypass ? lfe_delta_path : hrir_path) + R"(" channel = )" +
+                                        lfe_delta_path + R"(" channel = )" +
                                         lfe_channel_r + R"( } }
 
         # LFE path lowpass: 4th-order Linkwitz-Riley (two cascaded Butterworth biquads,
@@ -705,7 +707,7 @@ bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path
     // devices running at other rates.
     const string capture_props = R"(
 {
-    node.name = )" + string(capture_node_name) +
+    node.name = )" + capture_name +
                                          R"(
     media.class = "Audio/Sink"
     node.latency = "1024/48000"
@@ -718,7 +720,7 @@ bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path
     // Set playback properties for virtual surround module
     const string playback_props = R"(
 {
-    node.name = )" + string(playback_node_name) +
+    node.name = )" + playback_name +
                                           R"(
     node.passive = true
     node.latency = "1024/48000"
@@ -743,9 +745,34 @@ bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path
 }
         )";
 
+    return args;
+}
+
+bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled) {
+    if (!is_valid()) {
+        Q_EMIT error_occurred(QStringLiteral("Failed connecting to PipeWire audio service."));
+        return false;
+    }
+    if (module) {
+        qInfo("create_virtual_surround_module: Virtual surround module already exists");
+        return true;
+    }
+
+    // Generation 0 keeps the plain names so streams routed by a previous instance
+    // of this application are picked up again
+    capture_node_name = capture_node_name_base;
+    playback_node_name = playback_node_name_base;
+    module_generation = 0;
+
+    qInfo("create_virtual_surround_module: Creating module with WAV path '%s', upmixing %s",
+          hrir_wav_path.c_str(), upmix_enabled ? "enabled" : "disabled");
+
+    const string args = build_module_args(hrir_wav_path, upmix_enabled, capture_node_name, playback_node_name);
+    if (args.empty())
+        return false;
+
     pw_thread_loop_lock(thread_loop);
 
-    // Acutally load the module
     module = pw_context_load_module(
         context,
         "libpipewire-module-filter-chain",
@@ -765,6 +792,87 @@ bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path
     return true;
 }
 
+bool PipeWireManager::replace_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled) {
+    if (!module)
+        return create_virtual_surround_module(hrir_wav_path, upmix_enabled);
+
+    if (!is_valid()) {
+        Q_EMIT error_occurred(QStringLiteral("Failed connecting to PipeWire audio service."));
+        return false;
+    }
+
+    // Fresh names so the new module can coexist with the running one
+    const string new_generation = std::to_string(module_generation + 1);
+    const string new_capture_name = string(capture_node_name_base) + "." + new_generation;
+    const string new_playback_name = string(playback_node_name_base) + "." + new_generation;
+
+    qInfo("replace_virtual_surround_module: Replacing graph with WAV path '%s', upmixing %s",
+          hrir_wav_path.c_str(), upmix_enabled ? "enabled" : "disabled");
+
+    const string args = build_module_args(hrir_wav_path, upmix_enabled, new_capture_name, new_playback_name);
+    if (args.empty())
+        return false; // Keep the old graph playing with the previous settings
+
+    pw_thread_loop_lock(thread_loop);
+
+    pw_impl_module *new_module = pw_context_load_module(context,
+                                                        "libpipewire-module-filter-chain",
+                                                        args.c_str(),
+                                                        nullptr);
+    if (!new_module) {
+        pw_thread_loop_unlock(thread_loop);
+        qWarning("replace_virtual_surround_module: Failed to load the new module, keeping the old one");
+        Q_EMIT error_occurred(QStringLiteral("Error creating virtual surround device."));
+        return false;
+    }
+
+    // Move every routed stream from the old sink to the new one before the old sink
+    // disappears. Streams only ever move between two virtual sinks here - with the
+    // old code they briefly fell back to the physical output device (unattenuated,
+    // different volume) which caused an audible level jump and made players pause.
+    if (is_registry_listener_added && metadata) {
+        for (const uint32_t id : routed_node_ids) {
+            pw_metadata_set_property(metadata, id, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", new_capture_name.c_str());
+            qDebug("replace_virtual_surround_module: Node %u re-targeted to sink '%s'", id, new_capture_name.c_str());
+        }
+        // Let the server complete the re-links before the old module is torn down
+        sync_with_core(2);
+    }
+
+    // Event handlers compare against the member names, so switch them over before
+    // the old module's nodes produce their removal events
+    capture_node_name = new_capture_name;
+    playback_node_name = new_playback_name;
+    module_generation += 1;
+
+    pw_impl_module *old_module = module;
+    module = new_module;
+
+    pw_impl_module_destroy(old_module);
+
+    // Wait until the server has actually destroyed the old nodes
+    sync_with_core(2);
+
+    pw_thread_loop_unlock(thread_loop);
+
+    qInfo("replace_virtual_surround_module: Successfully replaced module");
+
+    return true;
+}
+
+bool PipeWireManager::is_audio_playing() const {
+    return audio_playing.load(std::memory_order_relaxed);
+}
+
+void PipeWireManager::update_playing_state() {
+    bool playing = false;
+    for (auto it = node_bindings.cbegin(); it != node_bindings.cend() && !playing; ++it) {
+        if (routed_node_ids.contains(it.key()) && it.value()->state == PW_NODE_STATE_RUNNING)
+            playing = true;
+    }
+    audio_playing.store(playing, std::memory_order_relaxed);
+}
+
 void PipeWireManager::remove_virtual_surround_module() {
     if (!thread_loop)
         return;
@@ -777,6 +885,7 @@ void PipeWireManager::remove_virtual_surround_module() {
     }
     // The playback node disappears with the module; do not keep its now stale ID
     playback_node_id = SPA_ID_INVALID;
+    audio_playing.store(false, std::memory_order_relaxed);
 
     // Wait until the server has actually destroyed the module's nodes,
     // recreating it too fast otherwise makes the audio stop completely
@@ -842,6 +951,7 @@ void PipeWireManager::disable_routing() {
     metadata_targets.clear();
     sinks.clear();
     decided_streams.clear();
+    audio_playing.store(false, std::memory_order_relaxed);
 
     // The registry is re-created on the next enable_routing()
     if (registry) {
