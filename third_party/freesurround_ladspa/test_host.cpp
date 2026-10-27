@@ -31,7 +31,7 @@ struct Rig {
     std::vector<float> in[kNumCh], out[kNumCh];
     float center = 0.7f, shift = 0.0f, depth = 1.0f, wrap = 90.0f, focus = 0.0f;
     float fsep = 1.0f, rsep = 1.0f, bassLo = 70.0f, bassHi = 90.0f;
-    float useLfe = 1.0f, upmixEnable = 1.0f, latency = 0.0f;
+    float useLfe = 1.0f, upmixEnable = 1.0f, latency = 0.0f, lfeSend = 0.0f;
 
     bool init(const LADSPA_Descriptor *desc) {
         d = desc;
@@ -81,6 +81,8 @@ struct Rig {
                 ptr = &upmixEnable;
             else if (!strcmp(n, "latency"))
                 ptr = &latency;
+            else if (!strcmp(n, "lfe_send"))
+                ptr = &lfeSend;
             if (ptr)
                 d->connect_port(h, i, ptr);
         }
@@ -220,6 +222,32 @@ void autoTransitions(const LADSPA_Descriptor *desc) {
     r.cleanup();
 }
 
+void autoLfeSend(const LADSPA_Descriptor *desc) {
+    printf("\nfreesurround71_auto (upmix LFE send gain)\n");
+    Rig r;
+    if (!r.init(desc)) {
+        printf("  [FAIL] instantiate\n");
+        ++failures;
+        return;
+    }
+    r.useLfe = 0.0f;
+    r.lfeSend = 0.5f;
+    long long t = 0;
+    for (int b = 0; b < 200; ++b) {
+        r.block(t, 0x3);
+        t += kBlock;
+    }
+    double max_err = 0.0, max_send = 0.0;
+    for (unsigned s = 0; s < kBlock; ++s) {
+        const double expected = 0.5 * ((double)r.out[0][s] + r.out[1][s] + r.out[2][s] +
+                                       r.out[4][s] + r.out[5][s] + r.out[6][s] + r.out[7][s]);
+        max_err = std::max(max_err, std::fabs((double)r.out[3][s] - expected));
+        max_send = std::max(max_send, std::fabs(expected));
+    }
+    check("upmix LFE send tracks 0.5 * main sum", max_err, 0.0, std::max(1e-5, max_send * 1e-5));
+    r.cleanup();
+}
+
 void autoNativeLfe(const LADSPA_Descriptor *desc) {
     printf("\nfreesurround71_auto (native LFE makeup)\n");
     Rig r;
@@ -277,6 +305,7 @@ int main(int argc, char **argv) {
 
     stereoSmoke(stereo);
     autoTransitions(autoDesc);
+    autoLfeSend(autoDesc);
     autoNativeLfe(autoDesc);
 
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "OK", failures, failures == 1 ? "" : "s");

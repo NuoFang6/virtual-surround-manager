@@ -21,7 +21,7 @@
 - Compatible with **EasyEffects** (and most similar apps)
 - Written entirely using the **PipeWire C API**, so no config files or annoying service restarts are required
 - Modern user interface, built with **KDE's Kirigami 6 framework**
-- Available languages are English and Simplified Chinese
+- The user interface is Simplified Chinese (as requested for this fork)
 - This project is **not using** vibe coding, AI agents or similar tools for generating unmaintainable slop
 
 ## Screenshot
@@ -167,8 +167,8 @@ Channels 7-12 look "shuffled" only because HeSuVi lists the right-ear IRs of
 the right-side speakers in that block.
 
 The LFE channel is **not** convolved with the center HRIR anymore. It uses a
-runtime-generated unit-impulse IR of the same length and format as the selected
-HRIR (`convLFE_L`/`convLFE_R`), so the LFE bypasses the HRIR coloring, is mixed
+runtime-generated, HRIR-normalized unit-impulse IR of the same length and
+format as the selected HRIR (`convLFE_L`/`convLFE_R`), so the LFE bypasses the HRIR coloring, is mixed
 equally into both ears, and keeps the same convolver timing as the other
 channels. Its 120 Hz LR4 lowpass and source-dependent gain are described below.
 
@@ -198,18 +198,86 @@ multichannel content is gap-free instead of flushing a silent buffer.
 
 ### LFE / bass management
 
-Bass below the 70-90 Hz transition is extracted from stereo by the upmixer and
-moved to the LFE channel (the main channels are attenuated by the same amount,
-so there is no doubled bass). The LFE path is lowpassed at 120 Hz with a
-4th-order Linkwitz-Riley filter, rendered without HRIR coloring as equal L/R,
-and gets the standard native-channel makeup:
+The low-frequency handling is selectable in Settings (`lfe_mode` in the
+configuration file). All modes leave the main channels full-range (`use_lfe=0`),
+so their bass keeps the selected HRIR's spatial and timbral response, matching
+HeSuVi's stereo matrix (`SUB=0`) and the Dolby/Apple binaural renderers. Native
+5.1/7.1 LFE enters the LFE path directly and its 2x (+6 dB) plus the
+HRIR-normalized delta matches the Dolby binaural convention of +5.5 dB (10 dB
+speaker makeup minus 4.5 dB for two-point-source headphone rendering). The
+runtime delta IR is scaled to the selected HRIR's center-channel 40-80 Hz
+magnitude, so the LFE level does not change with the profile.
 
-- Bass extracted from stereo: unity gain (it is at full level already).
-- Native LFE from 5.1/7.1 content: 2x (+6 dB), the same makeup HeSuVi's
-  `lfc.txt` applies, because the LFE channel is recorded 10 dB low.
+- **Balanced (default)**: while upmixing stereo, the plugin writes a mono copy
+  of the seven main outputs, scaled to −6 dB, into its LFE output; the graph's
+  120 Hz 4th-order Linkwitz-Riley stage low-passes it. The bypass branch used
+  for native 5.1/7.1 does not add this send, so real multichannel content never
+  gets a duplicate bass. Measures +3.4/+3.0/+2.5/+1.9 dB at
+  40/80/100/120 Hz with AppleSpatial and +3.6/+3.1/+2.6/+2.0 dB with
+  `27_95_142`.
+- **Reference**: native LFE only, no send; the most faithful and least
+  fatiguing option.
+- **Impact**: the same send at 0 dB instead of −6 dB (6 dB above balanced,
+  2x amplitude). Measures +5.8/+5.3/+4.5/+3.5 dB with AppleSpatial and
+  +6.1/+5.5/+4.7/+3.6 dB with `27_95_142`. It uses no static EQ; the previous
+  +4 dB/100 Hz shelf was removed because it sounded muddy and did not improve
+  punch.
 
-The auto upmixer applies the 2x to native LFE in its bypass branch; the graph
-itself uses the corresponding unity/2x gain when upmixing is on/off.
+The send and the LFE are aligned to the main HRIR bass per preset: the 120 Hz
+LR4 has about 4.4 ms of group delay at 40-120 Hz, while each HRIR has its own
+low-frequency delay. A 20-120 Hz fit (2.98 ms for AppleSpatial, 3.98 ms for
+`27_95_142`, on the main or LFE path as appropriate) removes the old
+−95…−171° phase difference above 90 Hz. Without it a louder send cancels
+instead of reinforcing; presets whose phase is not a clean delay (for example
+AtmosRenderer) are left unchanged and impact falls back to the balanced send
+level.
+
+The old 70-90 Hz FreeSurround redirect and its `VSM_BASS_MODE` /
+`VSM_BASS_LEGACY` / `VSM_LFE_SEND_DB` environment variables were removed.
+Important bass stays in the main channels; the LFE is an effects channel and
+is discarded in a stereo downmix.
+
+### Input detection display
+
+While the main window is visible, it polls the upmixer every 250 ms and shows
+whether the current stream is being upmixed as stereo, passed through as
+multichannel, or skipped because the output is a built-in speaker. The detector
+state (`vsm_auto_upmix_state`) and a processed-block counter
+(`vsm_auto_blocks`, used as an "audio is really flowing" heartbeat) are exported
+by the LADSPA plugin and read by the application; the text is not inferred from
+the UI switches.
+
+### Routing safeguards
+
+- **Built-in speakers**: if the physical default output reports
+  `device.form-factor=internal`, streams are released to that device and new
+  streams following the default are not virtualized. Switching back to a USB
+  DAC or headphones re-enables routing automatically. On laptops the internal
+  analog sink often serves both speakers and the headphone jack, so plugging
+  headphones into that jack is also skipped; USB/Bluetooth headphones are
+  unaffected.
+- **Default device**: the virtual bridge and internal effects sinks have
+  `priority.session=0`. If WirePlumber nevertheless selects one as the default
+  (manual choice or restored history), the application writes the previous
+  physical device back to `default.audio.sink` and
+  `default.configured.audio.sink`, so "revert default" cannot fall back to the
+  virtual device.
+- **Internal effects sink**: it is labelled "虚拟环绕声（内部效果）" to
+  distinguish it from the app-facing "虚拟环绕声". If a stream is manually
+  assigned to it (or to an older generation), the link monitor moves it back to
+  the stable bridge, so a later graph rebuild cannot drop the stream.
+
+### HRIR analysis
+
+The graph analyses the selected 14-channel WAV at every rebuild (not a hardcoded
+table): it prints and displays the delta-IR normalization gain, the 20-120 Hz
+alignment delay, the absolute average/worst-channel phase residual after that
+delay, and the automatically fitted all-pass correction (unity magnitude, phase
+only). A new file is handled automatically; a 2 ms longer copy of `27_95_142`
+changed the fitted delay from about 4.0 ms to 2.0 ms as expected. If the phase is
+not a clean delay (slope residual >15 degrees, e.g. AtmosRenderer), no delay or
+all-pass is inserted and impact falls back to the balanced send level. The
+result appears above the profile list in the main window and in the journal.
 
 ### Crackling / brief dropouts
 

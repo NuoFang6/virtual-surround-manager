@@ -5,11 +5,21 @@ This directory vendors the **FreeSurround stereo-to-7.1 upmixer** from the
 
 The virtual surround filter graph uses the plugin label **`freesurround71_auto`**
 (8 in / 8 out): when the input is stereo — i.e. all non-L/R channels are silent —
-it upmixes to 7.1 with FreeSurround (Passive Surround Decoding, including bass
-redirection into the LFE); as soon as any non-L/R channel carries signal, real
-multichannel content is detected and the input is passed through unchanged with
-matching latency compensation. This replicates the Windows chain
-(EqualizerAPO + Real3D-VST → HeSuVi), stereo detection included.
+it upmixes to 7.1 with FreeSurround (Passive Surround Decoding); as soon as any
+non-L/R channel carries signal, real multichannel content is detected and the
+input is passed through unchanged with matching latency compensation. This
+replicates the Windows chain (EqualizerAPO + Real3D-VST → HeSuVi), stereo
+detection included.
+
+The Virtual Surround Manager's graph always runs the upmixer with
+`use_lfe=0`: the main channels stay full-range through the HRIRs. Its three
+user-selectable LFE modes are built in the application's filter graph, not in
+the plugin: `balanced` adds a −6 dB mono copy of the main channels to the LFE
+while upmixing, `reference` uses native LFE only, and `impact` uses the same
+send at 0 dB. The application also delays the main or LFE path per preset to
+align the LR4 bass with the HRIR bass; without that, a larger send cancels.
+The plugin's own bass-redirection DSP (`use_lfe=1`) remains available for other
+hosts but is no longer used by this application.
 
 The plugin is **required for stereo upmixing** and built and installed together
 with the application (into the system LADSPA directory, e.g. `/usr/lib/ladspa`,
@@ -24,6 +34,18 @@ flattened (only the `#include "../dsp/..."` path in `freesurround_ladspa.cpp` wa
 adapted to match).
 
 Local patches (not yet in Real3D-VST):
+
+- `vsm_auto_upmix_state` is exported (`extern "C"` atomic int): 1 while the
+  detector is upmixing, 0 while bypassing multichannel content, -1 before the
+  first processed block. The application dlopen()s the plugin in its own
+  process and reads it for the live input-detection display.
+- `vsm_auto_blocks` is exported as a monotonic processed-block counter; the
+  application uses it as an "audio is really flowing" heartbeat for the UI.
+- The auto plugin has an extra `lfe_send` control. While upmixing, its LFE
+  output is the mono sum of the seven main outputs scaled by this value; while
+  bypassing, it remains the native LFE ×2 and the send is ignored. Keeping the
+  send inside the plugin is what prevents native 5.1/7.1 content from getting
+  a duplicate bass. The app passes 0.501 (balanced) or 1.0 (impact).
 
 - `freesurround71_auto` re-engages upmixing only after sustained pure-stereo
   input (`kStereoTolerance` consecutive blocks) instead of on the first silent

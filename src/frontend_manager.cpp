@@ -15,6 +15,22 @@
 #include <libportal/background.h>
 #endif
 
+namespace {
+
+PipeWireManager::LfeMode parse_lfe_mode(const QString &value) {
+    if (value == QStringLiteral("reference"))
+        return PipeWireManager::LfeMode::Reference;
+    if (value == QStringLiteral("impact"))
+        return PipeWireManager::LfeMode::Impact;
+    return PipeWireManager::LfeMode::Balanced;
+}
+
+bool is_valid_lfe_mode(const QString &value) {
+    return value == QStringLiteral("balanced") || value == QStringLiteral("reference") || value == QStringLiteral("impact");
+}
+
+} // namespace
+
 FrontendManager::FrontendManager(PipeWireManager *pipewire_manager, KConfig *config, QObject *parent) : QObject(parent) {
     m_pipewire_manager = pipewire_manager;
     m_config = config;
@@ -24,6 +40,7 @@ FrontendManager::FrontendManager(PipeWireManager *pipewire_manager, KConfig *con
     // Initialize UI values
 
     load_hrir_wav_files();
+    refresh_hrir_analysis();
 
     // Remove settings that no longer have any behaviour. `channels` belonged to
     // versions that still supported 5.1 output; `lfe_bypass` was the old toggle
@@ -47,6 +64,14 @@ FrontendManager::FrontendManager(PipeWireManager *pipewire_manager, KConfig *con
 
     m_upmix_enabled = m_config_settings.readEntry("upmix_enabled", bool());
 
+    m_lfe_mode = m_config_settings.readEntry("lfe_mode", QStringLiteral("balanced"));
+    if (!is_valid_lfe_mode(m_lfe_mode)) {
+        m_lfe_mode = QStringLiteral("balanced");
+        m_config_settings.writeEntry("lfe_mode", m_lfe_mode);
+        m_config->sync();
+    }
+    m_pipewire_manager->set_lfe_mode(parse_lfe_mode(m_lfe_mode));
+
     m_virtual_surround_auto_enabled = m_config_settings.readEntry("virtual_surround_auto_enabled", bool());
     if (m_virtual_surround_auto_enabled) {
         // This line gets intentionally skipped if auto-enabling is disabled
@@ -55,7 +80,7 @@ FrontendManager::FrontendManager(PipeWireManager *pipewire_manager, KConfig *con
 
     // Show why enabling virtual surround sound is impossible on a broken PipeWire connection
     if (!m_pipewire_manager->is_valid()) {
-        set_error_message(QStringLiteral("Failed connecting to PipeWire audio service."));
+        set_error_message(QStringLiteral("连接 PipeWire 音频服务失败。"));
     }
 
     // Headless measurement hook: Wayland sessions cannot be automated by the test
@@ -86,7 +111,7 @@ FrontendManager::FrontendManager(PipeWireManager *pipewire_manager, KConfig *con
 bool FrontendManager::does_hrir_wav_file_exist(const QString &file_path) {
     if (!QFile(file_path).exists()) {
         qWarning("does_hrir_wav_file_exist: HRIR file does not exist: %s", file_path.toStdString().c_str());
-        set_error_message(QStringLiteral("Selected HRIR file does not exist in your filesystem."));
+        set_error_message(QStringLiteral("所选 HRIR 文件不存在。"));
         return false;
     }
     return true;
@@ -98,7 +123,7 @@ bool FrontendManager::create_module() {
 
     if (m_hrir_wav_file_names.isEmpty()) {
         qWarning("create_module: No virtualization profiles available");
-        set_error_message(QStringLiteral("No virtualization profiles found. Add HRIR WAV files to the folder below and press Reload."));
+        set_error_message(QStringLiteral("未找到虚拟化配置文件。请把 HRIR WAV 文件放入下方文件夹，然后点击“重新加载”。"));
         return false;
     }
 
@@ -118,7 +143,7 @@ bool FrontendManager::rebuild_module() {
 
     if (m_hrir_wav_file_names.isEmpty()) {
         qWarning("rebuild_module: No virtualization profiles available");
-        set_error_message(QStringLiteral("No virtualization profiles found. Add HRIR WAV files to the folder below and press Reload."));
+        set_error_message(QStringLiteral("未找到虚拟化配置文件。请把 HRIR WAV 文件放入下方文件夹，然后点击“重新加载”。"));
         return false;
     }
 
@@ -206,6 +231,8 @@ void FrontendManager::set_hrir_wav_file_name_index(int index) {
         m_config->sync();
         Q_EMIT hrir_wav_file_name_index_changed();
     }
+
+    refresh_hrir_analysis();
 }
 
 void FrontendManager::load_hrir_wav_files() {
@@ -292,6 +319,8 @@ void FrontendManager::load_hrir_wav_files() {
         Q_EMIT hrir_wav_file_name_index_changed();
         qDebug("Restored previous file selection");
     }
+
+    refresh_hrir_analysis();
 }
 
 void FrontendManager::open_hrir_wav_folder() {
@@ -363,7 +392,7 @@ void FrontendManager::set_autostart_enabled(bool value) {
             // Without the desktop file autostart would silently not work, so
             // roll the setting back instead of persisting a broken state
             qWarning("set_autostart_enabled: Failed to copy desktop file from '%s' to '%s'", source.toStdString().c_str(), destination.toStdString().c_str());
-            set_error_message(QStringLiteral("Could not enable autostart: copying the desktop file from '%1' failed.").arg(source));
+            set_error_message(QStringLiteral("无法启用自动启动：复制桌面文件失败（%1）。").arg(source));
             m_autostart_enabled = false;
             Q_EMIT autostart_enabled_changed();
             return;
@@ -440,6 +469,135 @@ void FrontendManager::set_upmix_enabled(bool value) {
     }
 }
 
+QString FrontendManager::get_hrir_analysis_text() const {
+    return m_hrir_analysis_text;
+}
+
+void FrontendManager::refresh_hrir_analysis() {
+    QString text;
+    const QString path = m_hrir_wav_file_paths.value(m_hrir_wav_file_name_index);
+    if (!path.isEmpty()) {
+        const PipeWireManager::HrirAnalysis analysis = m_pipewire_manager->analyze_hrir(path.toStdString());
+        if (!analysis.valid) {
+            text = QStringLiteral("当前 HRIR 分析：无法读取（需要有效的 14 声道 HeSuVi WAV）");
+        } else {
+            QString alignment;
+            if (analysis.delay_main)
+                alignment = QStringLiteral("主声道延迟 %1 ms").arg(analysis.alignment_ms, 0, 'f', 2);
+            else if (analysis.delay_lfe)
+                alignment = QStringLiteral("LFE 延迟 %1 ms").arg(analysis.alignment_ms, 0, 'f', 2);
+            else if (analysis.residual_degrees > 15.0)
+                alignment = QStringLiteral("相位非线性，未插入对齐");
+            else
+                alignment = QStringLiteral("无需额外对齐");
+
+            const QString correction = analysis.allpass_valid
+                                           ? QStringLiteral("全通 %1 Hz/Q%2（校正后平均 %3°、最坏 %4°）")
+                                                 .arg(analysis.allpass_freq, 0, 'f', 0)
+                                                 .arg(analysis.allpass_q, 0, 'f', 2)
+                                                 .arg(analysis.allpass_residual_degrees, 0, 'f', 1)
+                                                 .arg(analysis.allpass_worst_channel_degrees, 0, 'f', 1)
+                                           : QStringLiteral("未启用全通校正");
+
+            text = QStringLiteral("当前 HRIR：LFE 归一化 %1 dB；低频对齐：%2；拟合残差 %3°，对齐后平均 %4°，最坏声道 %5°；相位校正：%6")
+                       .arg(analysis.reference_gain_db, 0, 'f', 2)
+                       .arg(alignment)
+                       .arg(analysis.residual_degrees, 0, 'f', 1)
+                       .arg(analysis.average_residual_degrees, 0, 'f', 1)
+                       .arg(analysis.worst_channel_residual_degrees, 0, 'f', 1)
+                       .arg(correction);
+        }
+    }
+
+    if (text == m_hrir_analysis_text)
+        return;
+    m_hrir_analysis_text = text;
+    qDebug("refresh_hrir_analysis: %s", text.toStdString().c_str());
+    Q_EMIT hrir_analysis_text_changed();
+}
+
 bool FrontendManager::is_audio_playing() const {
     return m_pipewire_manager->is_audio_playing();
+}
+
+QString FrontendManager::get_lfe_mode() const {
+    return m_lfe_mode;
+}
+
+void FrontendManager::set_lfe_mode(const QString &value) {
+    if (!is_valid_lfe_mode(value) || m_lfe_mode == value)
+        return;
+
+    const QString previous_mode = m_lfe_mode;
+    m_lfe_mode = value;
+    Q_EMIT lfe_mode_changed();
+
+    m_config_settings.writeEntry("lfe_mode", m_lfe_mode);
+    m_config->sync();
+    m_pipewire_manager->set_lfe_mode(parse_lfe_mode(m_lfe_mode));
+
+    // Like the upmix switch, the mode is baked into the filter graph. While
+    // routing is enabled only the effects graph is replaced behind the stable
+    // bridge sink, so a switch during playback keeps the stream in place.
+    if (!rebuild_module()) {
+        m_lfe_mode = previous_mode;
+        m_pipewire_manager->set_lfe_mode(parse_lfe_mode(m_lfe_mode));
+        m_config_settings.writeEntry("lfe_mode", m_lfe_mode);
+        m_config->sync();
+        Q_EMIT lfe_mode_changed();
+    }
+}
+
+QString FrontendManager::get_input_detection_text() const {
+    return m_input_detection_text;
+}
+
+void FrontendManager::refresh_input_detection() {
+    const qint64 now_ms = QDateTime::currentMSecsSinceEpoch();
+
+    // The PipeWire node state alone proved unreliable for "is audio playing"
+    // (streams can be RUNNING while their state listener was detached). The
+    // plugin's process counter only advances while real blocks flow through the
+    // effects graph, so use that as the heartbeat instead.
+    if (!m_virtual_surround_enabled || !m_upmix_enabled) {
+        // Remember the current count without treating it as new audio
+        m_last_auto_blocks = m_pipewire_manager->upmix_block_count();
+        m_last_audio_ms = 0;
+    } else {
+        const uint64_t blocks = m_pipewire_manager->upmix_block_count();
+        if (blocks != m_last_auto_blocks) {
+            m_last_auto_blocks = blocks;
+            m_last_audio_ms = now_ms;
+        }
+    }
+    const bool audio_flowing = m_last_audio_ms > 0 && now_ms - m_last_audio_ms < 750;
+
+    QString text;
+    if (!m_virtual_surround_enabled) {
+        text = QStringLiteral("输入检测：虚拟环绕声已关闭");
+    } else if (m_pipewire_manager->is_speaker_bypass()) {
+        text = QStringLiteral("输入检测：输出为内置扬声器，已自动跳过处理");
+    } else if (!m_upmix_enabled) {
+        text = QStringLiteral("输入检测：上混已关闭（直通）");
+    } else if (!audio_flowing) {
+        text = QStringLiteral("输入检测：等待音频播放…");
+    } else {
+        switch (m_pipewire_manager->upmix_auto_state()) {
+        case 1:
+            text = QStringLiteral("输入检测：检测到立体声，上混已生效");
+            break;
+        case 0:
+            text = QStringLiteral("输入检测：检测到多声道，自动直通");
+            break;
+        default:
+            text = QStringLiteral("输入检测：正在检测输入…");
+            break;
+        }
+    }
+
+    if (text == m_input_detection_text)
+        return;
+    m_input_detection_text = text;
+    qDebug("refresh_input_detection: %s", text.toStdString().c_str());
+    Q_EMIT input_detection_text_changed();
 }

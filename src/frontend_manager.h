@@ -27,6 +27,12 @@ class FrontendManager : public QObject {
     Q_PROPERTY(bool virtualSurroundAutoEnabled READ get_virtual_surround_auto_enabled WRITE set_virtual_surround_auto_enabled NOTIFY virtual_surround_auto_enabled_changed)
     // Whether stereo audio is upmixed to surround (PSD) or not
     Q_PROPERTY(bool upmixEnabled READ get_upmix_enabled WRITE set_upmix_enabled NOTIFY upmix_enabled_changed)
+    // Low-frequency handling mode: "balanced", "reference" or "impact"
+    Q_PROPERTY(QString lfeMode READ get_lfe_mode WRITE set_lfe_mode NOTIFY lfe_mode_changed)
+    // Live input detection text for the main page (refreshed while it is visible)
+    Q_PROPERTY(QString inputDetectionText READ get_input_detection_text NOTIFY input_detection_text_changed)
+    // Diagnostic line for the selected HRIR (normalization gain and alignment delay)
+    Q_PROPERTY(QString hrirAnalysisText READ get_hrir_analysis_text NOTIFY hrir_analysis_text_changed)
 
   public:
     explicit FrontendManager(PipeWireManager *pipewire_manager, KConfig *config, QObject *parent = nullptr);
@@ -68,6 +74,19 @@ class FrontendManager : public QObject {
     void set_upmix_enabled(bool value);
     Q_SIGNAL void upmix_enabled_changed();
 
+    QString get_lfe_mode() const;
+    void set_lfe_mode(const QString &value);
+    Q_SIGNAL void lfe_mode_changed();
+
+    QString get_input_detection_text() const;
+    Q_SIGNAL void input_detection_text_changed();
+
+    QString get_hrir_analysis_text() const;
+    Q_SIGNAL void hrir_analysis_text_changed();
+
+    // Recomputes the input detection text from the current graph state
+    Q_INVOKABLE void refresh_input_detection();
+
     // True while audio is actually playing through the virtual surround sink
     Q_INVOKABLE bool is_audio_playing() const;
 
@@ -81,6 +100,11 @@ class FrontendManager : public QObject {
     bool m_autostart_enabled = false;
     bool m_virtual_surround_auto_enabled = false;
     bool m_upmix_enabled = false;
+    QString m_lfe_mode = QStringLiteral("balanced");
+    QString m_input_detection_text;
+    QString m_hrir_analysis_text;
+    uint64_t m_last_auto_blocks = 0;
+    qint64 m_last_audio_ms = 0;
 
     PipeWireManager *m_pipewire_manager;
     KConfig *m_config;
@@ -89,6 +113,11 @@ class FrontendManager : public QObject {
     QString hrir_wav_subpath = QStringLiteral("/hrir_wav");
 
     bool does_hrir_wav_file_exist(const QString &file_path);
+
+    //
+    // Recomputes the diagnostic line for the currently selected HRIR.
+    //
+    void refresh_hrir_analysis();
 
     //
     // Creates the virtual surround module from the current settings and starts

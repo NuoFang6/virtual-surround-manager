@@ -8,6 +8,7 @@
 #include <QTimer>
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <pipewire/extensions/metadata.h>
 #include <pipewire/impl-module.h>
@@ -23,6 +24,58 @@ class PipeWireManager : public QObject {
   public:
     PipeWireManager();
     ~PipeWireManager() override;
+
+    //
+    // How the low-frequency path is enhanced around the always-uncolored LFE
+    // channel (see build_effects_module_args for the exact filters).
+    //
+    enum class LfeMode {
+        Balanced,  // native LFE + a -6 dB mono bass send while upmixing
+        Reference, // native LFE only, no enhancement
+        Impact,    // the same send at 0 dB (falls back to -6 dB when unaligned)
+    };
+    void set_lfe_mode(LfeMode mode);
+
+    //
+    // Diagnostic result for one HRIR: the delta-IR normalization gain and the
+    // per-preset LFE/main alignment delay. Used by the UI so imported presets
+    // show exactly what the graph will do with them.
+    //
+    struct HrirAnalysis {
+        bool valid = false;
+        double reference_gain = 0.0;
+        double reference_gain_db = 0.0;
+        double alignment_ms = 0.0;
+        bool delay_main = false;
+        bool delay_lfe = false;
+        double residual_degrees = 0.0;        // linear slope-fit residual
+        double average_residual_degrees = 0.0; // absolute average phase error after delay
+        double worst_channel_residual_degrees = 0.0;
+        bool allpass_valid = false;
+        double allpass_freq = 0.0;
+        double allpass_q = 0.0;
+        double allpass_residual_degrees = 0.0;
+        double allpass_worst_channel_degrees = 0.0;
+    };
+    HrirAnalysis analyze_hrir(const string &path) const;
+
+    //
+    // The auto upmixer's current decision: 1 = stereo (upmixing), 0 = multichannel
+    // (bypassing), -1 = unknown (plugin not loaded or no audio processed yet).
+    //
+    int upmix_auto_state() const;
+
+    //
+    // True while streams are intentionally left unvirtualized because the
+    // physical output is a built-in speaker.
+    //
+    bool is_speaker_bypass() const;
+
+    //
+    // Monotonic count of processed graph blocks. Changes only while audio is
+    // actually flowing through the effects graph.
+    //
+    uint64_t upmix_block_count() const;
 
     //
     // True if the connection to the PipeWire audio service was established.
@@ -106,6 +159,18 @@ class PipeWireManager : public QObject {
     string effects_capture_node_name;
     string effects_playback_node_name;
     uint32_t effects_generation = 0;
+
+    LfeMode lfe_mode = LfeMode::Balanced;
+
+    // Handle and symbol of the LADSPA plugin's exported auto-detection state.
+    // The filter-chain module loads the plugin in this process, so dlopen()
+    // returns the already loaded object and dlsym() reads the same atomic the
+    // running graph writes. Holding the handle keeps the symbol valid across
+    // effects graph replacements.
+    void *upmix_state_handle = nullptr;
+    std::atomic<int> *upmix_state = nullptr;
+    std::atomic<uint64_t> *upmix_blocks = nullptr;
+
     // Thanks to EasyEffects for the list
     constexpr static auto ignored_node_names = std::to_array<std::string_view>({"libcanberra", "org.gnome.VolumeControl", "GNOME Shell", "Mutter", "gsd-media-keys"});
 
@@ -148,9 +213,27 @@ class PipeWireManager : public QObject {
     struct SinkInfo {
         string node_name;
         string serial;
+        string form_factor;
+        int priority = 0;
     };
     QMap<uint32_t, SinkInfo> sinks;
 
+    // Last default sink that was not one of ours; used to give the user's real
+    // output device back when WirePlumber selects a virtual sink.
+    string last_physical_default_sink;
+
+    // True while the effective physical output is a built-in device (speakers).
+    // Streams following the default are then left on the physical device.
+    std::atomic<bool> speaker_bypass{false};
+
+    bool is_our_sink_name(const string &name) const;
+    bool is_effects_sink_name(const string &name) const;
+    string choose_physical_default_sink() const;
+    bool physical_default_is_internal() const;
+    bool restore_physical_default();
+    void update_speaker_bypass();
+    void release_routed_streams();
+    void route_default_streams();
     struct NodeBinding {
         PipeWireManager *manager;
         uint32_t id;
@@ -165,6 +248,20 @@ class PipeWireManager : public QObject {
         enum pw_node_state state = PW_NODE_STATE_CREATING;
     };
     QMap<uint32_t, NodeBinding *> node_bindings;
+
+    struct SinkBinding {
+        PipeWireManager *manager;
+        uint32_t id;
+        struct pw_proxy *proxy;
+        struct spa_hook listener;
+    };
+    QMap<uint32_t, SinkBinding *> sink_bindings;
+
+    // Throttle for redirecting a stream that was manually moved to the internal
+    // effects sink; WirePlumber can emit several link events during the move.
+    QHash<uint32_t, qint64> effects_redirect_ms;
+
+    void attach_binding_listener(NodeBinding *binding);
 
     //
     // Returns the path of the FreeSurround LADSPA plugin used for stereo upmixing,
@@ -230,7 +327,7 @@ class PipeWireManager : public QObject {
     // Schedules destruction of a replaced effects graph. Callers must not hold the
     // thread loop lock.
     //
-    void schedule_effects_destroy(pw_impl_module *old_module);
+    void schedule_effects_destroy(pw_impl_module *old_module, uint32_t old_sink_id, int attempts_left = 20);
 
     //
     // Destroys all deferred effects modules. Must be called with the thread loop
@@ -284,6 +381,7 @@ class PipeWireManager : public QObject {
     // Returns true if a stream has no explicit target or targets the default sink.
     //
     bool stream_follows_default(uint32_t id, const string &props_target) const;
+    bool stream_targets_ours(uint32_t id, const string &props_target) const;
 
     //
     // Decides once whether to virtualize a stream, then routes it if so.
@@ -332,6 +430,18 @@ class PipeWireManager : public QObject {
     const struct pw_node_events node_events = {
         .version = PW_VERSION_NODE_EVENTS,
         .info = on_node_info,
+        .param = nullptr,
+    };
+
+    //
+    // Called with a bound sink node's info; reads device.form-factor from the
+    // full props (the registry global does not carry it).
+    //
+    static void on_sink_info(void *data, const struct pw_node_info *info);
+
+    const struct pw_node_events sink_node_events = {
+        .version = PW_VERSION_NODE_EVENTS,
+        .info = on_sink_info,
         .param = nullptr,
     };
 };

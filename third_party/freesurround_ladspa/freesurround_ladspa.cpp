@@ -22,9 +22,24 @@
 #include "freesurround_decoder.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <vector>
+
+// Live detector state for the application UI. The filter-chain module loads
+// this plugin inside the application process, so the app can dlopen() the same
+// object and read this atomic: 1 = stereo (upmixing), 0 = multichannel
+// (bypassing), -1 = not active yet. Visibility is forced because the build
+// otherwise uses hidden visibility for plugin sources.
+extern "C" __attribute__((visibility("default"))) std::atomic<int> vsm_auto_upmix_state{-1};
+
+// Monotonic process counter, used by the application to tell whether audio is
+// actually flowing through the graph (the node state alone proved unreliable
+// on some sessions). It is deliberately not reset on activation: the count
+// keeps increasing across graph replacements in the same process.
+extern "C" __attribute__((visibility("default"))) std::atomic<std::uint64_t> vsm_auto_blocks{0};
 
 namespace {
 
@@ -58,6 +73,7 @@ enum ControlPort {
     CTRL_USE_LFE,
     CTRL_UPMIX_ENABLE, // auto plugin: 1.0 = allow FreeSurround upmixing
     CTRL_LATENCY,
+    CTRL_LFE_SEND, // auto plugin: mono main-sum send written into the LFE output
     CTRL_COUNT
 };
 
@@ -74,6 +90,7 @@ struct Controls {
     LADSPA_Data *useLfe = nullptr;
     LADSPA_Data *upmixEnable = nullptr;
     LADSPA_Data *latencyOut = nullptr;
+    LADSPA_Data *lfeSend = nullptr;
 };
 
 void connectControl(Controls &c, unsigned long port, LADSPA_Data *data) {
@@ -90,6 +107,7 @@ void connectControl(Controls &c, unsigned long port, LADSPA_Data *data) {
     case CTRL_USE_LFE: c.useLfe = data; break;
     case CTRL_UPMIX_ENABLE: c.upmixEnable = data; break;
     case CTRL_LATENCY: c.latencyOut = data; break;
+    case CTRL_LFE_SEND: c.lfeSend = data; break;
     default: break;
     }
 }
@@ -340,12 +358,14 @@ void autoActivate(LADSPA_Handle handle) {
     self->wasBypassed = false;
     self->nonStereoBlocks = 0;
     self->stereoBlocks = kStereoTolerance; // start upmixing immediately after activation
+    vsm_auto_upmix_state.store(-1, std::memory_order_relaxed);
 }
 
 void autoRun(LADSPA_Handle handle, unsigned long n) {
     AutoInstance *self = (AutoInstance *)handle;
     if (!self->core.decoder || n == 0) return;
 
+    vsm_auto_blocks.fetch_add(1, std::memory_order_relaxed);
     syncControls(self->core.decoder, self->ctrl, self->sampleRate);
 
     // ---- stereo detection, same rules as the VST plugin ----
@@ -379,6 +399,9 @@ void autoRun(LADSPA_Handle handle, unsigned long n) {
     const bool upmixAllowed = !self->ctrl.upmixEnable || *self->ctrl.upmixEnable > 0.5f;
     if (!upmixAllowed)
         isActuallyStereo = false;
+
+    // Publish the detector decision (with its hysteresis) for the app's UI
+    vsm_auto_upmix_state.store(isActuallyStereo ? 1 : 0, std::memory_order_relaxed);
 
     if (!isActuallyStereo) {
         // ---- bypass path: pass the delayed input through ----
@@ -430,6 +453,27 @@ void autoRun(LADSPA_Handle handle, unsigned long n) {
         return;
     }
     self->core.writeOut(self->out, n);
+
+    // Stereo upmix branch: the LFE output carries the optional mono main-sum
+    // send. The native LFE input is silent in this branch (the detector only
+    // upmixes when the non-L/R channels are silent), so this is the only LFE
+    // source while upmixing. In the bypass branch below, the native LFE is
+    // passed through instead; the send is never added to real multichannel
+    // content, which would double its bass.
+    if (self->out[3]) {
+        const float send = self->ctrl.lfeSend ? *self->ctrl.lfeSend : 0.0f;
+        if (send == 0.0f) {
+            std::memset(self->out[3], 0, sizeof(LADSPA_Data) * n);
+        } else {
+            for (unsigned long s = 0; s < n; ++s) {
+                float sum = 0.0f;
+                for (const int c : {0, 1, 2, 4, 5, 6, 7})
+                    if (self->out[c])
+                        sum += self->out[c][s];
+                self->out[3][s] = send * sum;
+            }
+        }
+    }
 }
 
 void autoCleanup(LADSPA_Handle handle) {
@@ -487,7 +531,7 @@ const char *const autoPortNames[] = {
     "Out FL", "Out FR", "Out FC", "Out LFE", "Out RL", "Out RR", "Out SL", "Out SR",
     "center_image", "shift", "depth", "circular_wrap", "focus",
     "front_sep", "rear_sep", "bass_lo", "bass_hi", "use_lfe",
-    "upmix_enable", "latency",
+    "upmix_enable", "latency", "lfe_send",
 };
 
 const LADSPA_PortDescriptor autoPortDescriptors[] = {
@@ -496,7 +540,7 @@ const LADSPA_PortDescriptor autoPortDescriptors[] = {
     CONTROL_IN, CONTROL_IN, CONTROL_IN, CONTROL_IN, CONTROL_IN,
     CONTROL_IN, CONTROL_IN, CONTROL_IN, CONTROL_IN, CONTROL_IN,
     CONTROL_IN,
-    CONTROL_OUT,
+    CONTROL_OUT, CONTROL_IN,
 };
 
 const LADSPA_PortRangeHint autoPortRangeHints[] = {
@@ -505,6 +549,7 @@ const LADSPA_PortRangeHint autoPortRangeHints[] = {
     C_HINTS,
     CTRL(LADSPA_HINT_TOGGLED | LADSPA_HINT_DEFAULT_1, 0.0f, 1.0f), // upmix_enable
     NOHINT,                                                        // latency (output)
+    CTRL(LADSPA_HINT_BOUNDED_BELOW | LADSPA_HINT_BOUNDED_ABOVE | LADSPA_HINT_DEFAULT_0, 0.0f, 1.0f), // lfe_send
 };
 
 const LADSPA_Descriptor descriptorStereo = {
@@ -534,7 +579,7 @@ const LADSPA_Descriptor descriptorAuto = {
     .Name = "Real3D FreeSurround 7.1 Auto Upmixer (stereo detection + bypass)",
     .Maker = "Real3D-VST",
     .Copyright = "GPL-2.0-or-later",
-    .PortCount = 28,
+    .PortCount = 29,
     .PortDescriptors = autoPortDescriptors,
     .PortNames = autoPortNames,
     .PortRangeHints = autoPortRangeHints,

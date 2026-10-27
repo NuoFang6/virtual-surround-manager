@@ -108,9 +108,9 @@ int main(int argc, char *argv[]) {
 
     // Credits
     KAboutData aboutData(QStringLiteral("virtual-surround-manager"),
-                         i18nc("@title", "Virtual Surround"),
+                         i18nc("@title", "虚拟环绕声"),
                          QStringLiteral(PROJECT_VERSION),
-                         i18nc("@subtitle", "3D sound for headphones"),
+                         i18nc("@subtitle", "为耳机带来 3D 音效"),
                          KAboutLicense::MIT,
                          QStringLiteral("© 2026, Berny23"));
     aboutData.setOrganizationDomain("berny23.de");
@@ -118,14 +118,14 @@ int main(int argc, char *argv[]) {
     aboutData.setProgramLogo(QStringLiteral("de.berny23.virtual_surround_manager"));
     aboutData.setBugAddress("https://github.com/Berny23/virtual-surround-manager/issues");
     aboutData.addComponent(KAboutComponent(
-        i18nc("@component", "Contains HRIR WAV files from HeSuVi. © 2021, Matt Gore. See: hesuvi_license.txt"),
+        i18nc("@component", "包含来自 HeSuVi 的 HRIR WAV 文件。© 2021, Matt Gore。许可信息见 hesuvi_license.txt"),
         QStringLiteral(""),
         QStringLiteral(""),
         QStringLiteral("https://hesuvi.net"),
         KAboutLicense::MIT));
     aboutData.addAuthor(
         QStringLiteral("Berny23"),
-        i18nc("@info:credit", "Developer"),
+        i18nc("@info:credit", "开发者"),
         QStringLiteral(""),
         QStringLiteral("https://berny23.de"));
     KAboutData::setApplicationData(aboutData);

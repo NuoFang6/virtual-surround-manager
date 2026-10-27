@@ -1,5 +1,6 @@
 #include "pipewire_manager.h"
 
+#include <QDateTime>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
@@ -10,9 +11,16 @@
 #include <QtEndian>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdlib>
+#include <chrono>
+#include <complex>
 #include <cstring>
+#include <dlfcn.h>
+#include <numbers>
+#include <numeric>
 #include <string_view>
+#include <thread>
 #include <time.h>
 
 //
@@ -45,7 +53,7 @@ static string json_escape(const string &value) {
 //
 static bool parse_wav_format(const string &path, uint32_t &channels, uint32_t &rate,
                              uint32_t &block_align, uint16_t &bits, uint16_t &format_tag,
-                             uint32_t &frames) {
+                             uint32_t &frames, size_t &data_offset) {
     QFile file(QString::fromStdString(path));
     if (!file.open(QIODevice::ReadOnly))
         return false;
@@ -81,6 +89,7 @@ static bool parse_wav_format(const string &path, uint32_t &channels, uint32_t &r
             if (block_align == 0 || channels == 0)
                 return false;
             frames = size / block_align;
+            data_offset = offset + 8;
             // Only plain PCM or float (the formats the convolver accepts anyway)
             return (format_tag == 1 || format_tag == 3) && rate > 0 && frames > 0;
         }
@@ -90,20 +99,379 @@ static bool parse_wav_format(const string &path, uint32_t &channels, uint32_t &r
 }
 
 //
+// Reads one interleaved sample of the HRIR (14 channels) as a normalized float.
+//
+static double wav_sample(const QByteArray &data, size_t data_offset, uint32_t block_align,
+                         uint16_t format_tag, uint16_t bits, uint32_t frame, uint32_t channel) {
+    const uint32_t frame_size = bits / 8;
+    const char *p = data.constData() + data_offset + static_cast<size_t>(frame) * block_align +
+                    static_cast<size_t>(channel) * frame_size;
+    if (format_tag == 3 && bits == 32) {
+        float v = 0.0f;
+        memcpy(&v, p, sizeof(v));
+        return v;
+    }
+    if (format_tag == 1) {
+        if (bits == 16)
+            return qFromLittleEndian<int16_t>(reinterpret_cast<const uint8_t *>(p)) / 32768.0;
+        if (bits == 24) {
+            int32_t v = static_cast<uint8_t>(p[0]) |
+                        (static_cast<int32_t>(static_cast<uint8_t>(p[1])) << 8) |
+                        (static_cast<int32_t>(static_cast<uint8_t>(p[2])) << 16);
+            if (v & 0x800000)
+                v -= 0x1000000;
+            return v / 8388608.0;
+        }
+        if (bits == 32)
+            return qFromLittleEndian<int32_t>(reinterpret_cast<const uint8_t *>(p)) / 2147483648.0;
+    }
+    return 0.0;
+}
+
+//
+// The delta impulse is flat across the spectrum, while every HRIR has its own
+// low-frequency magnitude. A full-scale delta therefore makes the LFE path's
+// level depend on the selected HRIR: measured across the bundled profiles, the
+// native LFE was +2.8 to +8.3 dB hotter than the Dolby binaural reference.
+// Scale the delta to the center-channel HRIR's 40-80 Hz magnitude so the LFE
+// path has the same low-frequency gain as the center speaker (the LFE's
+// natural reference in HeSuVi), while keeping the delta itself flat/uncolored.
+//
+static double lfe_reference_gain(const string &hrir_path) {
+    uint32_t channels = 0, rate = 0, block_align = 0, frames = 0;
+    uint16_t bits = 0, format_tag = 0;
+    size_t data_offset = 0;
+    if (!parse_wav_format(hrir_path, channels, rate, block_align, bits, format_tag, frames, data_offset))
+        return -1.0;
+    const bool supported = (format_tag == 3 && bits == 32) ||
+                           (format_tag == 1 && (bits == 16 || bits == 24 || bits == 32));
+    if (channels != 14 || frames == 0 || !supported)
+        return -1.0;
+
+    QFile file(QString::fromStdString(hrir_path));
+    if (!file.open(QIODevice::ReadOnly))
+        return -1.0;
+    const QByteArray data = file.readAll();
+    file.close();
+    if (data_offset + static_cast<size_t>(frames) * block_align > static_cast<size_t>(data.size()))
+        return -1.0;
+
+    // Center HRIR pair (HeSuVi LFE uses these) over a 40-80 Hz grid. A plain DFT
+    // is enough: at most ~48000 samples * 10 evaluations for a 1 s HRIR.
+    static constexpr double kFreqs[] = {40.0, 50.0, 60.0, 70.0, 80.0};
+    double magnitude_sum = 0.0;
+    int magnitude_count = 0;
+    for (const double f : kFreqs) {
+        for (const uint32_t channel : {6u, 13u}) {
+            double re = 0.0, im = 0.0;
+            for (uint32_t n = 0; n < frames; ++n) {
+                const double s = wav_sample(data, data_offset, block_align, format_tag, bits, n, channel);
+                const double phase = 2.0 * std::numbers::pi * f * static_cast<double>(n) / rate;
+                re += s * std::cos(phase);
+                im -= s * std::sin(phase);
+            }
+            magnitude_sum += std::sqrt(re * re + im * im);
+            ++magnitude_count;
+        }
+    }
+    if (magnitude_count == 0)
+        return -1.0;
+    // Normalized HRIRs have a low-frequency magnitude below unity; the clamp
+    // protects the integer delta formats and obviously broken files.
+    const double gain = std::clamp(magnitude_sum / magnitude_count, 0.05, 1.0);
+    qInfo("lfe_reference_gain: '%s' center HRIR 40-80 Hz gain %.4f (%.2f dB)",
+          hrir_path.c_str(), gain, 20.0 * std::log10(gain));
+    return gain;
+}
+
+struct LfeAlignment {
+    bool valid = false;
+    bool delay_main = false;
+    bool delay_lfe = false;
+    double seconds = 0.0;
+    double residual_degrees = 0.0;        // linear slope-fit residual
+    double average_residual_degrees = 0.0; // absolute average phase error after delay
+    double worst_channel_residual_degrees = 0.0;
+    bool allpass_valid = false;
+    double allpass_freq = 0.0;
+    double allpass_q = 0.0;
+    double allpass_residual_degrees = 0.0;
+    double allpass_worst_channel_degrees = 0.0;
+};
+
+//
+// The LFE path's 120 Hz LR4 has a group delay of roughly 4.4 ms at 40-120 Hz,
+// while each HRIR has its own low-frequency group delay. Without compensation
+// the send/native LFE and the main HRIR bass arrive with a frequency-dependent
+// phase difference (measured -37..-171 degrees for the bundled presets), which
+// makes a larger LFE send cancel instead of reinforce. Fit the phase difference
+// between the LR4 and the summed main HRIR response over 40-120 Hz; delay the
+// main path when the LFE path lags, or the LFE path when the HRIR is longer.
+// Presets whose phase is not a clean delay (e.g. synthetic AtmosRenderer) get
+// no correction rather than a wrong one.
+//
+static double allpass_phase_radians(double f, double f0, double q, double rate) {
+    const double w0 = 2.0 * std::numbers::pi * f0 / rate;
+    const double alpha = std::sin(w0) / (2.0 * q);
+    const double cosw0 = std::cos(w0);
+    const double b0 = 1.0 - alpha;
+    const double b1 = -2.0 * cosw0;
+    const double b2 = 1.0 + alpha;
+    const double a0 = 1.0 + alpha;
+    const double a1 = -2.0 * cosw0;
+    const double a2 = 1.0 - alpha;
+    const double zr = std::cos(-2.0 * std::numbers::pi * f / rate);
+    const double zi = std::sin(-2.0 * std::numbers::pi * f / rate);
+    // z = zr + j zi, evaluate the biquad with two complex multiplies
+    const std::complex<double> z(zr, zi);
+    const std::complex<double> num = b0 + b1 * z + b2 * z * z;
+    const std::complex<double> den = a0 + a1 * z + a2 * z * z;
+    return std::arg(num / den);
+}
+
+//
+// The LFE path's 120 Hz LR4 has a group delay of roughly 4.4 ms at low
+// frequencies, while each HRIR has its own low-frequency group delay. Without
+// compensation the send/native LFE and the main HRIR bass arrive with a
+// frequency-dependent phase difference, which makes a larger LFE send cancel
+// instead of reinforce. Fit the phase difference between the LR4 and the summed
+// main HRIR response over 20-120 Hz; delay the main path when the LFE path lags,
+// or the LFE path when the HRIR is longer. The remaining absolute phase error is
+// then reduced with an automatically fitted all-pass section in the LFE path.
+// Presets whose phase is not a clean delay (e.g. synthetic AtmosRenderer) get
+// no correction rather than a wrong one.
+//
+static LfeAlignment lfe_alignment(const string &hrir_path, uint32_t rate) {
+    uint32_t channels = 0, samples = 0, block_align = 0;
+    uint16_t bits = 0, format_tag = 0;
+    size_t data_offset = 0;
+    if (!parse_wav_format(hrir_path, channels, rate, block_align, bits, format_tag, samples, data_offset))
+        return {};
+    const bool supported = (format_tag == 3 && bits == 32) ||
+                           (format_tag == 1 && (bits == 16 || bits == 24 || bits == 32));
+    if (channels != 14 || samples == 0 || !supported || rate == 0)
+        return {};
+
+    QFile file(QString::fromStdString(hrir_path));
+    if (!file.open(QIODevice::ReadOnly))
+        return {};
+    const QByteArray data = file.readAll();
+    file.close();
+    if (data_offset + static_cast<size_t>(samples) * block_align > static_cast<size_t>(data.size()))
+        return {};
+
+    // LR4 coefficients (same as the graph's two bq_lowpass sections)
+    const double w0 = 2.0 * std::numbers::pi * 120.0 / rate;
+    const double cosw0 = std::cos(w0);
+    const double alpha = std::sin(w0) / (2.0 * 0.7071067811865476);
+    const double b0 = (1.0 - cosw0) / 2.0;
+    const double b1 = 1.0 - cosw0;
+    const double b2 = b0;
+    const double a0 = 1.0 + alpha;
+    const double a1 = -2.0 * cosw0;
+    const double a2 = 1.0 - alpha;
+
+    // 20-120 Hz covers the LFE band that matters for the send. The previous
+    // implementation started at 40 Hz; 20-40 Hz is included now so the deep-bass
+    // phase is part of the fit, not an unmeasured extrapolation.
+    constexpr double freqs[] = {20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0};
+    constexpr size_t count = std::size(freqs);
+    std::complex<double> channel_resp[14][count];
+    for (uint32_t channel = 0; channel < 14; ++channel) {
+        for (size_t i = 0; i < count; ++i) {
+            const double f = freqs[i];
+            double re = 0.0;
+            double im = 0.0;
+            for (uint32_t n = 0; n < samples; ++n) {
+                const double sample = wav_sample(data, data_offset, block_align, format_tag, bits, n, channel);
+                const double phase = 2.0 * std::numbers::pi * f * static_cast<double>(n) / rate;
+                re += sample * std::cos(phase);
+                im -= sample * std::sin(phase);
+            }
+            channel_resp[channel][i] = std::complex<double>(re, im);
+        }
+    }
+
+    double diff[count] = {};
+    std::complex<double> lfe_resp[count];
+    for (size_t i = 0; i < count; ++i) {
+        const double f = freqs[i];
+        std::complex<double> left_sum = 0.0;
+        std::complex<double> right_sum = 0.0;
+        for (uint32_t channel = 0; channel < 14; ++channel) {
+            if (channel % 2 == 0)
+                left_sum += channel_resp[channel][i];
+            else
+                right_sum += channel_resp[channel][i];
+        }
+        const std::complex<double> main_bass = (left_sum + right_sum) / 2.0;
+        if (std::abs(main_bass) < 1e-9)
+            return {};
+
+        const std::complex<double> z = std::exp(std::complex<double>(0.0, -2.0 * std::numbers::pi * f / rate));
+        const std::complex<double> lp = (b0 + b1 * z + b2 * z * z) / (a0 + a1 * z + a2 * z * z);
+        lfe_resp[i] = lp * lp;
+        diff[i] = std::arg(lfe_resp[i] / main_bass);
+    }
+
+    // Unwrap before the linear fit
+    for (size_t i = 1; i < count; ++i) {
+        while (diff[i] - diff[i - 1] > std::numbers::pi)
+            diff[i] -= 2.0 * std::numbers::pi;
+        while (diff[i] - diff[i - 1] < -std::numbers::pi)
+            diff[i] += 2.0 * std::numbers::pi;
+    }
+
+    // Equal-weight least-squares slope. The absolute residual after applying the
+    // delay is reported separately; slope residual alone was misleadingly small.
+    const double mean_f = std::accumulate(std::begin(freqs), std::end(freqs), 0.0) / count;
+    const double mean_d = std::accumulate(std::begin(diff), std::end(diff), 0.0) / count;
+    double num = 0.0, den = 0.0;
+    for (size_t i = 0; i < count; ++i) {
+        num += (freqs[i] - mean_f) * (diff[i] - mean_d);
+        den += (freqs[i] - mean_f) * (freqs[i] - mean_f);
+    }
+    const double slope = num / den;
+    double slope_residual = 0.0;
+    for (size_t i = 0; i < count; ++i) {
+        const double predicted = mean_d + slope * (freqs[i] - mean_f);
+        slope_residual += std::pow(diff[i] - predicted, 2);
+    }
+    slope_residual = std::sqrt(slope_residual / count);
+
+    LfeAlignment result;
+    result.valid = true;
+    result.residual_degrees = slope_residual * 180.0 / std::numbers::pi;
+
+    double tau = -slope / (2.0 * std::numbers::pi);
+    if (slope_residual > 0.26) {
+        // Phase is not a clean delay; leave the signal untouched rather than
+        // inserting a wrong delay/correction.
+        tau = 0.0;
+    } else if (std::abs(tau) < 0.0002) {
+        tau = 0.0;
+    } else {
+        tau = std::clamp(tau, -0.02, 0.02);
+        // Quantize to whole samples so the graph's delay exactly represents the fit
+        tau = std::round(tau * rate) / rate;
+    }
+
+    result.seconds = std::abs(tau);
+    result.delay_main = tau > 0.0;
+    result.delay_lfe = tau < 0.0;
+
+    // Residual phase after the selected delay. For tau < 0 the LFE path is
+    // delayed, so the same formula (+2*pi*f*tau) applies: delaying LFE by
+    // |tau| subtracts 2*pi*f*|tau| from the LFE-main difference.
+    double average_residual_sq = 0.0;
+    for (size_t i = 0; i < count; ++i) {
+        const double r = diff[i] + 2.0 * std::numbers::pi * freqs[i] * tau;
+        average_residual_sq += r * r;
+    }
+    const double average_residual = std::sqrt(average_residual_sq / count);
+    result.average_residual_degrees = average_residual * 180.0 / std::numbers::pi;
+
+    double worst_channel = 0.0;
+    for (uint32_t channel = 0; channel < 14; ++channel) {
+        double sum = 0.0;
+        for (size_t i = 0; i < count; ++i) {
+            double r = std::arg(lfe_resp[i] / channel_resp[channel][i]) +
+                       2.0 * std::numbers::pi * freqs[i] * tau;
+            r = std::remainder(r, 2.0 * std::numbers::pi);
+            sum += r * r;
+        }
+        worst_channel = std::max(worst_channel, std::sqrt(sum / count));
+    }
+    result.worst_channel_residual_degrees = worst_channel * 180.0 / std::numbers::pi;
+
+    // Automatic all-pass correction on the LFE path. One second-order section is
+    // enough to remove the residual hump; it has exactly unity magnitude, so the
+    // LFE stays uncolored. Only use it when it measurably improves the absolute
+    // residual and the target phase is always a lag (a causal all-pass cannot
+    // lead).
+    if (slope_residual <= 0.26) {
+        double target[count];
+        bool can_lead = false;
+        for (size_t i = 0; i < count; ++i) {
+            const double r = diff[i] + 2.0 * std::numbers::pi * freqs[i] * tau;
+            target[i] = -r; // correction phase wanted from the all-pass
+            if (target[i] > 1e-9)
+                can_lead = true;
+        }
+        if (!can_lead) {
+            double best_error = 1e9;
+            double best_freq = 0.0;
+            double best_q = 0.0;
+            constexpr int kFreqSteps = 80;
+            constexpr int kQSteps = 40;
+            const double f_min = 20.0, f_max = 12000.0;
+            const double q_min = 0.1, q_max = 10.0;
+            for (int fi = 0; fi < kFreqSteps; ++fi) {
+                const double f0 = f_min * std::pow(f_max / f_min, static_cast<double>(fi) / (kFreqSteps - 1));
+                for (int qi = 0; qi < kQSteps; ++qi) {
+                    const double q = q_min * std::pow(q_max / q_min, static_cast<double>(qi) / (kQSteps - 1));
+                    double error = 0.0;
+                    for (size_t i = 0; i < count; ++i) {
+                        const double err = allpass_phase_radians(freqs[i], f0, q, rate) - target[i];
+                        error += err * err;
+                    }
+                    error = std::sqrt(error / count);
+                    if (error < best_error) {
+                        best_error = error;
+                        best_freq = f0;
+                        best_q = q;
+                    }
+                }
+            }
+            if (best_error < average_residual - 0.0087) { // at least 0.5 deg RMS
+                result.allpass_valid = true;
+                result.allpass_freq = best_freq;
+                result.allpass_q = best_q;
+                result.allpass_residual_degrees = best_error * 180.0 / std::numbers::pi;
+
+                double worst_after = 0.0;
+                for (uint32_t channel = 0; channel < 14; ++channel) {
+                    double sum = 0.0;
+                    for (size_t i = 0; i < count; ++i) {
+                        double r = std::arg(lfe_resp[i] / channel_resp[channel][i]) +
+                                   2.0 * std::numbers::pi * freqs[i] * tau +
+                                   allpass_phase_radians(freqs[i], best_freq, best_q, rate);
+                        r = std::remainder(r, 2.0 * std::numbers::pi);
+                        sum += r * r;
+                    }
+                    worst_after = std::max(worst_after, std::sqrt(sum / count));
+                }
+                result.allpass_worst_channel_degrees = worst_after * 180.0 / std::numbers::pi;
+            }
+        }
+    }
+
+    qInfo("lfe_alignment: '%s' fit %.2f ms, slope-residual %.2f deg, absolute avg %.2f deg, worst channel %.2f deg%s",
+          hrir_path.c_str(), result.seconds * 1000.0, result.residual_degrees, result.average_residual_degrees,
+          result.worst_channel_residual_degrees,
+          result.allpass_valid ? " (+ all-pass)" : "");
+    if (result.allpass_valid) {
+        qInfo("lfe_alignment: all-pass %.1f Hz Q %.3f, avg %.2f deg, worst channel %.2f deg",
+              result.allpass_freq, result.allpass_q, result.allpass_residual_degrees,
+              result.allpass_worst_channel_degrees);
+    }
+    return result;
+}
+
+//
 // Writes a "dirac delta" impulse response with the exact format and length of
-// the selected HRIR: a single full-scale sample at t = 0 followed by silence.
-// Convolving the LFE path with this instead of the HRIR leaves the signal
-// uncolored (equal L/R, no spatial processing) while keeping the convolver
-// branch identical in IR length - and therefore in processing latency - to the
-// convolved channels it sums with. This mirrors the conventional design in
-// headphone virtualizers where the LFE channel bypasses BRIR convolution and
-// is time-aligned with an extra delay.
+// the selected HRIR: a single sample at t = 0 followed by silence, scaled to the
+// HRIR's low-frequency magnitude (see lfe_reference_gain). Convolving the LFE
+// path with this instead of the HRIR leaves the signal uncolored (equal L/R, no
+// spatial processing) while keeping the convolver branch identical in IR length
+// to the convolved channels it sums with.
 //
 static bool write_lfe_bypass_delta(const string &hrir_path, const string &delta_path) {
     uint32_t channels = 0, rate = 0, block_align = 0, frames = 0;
     uint16_t bits = 0;
     uint16_t format_tag = 0;
-    if (!parse_wav_format(hrir_path, channels, rate, block_align, bits, format_tag, frames))
+    size_t data_offset = 0;
+    if (!parse_wav_format(hrir_path, channels, rate, block_align, bits, format_tag, frames, data_offset))
         return false;
 
     // The graph maps all 14 HeSuVi channels; a file with fewer channels would
@@ -114,9 +482,16 @@ static bool write_lfe_bypass_delta(const string &hrir_path, const string &delta_
         return false;
     }
 
-    // Keep a sane cap so a broken header cannot produce a huge file
-    if (frames > rate * 2)
-        frames = rate * 2;
+    const double delta_gain = lfe_reference_gain(hrir_path);
+    if (delta_gain <= 0.0)
+        return false;
+
+    // Keep a sane cap for a broken header, but do not truncate a valid long HRIR:
+    // the delta IR length has to match the main IR length for latency alignment.
+    if (frames > rate * 10) {
+        qWarning("write_lfe_bypass_delta: '%s' is longer than 10 s, truncating", hrir_path.c_str());
+        frames = rate * 10;
+    }
 
     // Mono file, same encoding as the source IR
     const uint32_t frame_size = bits / 8;
@@ -157,17 +532,20 @@ static bool write_lfe_bypass_delta(const string &hrir_path, const string &delta_
 
     QByteArray samples(data_size, '\0');
     if (is_float) {
-        const float full_scale = 1.0f;
-        memcpy(samples.data(), &full_scale, 4);
+        const float gain = static_cast<float>(delta_gain);
+        memcpy(samples.data(), &gain, 4);
     } else if (bits == 16) {
-        const int16_t full_scale = 32767;
-        memcpy(samples.data(), &full_scale, 2);
+        const int16_t gain = static_cast<int16_t>(std::lround(32767.0 * delta_gain));
+        memcpy(samples.data(), &gain, 2);
     } else if (bits == 24) {
-        const uint8_t full_scale[3] = {0xFF, 0xFF, 0x7F};
-        memcpy(samples.data(), full_scale, 3);
+        const int32_t gain = static_cast<int32_t>(std::lround(8388607.0 * delta_gain));
+        const uint8_t bytes[3] = {static_cast<uint8_t>(gain & 0xFF),
+                                  static_cast<uint8_t>((gain >> 8) & 0xFF),
+                                  static_cast<uint8_t>((gain >> 16) & 0xFF)};
+        memcpy(samples.data(), bytes, 3);
     } else if (bits == 32) {
-        const int32_t full_scale = INT32_MAX;
-        memcpy(samples.data(), &full_scale, 4);
+        const int32_t gain = static_cast<int32_t>(std::lround(2147483647.0 * delta_gain));
+        memcpy(samples.data(), &gain, 4);
     } else {
         return false;
     }
@@ -234,6 +612,144 @@ string PipeWireManager::resolve_sink_name(const string &key) const {
     return {};
 }
 
+bool PipeWireManager::is_our_sink_name(const string &name) const {
+    if (name.empty())
+        return false;
+    if (name == capture_node_name || name == effects_capture_node_name)
+        return true;
+    return name.rfind(capture_node_name + ".effects.", 0) == 0;
+}
+
+bool PipeWireManager::is_effects_sink_name(const string &name) const {
+    return !name.empty() && name.rfind(capture_node_name + ".effects.", 0) == 0;
+}
+
+string PipeWireManager::choose_physical_default_sink() const {
+    // Prefer the device that was default before a virtual sink took over
+    if (!last_physical_default_sink.empty() && !is_our_sink_name(last_physical_default_sink)) {
+        for (auto it = sinks.cbegin(); it != sinks.cend(); ++it) {
+            if (it.value().node_name == last_physical_default_sink)
+                return last_physical_default_sink;
+        }
+    }
+
+    string best_name;
+    int best_rank = -1000000;
+    for (auto it = sinks.cbegin(); it != sinks.cend(); ++it) {
+        const SinkInfo &info = it.value();
+        if (is_our_sink_name(info.node_name))
+            continue;
+        // Hardware outputs beat other virtual sinks; priority.session decides
+        // among them, matching WirePlumber's own ranking.
+        const bool hardware = info.node_name.rfind("alsa_output.", 0) == 0 ||
+                              info.node_name.rfind("bluez_output.", 0) == 0;
+        const int rank = info.priority + (hardware ? 100000 : 0);
+        if (best_name.empty() || rank > best_rank) {
+            best_name = info.node_name;
+            best_rank = rank;
+        }
+    }
+    return best_name;
+}
+
+bool PipeWireManager::physical_default_is_internal() const {
+    string name = last_physical_default_sink;
+    if (name.empty() || is_our_sink_name(name))
+        name = default_sink_name;
+    if (name.empty() || is_our_sink_name(name))
+        name = choose_physical_default_sink();
+    if (name.empty() || is_our_sink_name(name))
+        return false;
+
+    for (auto it = sinks.cbegin(); it != sinks.cend(); ++it) {
+        if (it.value().node_name == name)
+            return it.value().form_factor == "internal";
+    }
+    return false;
+}
+
+bool PipeWireManager::restore_physical_default() {
+    if (!metadata)
+        return false;
+    const string restore = choose_physical_default_sink();
+    if (restore.empty() || is_our_sink_name(restore))
+        return false;
+
+    // Set the state before writing so the echo of our own writes is not mistaken
+    // for another virtual default selection
+    default_sink_name = restore;
+    if (!is_our_sink_name(restore))
+        last_physical_default_sink = restore;
+
+    const string payload = "{\"name\":\"" + json_escape(restore) + "\"}";
+    // default.configured is WirePlumber's persisted user preference; updating it
+    // keeps the virtual sink out of the default history, so the next startup or
+    // "revert default" cannot select it again.
+    pw_metadata_set_property(metadata, 0, "default.configured.audio.sink", "Spa:String:JSON", payload.c_str());
+    pw_metadata_set_property(metadata, 0, "default.audio.sink", "Spa:String:JSON", payload.c_str());
+    qInfo("restore_physical_default: virtual sink was selected as default, restored '%s'", restore.c_str());
+    update_speaker_bypass();
+    return true;
+}
+
+void PipeWireManager::update_speaker_bypass() {
+    const bool bypass = physical_default_is_internal();
+    if (speaker_bypass.exchange(bypass) == bypass)
+        return;
+
+    qInfo("update_speaker_bypass: built-in speaker output %s", bypass ? "detected, skipping virtualization" : "gone, resuming virtualization");
+    if (bypass)
+        release_routed_streams();
+    else
+        route_default_streams();
+}
+
+void PipeWireManager::release_routed_streams() {
+    if (!metadata)
+        return;
+    // Clear the set first: our metadata callback re-routes tracked streams whose
+    // target is removed, which would otherwise undo this release.
+    const QList<uint32_t> ids = routed_node_ids.values();
+    routed_node_ids.clear();
+    for (uint32_t id : ids) {
+        pw_metadata_set_property(metadata, id, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", nullptr);
+        qInfo("release_routed_streams: Node %u left on the physical output", id);
+    }
+    update_playing_state();
+}
+
+void PipeWireManager::route_default_streams() {
+    if (!metadata || speaker_bypass.load(std::memory_order_relaxed))
+        return;
+    for (auto it = node_bindings.begin(); it != node_bindings.end(); ++it) {
+        const uint32_t id = it.key();
+        if (routed_node_ids.contains(id))
+            continue;
+        if (!stream_follows_default(id, it.value()->props_target))
+            continue;
+        pw_metadata_set_property(metadata, id, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", capture_node_name.c_str());
+        routed_node_ids.insert(id);
+        attach_binding_listener(it.value());
+        qInfo("route_default_streams: Node %u routed to sink '%s'", id, capture_node_name.c_str());
+    }
+    update_playing_state();
+}
+
+bool PipeWireManager::stream_targets_ours(uint32_t id, const string &props_target) const {
+    // The metadata target takes precedence over the node's own props target
+    string target = metadata_targets.value(id, string());
+    if (target.empty())
+        target = props_target;
+    if (target.empty())
+        return false;
+
+    // Any generation of our virtual sink, including the internal effects sink
+    if (target.rfind(capture_node_name_base, 0) == 0)
+        return true;
+    const string sink = resolve_sink_name(target);
+    return !sink.empty() && is_our_sink_name(sink);
+}
+
 bool PipeWireManager::stream_follows_default(uint32_t id, const string &props_target) const {
     // The metadata target takes precedence over the node's own props target
     string target = metadata_targets.value(id, string());
@@ -244,8 +760,8 @@ bool PipeWireManager::stream_follows_default(uint32_t id, const string &props_ta
         return true;
 
     // Streams that still target our virtual sink (any generation) - e.g. routed by a
-    // previous instance of this application - keep being managed instead of being
-    // treated as assigned elsewhere.
+    // previous instance of this application, or manually assigned to the internal
+    // effects sink - keep being managed instead of being treated as assigned elsewhere.
     if (target.rfind(capture_node_name_base, 0) == 0)
         return true;
 
@@ -258,6 +774,8 @@ bool PipeWireManager::stream_follows_default(uint32_t id, const string &props_ta
         // it out of the virtual device forever, so treat it as following default.
         return true;
     }
+    if (is_our_sink_name(sink))
+        return true;
     return sink == default_sink_name;
 }
 
@@ -267,7 +785,16 @@ void PipeWireManager::decide_stream(uint32_t id, const string &props_target) {
 
     decided_streams.insert(id);
 
-    if (stream_follows_default(id, props_target)) {
+    const bool explicitly_ours = stream_targets_ours(id, props_target);
+    if (!explicitly_ours && speaker_bypass.load(std::memory_order_relaxed) &&
+        stream_follows_default(id, props_target)) {
+        qInfo("decide_stream: Node %u left on the built-in speaker output", id);
+        return;
+    }
+
+    if (explicitly_ours || stream_follows_default(id, props_target)) {
+        // This also redirects a stream manually assigned to the internal effects
+        // sink to the stable bridge, so a later graph replacement cannot move it.
         pw_metadata_set_property(metadata, id, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", capture_node_name.c_str());
         routed_node_ids.insert(id);
         qInfo("decide_stream: Node %u routed to sink '%s'", id, capture_node_name.c_str());
@@ -298,6 +825,33 @@ void PipeWireManager::on_node_info(void *data, const struct pw_node_info *info) 
     manager->update_playing_state();
 }
 
+void PipeWireManager::on_sink_info(void *data, const struct pw_node_info *info) {
+    SinkBinding *binding = static_cast<SinkBinding *>(data);
+    PipeWireManager *manager = binding->manager;
+    if (!info || !info->props)
+        return;
+
+    const char *form_factor = spa_dict_lookup(info->props, "device.form-factor");
+    if (!form_factor)
+        form_factor = spa_dict_lookup(info->props, "device.form_factor");
+    const char *priority_text = spa_dict_lookup(info->props, "priority.session");
+    if (!priority_text)
+        priority_text = spa_dict_lookup(info->props, "priority.driver");
+
+    auto it = manager->sinks.find(binding->id);
+    if (it != manager->sinks.end()) {
+        if (form_factor)
+            it.value().form_factor = form_factor;
+        if (priority_text)
+            it.value().priority = std::atoi(priority_text);
+    }
+
+    if (manager->is_our_sink_name(manager->default_sink_name))
+        manager->restore_physical_default();
+    else
+        manager->update_speaker_bypass();
+}
+
 int PipeWireManager::on_metadata_property(void *data,
                                           uint32_t subject, // Node ID
                                           const char *key,
@@ -308,13 +862,35 @@ int PipeWireManager::on_metadata_property(void *data,
     if (!key)
         return 0;
 
+    // Persisted user preference (WirePlumber's default history); use it as the
+    // physical fallback when the current default is one of our virtual sinks
+    if (strcmp(key, "default.configured.audio.sink") == 0) {
+        const string configured = parse_default_sink_name(value);
+        if (!configured.empty() && !manager->is_our_sink_name(configured))
+            manager->last_physical_default_sink = configured;
+        return 0;
+    }
+
     // Track the default sink so we know which streams follow it
     if (strcmp(key, "default.audio.sink") == 0) {
         const string new_default = parse_default_sink_name(value);
-        if (new_default != manager->default_sink_name) {
-            manager->default_sink_name = new_default;
-            qDebug("on_metadata_property: Default sink is now '%s'", new_default.c_str());
+        if (new_default.empty())
+            return 0;
+        if (manager->is_our_sink_name(new_default)) {
+            // WirePlumber must never keep one of our virtual sinks as the default.
+            // This happens when the user selects it manually or when the default
+            // history restores it on startup / after "revert default".
+            if (!manager->restore_physical_default())
+                manager->default_sink_name = new_default;
+            return 0;
         }
+
+        const bool changed = new_default != manager->default_sink_name;
+        manager->default_sink_name = new_default;
+        manager->last_physical_default_sink = new_default;
+        if (changed)
+            qDebug("on_metadata_property: Default sink is now '%s'", new_default.c_str());
+        manager->update_speaker_bypass();
         return 0;
     }
 
@@ -325,12 +901,37 @@ int PipeWireManager::on_metadata_property(void *data,
     if (manager->internal_playback_ids.contains(subject))
         return 0;
 
+    // WirePlumber uses "-1" to mean "no explicit target, follow the default sink"
+    const bool no_target = !value || strlen(value) == 0 || strcmp(value, "-1") == 0;
+
+    // A stream explicitly assigned to any generation of our virtual sink (or to
+    // the internal effects sink) must stay on the stable bridge. This also covers
+    // manual per-application routing through the duplicate internal device.
+    bool ours_target = false;
+    if (!no_target) {
+        ours_target = strncmp(value, manager->capture_node_name_base, strlen(manager->capture_node_name_base)) == 0;
+        if (!ours_target) {
+            const string sink = manager->resolve_sink_name(value);
+            ours_target = !sink.empty() && manager->is_our_sink_name(sink);
+        }
+    }
+    if (ours_target) {
+        if (strcmp(value, manager->capture_node_name.c_str()) != 0) {
+            pw_metadata_set_property(manager->metadata, subject, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", manager->capture_node_name.c_str());
+            qDebug("on_metadata_property: Node %u redirected from '%s' to the stable bridge", subject, value);
+        }
+        manager->metadata_targets[subject] = manager->capture_node_name;
+        manager->routed_node_ids.insert(subject);
+        auto binding = manager->node_bindings.find(subject);
+        if (binding != manager->node_bindings.end())
+            manager->attach_binding_listener(binding.value());
+        manager->update_playing_state();
+        return 0;
+    }
+
     // Ignore the echo of our own routing writes
     if (value && strcmp(value, manager->capture_node_name.c_str()) == 0)
         return 0;
-
-    // WirePlumber uses "-1" to mean "no explicit target, follow the default sink"
-    const bool no_target = !value || strlen(value) == 0 || strcmp(value, "-1") == 0;
     if (no_target)
         manager->metadata_targets.remove(subject);
     else
@@ -341,7 +942,7 @@ int PipeWireManager::on_metadata_property(void *data,
         // Clears to "-1" are left alone: WirePlumber uses them to make a stream
         // follow the default sink, and answering them starts a write battle. The
         // bridge sink survives graph swaps, so they no longer occur mid-switch.
-        if (value == nullptr) {
+        if (value == nullptr && !manager->speaker_bypass.load(std::memory_order_relaxed)) {
             pw_metadata_set_property(manager->metadata, subject, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", manager->capture_node_name.c_str());
             qDebug("on_metadata_property: Re-routed node %u to sink '%s' after target removal", subject, manager->capture_node_name.c_str());
         }
@@ -424,12 +1025,41 @@ void PipeWireManager::registry_event_global(void *data,
         const char *output = spa_dict_lookup(props, PW_KEY_LINK_OUTPUT_NODE);
         const char *input = spa_dict_lookup(props, PW_KEY_LINK_INPUT_NODE);
         if (output && input) {
-            manager->links.insert(id, LinkInfo{
-                                          static_cast<uint32_t>(std::strtoul(output, nullptr, 10)),
-                                          static_cast<uint32_t>(std::strtoul(input, nullptr, 10)),
-                                      });
+            const uint32_t out_id = static_cast<uint32_t>(std::strtoul(output, nullptr, 10));
+            const uint32_t in_id = static_cast<uint32_t>(std::strtoul(input, nullptr, 10));
+            manager->links.insert(id, LinkInfo{out_id, in_id});
             if (manager->link_wait_active.load(std::memory_order_relaxed))
                 pw_thread_loop_signal(manager->thread_loop, false);
+
+            // A stream manually assigned to the internal effects sink (the second
+            // identically-looking entry in per-application device lists) must be
+            // moved back to the stable bridge: otherwise the next graph rebuild
+            // destroys its sink and the stream falls back to the physical output.
+            if (manager->node_bindings.contains(out_id) && !manager->internal_playback_ids.contains(out_id)) {
+                const bool effects_input = in_id == manager->effects_capture_id ||
+                                           (manager->internal_capture_ids.contains(in_id) &&
+                                            in_id != manager->bridge_capture_id);
+                if (effects_input) {
+                    manager->routed_node_ids.insert(out_id);
+                    manager->attach_binding_listener(manager->node_bindings.value(out_id));
+                    const qint64 now_ms = QDateTime::currentMSecsSinceEpoch();
+                    const qint64 last_ms = manager->effects_redirect_ms.value(out_id, 0);
+                    if (now_ms - last_ms > 1500) {
+                        manager->effects_redirect_ms[out_id] = now_ms;
+                        manager->metadata_targets[out_id] = manager->capture_node_name;
+                        if (manager->metadata) {
+                            pw_metadata_set_property(manager->metadata, out_id, PW_KEY_TARGET_OBJECT,
+                                                     "Spa:String:JSON", manager->capture_node_name.c_str());
+                        }
+                        qInfo("registry_event_global: Node %u redirected from the internal effects sink to the bridge", out_id);
+                    }
+                    manager->update_playing_state();
+                } else if (in_id == manager->bridge_capture_id) {
+                    manager->routed_node_ids.insert(out_id);
+                    manager->attach_binding_listener(manager->node_bindings.value(out_id));
+                    manager->update_playing_state();
+                }
+            }
         }
         return;
     }
@@ -465,7 +1095,27 @@ void PipeWireManager::registry_event_global(void *data,
                 pw_thread_loop_signal(manager->thread_loop, false);
         } else if (node_name) {
             const char *serial = spa_dict_lookup(props, PW_KEY_OBJECT_SERIAL);
-            manager->sinks[id] = SinkInfo{node_name, serial ? serial : ""};
+            const char *form_factor = spa_dict_lookup(props, "device.form-factor");
+            if (!form_factor)
+                form_factor = spa_dict_lookup(props, "device.form_factor");
+            const char *priority_text = spa_dict_lookup(props, "priority.session");
+            if (!priority_text)
+                priority_text = spa_dict_lookup(props, "priority.driver");
+            manager->sinks[id] = SinkInfo{node_name, serial ? serial : "", form_factor ? form_factor : "",
+                                          priority_text ? std::atoi(priority_text) : 0};
+            // The registry global does not carry device.form-factor, so bind the
+            // sink node to read its full info. This is also what tells the
+            // built-in speaker detector which output is internal.
+            if (!manager->sink_bindings.contains(id)) {
+                pw_proxy *proxy = static_cast<pw_proxy *>(
+                    pw_registry_bind(manager->registry, id, PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, 0));
+                if (proxy) {
+                    SinkBinding *binding = new SinkBinding{manager, id, proxy, {}};
+                    manager->sink_bindings.insert(id, binding);
+                    pw_node_add_listener(reinterpret_cast<pw_node *>(proxy), &binding->listener,
+                                         &manager->sink_node_events, binding);
+                }
+            }
         }
         return;
     }
@@ -521,13 +1171,43 @@ void PipeWireManager::registry_event_global_remove(void *data, uint32_t id) {
         manager->metadata_targets.clear();
     }
 
-    if (manager->links.remove(id) > 0 && manager->link_wait_active.load(std::memory_order_relaxed))
-        pw_thread_loop_signal(manager->thread_loop, false);
+    auto link_it = manager->links.find(id);
+    if (link_it != manager->links.end()) {
+        const LinkInfo link = link_it.value();
+        manager->links.remove(id);
+        if (link.input_node == manager->bridge_capture_id && manager->node_bindings.contains(link.output_node)) {
+            // A manual move away from the bridge leaves no link; stop treating the
+            // stream as routed so the playback/detection state stays truthful.
+            bool still_on_bridge = false;
+            for (const LinkInfo &other : manager->links) {
+                if (other.output_node == link.output_node && other.input_node == manager->bridge_capture_id) {
+                    still_on_bridge = true;
+                    break;
+                }
+            }
+            if (!still_on_bridge) {
+                manager->routed_node_ids.remove(link.output_node);
+                manager->update_playing_state();
+                qInfo("registry_event_global_remove: Node %u left the bridge sink", link.output_node);
+            }
+        }
+        if (manager->link_wait_active.load(std::memory_order_relaxed))
+            pw_thread_loop_signal(manager->thread_loop, false);
+    }
+
+    auto sink_binding = manager->sink_bindings.find(id);
+    if (sink_binding != manager->sink_bindings.end()) {
+        spa_hook_remove(&sink_binding.value()->listener);
+        pw_proxy_destroy(sink_binding.value()->proxy);
+        delete sink_binding.value();
+        manager->sink_bindings.erase(sink_binding);
+    }
 
     manager->sinks.remove(id);
     manager->metadata_targets.remove(id);
     manager->routed_node_ids.remove(id);
     manager->decided_streams.remove(id);
+    manager->effects_redirect_ms.remove(id);
     manager->internal_playback_ids.remove(id);
     manager->internal_capture_ids.remove(id);
 
@@ -563,6 +1243,14 @@ void PipeWireManager::detach_binding_listener(NodeBinding *binding) {
     binding->listener_attached = false;
 }
 
+void PipeWireManager::attach_binding_listener(NodeBinding *binding) {
+    if (binding->listener_attached)
+        return;
+    spa_zero(binding->listener);
+    binding->listener_attached = true;
+    pw_node_add_listener(reinterpret_cast<pw_node *>(binding->proxy), &binding->listener, &node_events, binding);
+}
+
 string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, bool upmix_enabled,
                                                   const string &capture_name, const string &playback_name) {
     if (hrir_wav_path.empty()) {
@@ -582,13 +1270,15 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
     QDir().mkpath(QFileInfo(delta_file).absolutePath());
     if (!write_lfe_bypass_delta(hrir_wav_path, delta_file.toStdString())) {
         qWarning("build_effects_module_args: Could not create LFE bypass impulse for '%s'", hrir_wav_path.c_str());
-        Q_EMIT error_occurred(QStringLiteral("Could not use the selected HRIR. It must be a valid "
-                                             "14-channel HeSuVi WAV file (see the profile list notes)."));
+        Q_EMIT error_occurred(QStringLiteral("无法使用所选 HRIR。它必须是有效的 14 声道 HeSuVi WAV 文件（参见配置文件列表说明）。"));
         return {};
     }
     const string lfe_delta_path = json_escape(delta_file.toStdString());
     const string lfe_channel_l = "0";
     const string lfe_channel_r = "0";
+
+    // Align the LFE/send and main HRIR bass per preset (see lfe_alignment).
+    const LfeAlignment alignment = lfe_alignment(hrir_wav_path, 48000);
 
     // The FreeSurround upmixer is only part of the graph while upmixing is enabled;
     // without it the graph inputs are the copy nodes directly and the bundled
@@ -597,23 +1287,138 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
     string upmix_links;
     string graph_inputs = R"(  [ "copyFL:In" "copyFR:In" "copyFC:In" "copyLFE:In" "copyRL:In" "copyRR:In" "copySL:In" "copySR:In" ])";
 
+    // Low-frequency handling (2026-10-28). The LFE channel itself is always
+    // rendered uncolored through the normalized delta IR. The 120 Hz LR4 in
+    // that path has ~4.4 ms of group delay at 40-120 Hz, while every HRIR has
+    // its own low-frequency delay; lfe_alignment() compensates the difference
+    // with a delay on the main or LFE path. Without it the send and main bass
+    // partially cancel above 90 Hz (measured -95..-171 degrees), which is why a
+    // louder send sounded worse instead of stronger.
+    // - Balanced: mono sum of the seven full-range main channels, -6 dB into the
+    //   LFE path while upmixing; native LFE direct. With alignment this adds
+    //   density without the old cancellation.
+    // - Reference: native LFE only, no send; most faithful.
+    // - Impact: the same aligned send at 0 dB instead of -6 dB (6 dB more,
+    //   i.e. 2x amplitude). It adds density and punch without the muddy broad
+    //   shelf of the previous implementation.
+    const bool lfe_send = upmix_enabled && lfe_mode != LfeMode::Reference;
+    const string use_lfe = "0.0";
+    // A stronger send is only safe once the LFE/main bass phases are aligned;
+    // presets whose phase is not a clean delay (alignment skipped) keep the
+    // balanced level instead of risking more cancellation.
+    const double effective_phase_residual = alignment.allpass_valid ? alignment.allpass_residual_degrees
+                                                                     : alignment.average_residual_degrees;
+    const bool bass_aligned = alignment.valid && effective_phase_residual <= 15.0;
+    const double send_db = (lfe_mode == LfeMode::Impact && bass_aligned) ? 0.0 : -6.0;
+    const string send_gain_text = std::to_string(lfe_send ? std::pow(10.0, send_db / 20.0) : 0.0);
+    // The LFE output of the auto plugin carries either the native LFE (bypass
+    // branch) or the stereo upmix branch's mono main-sum send. There is no
+    // separate graph mixer: adding a send outside the plugin would also add it
+    // to real multichannel content, doubling that content's bass.
+    string lfe_source_link = R"({ output = "copyLFE:Out" input="lfeLP1:In" })";
+    string lfe_align_links;
+    string lfe_phase_nodes;
+    string lfe_phase_links = R"(
+        { output = "lfeLP2:Out" input="gainLFE_L:In" }
+        { output = "lfeLP2:Out" input="gainLFE_R:In" }
+)";
+    if (alignment.allpass_valid) {
+        lfe_phase_nodes = R"(
+        # Automatic all-pass phase correction for the LFE path (per HRIR).
+        # Unity magnitude; only the low-frequency phase is rotated.
+        { type = builtin label = bq_allpass name = apLFE control = { "Freq" = )" + std::to_string(alignment.allpass_freq) + R"( "Q" = )" + std::to_string(alignment.allpass_q) + R"( } }
+)";
+        lfe_phase_links = R"(
+        { output = "lfeLP2:Out" input="apLFE:In" }
+        { output = "apLFE:Out" input="gainLFE_L:In" }
+        { output = "apLFE:Out" input="gainLFE_R:In" }
+)";
+    }
+
+    string alignment_nodes;
+    string main_input_links = R"(
+        { output = "copyFL:Out"  input="convFL_L:In"  }
+        { output = "copyFL:Out"  input="convFL_R:In"  }
+        { output = "copySL:Out"  input="convSL_L:In"  }
+        { output = "copySL:Out"  input="convSL_R:In"  }
+        { output = "copyRL:Out"  input="convRL_L:In"  }
+        { output = "copyRL:Out"  input="convRL_R:In"  }
+        { output = "copyFC:Out"  input="convFC_L:In"  }
+        { output = "copyFR:Out"  input="convFR_R:In"  }
+        { output = "copyFR:Out"  input="convFR_L:In"  }
+        { output = "copySR:Out"  input="convSR_R:In"  }
+        { output = "copySR:Out"  input="convSR_L:In"  }
+        { output = "copyRR:Out"  input="convRR_R:In"  }
+        { output = "copyRR:Out"  input="convRR_L:In"  }
+        { output = "copyFC:Out"  input="convFC_R:In"  }
+)";
+    if (alignment.delay_main) {
+        const string delay_s = std::to_string(alignment.seconds);
+        const string control = R"ctl( config = { "max-delay" = 0.02 } control = { "Delay (s)" = )ctl" + delay_s + R"ctl( } })ctl";
+        alignment_nodes = R"(
+        # Per-HRIR bass alignment (LR4 vs. HRIR low-frequency group delay)
+        { type = builtin label = delay name = delayFL )" + control + R"(
+        { type = builtin label = delay name = delayFR )" + control + R"(
+        { type = builtin label = delay name = delayFC )" + control + R"(
+        { type = builtin label = delay name = delayRL )" + control + R"(
+        { type = builtin label = delay name = delayRR )" + control + R"(
+        { type = builtin label = delay name = delaySL )" + control + R"(
+        { type = builtin label = delay name = delaySR )" + control + R"(
+)";
+        main_input_links = R"(
+        { output = "copyFL:Out" input="delayFL:In" } { output = "delayFL:Out" input="convFL_L:In" } { output = "delayFL:Out" input="convFL_R:In" }
+        { output = "copyFR:Out" input="delayFR:In" } { output = "delayFR:Out" input="convFR_R:In" } { output = "delayFR:Out" input="convFR_L:In" }
+        { output = "copyFC:Out" input="delayFC:In" } { output = "delayFC:Out" input="convFC_L:In" } { output = "delayFC:Out" input="convFC_R:In" }
+        { output = "copyRL:Out" input="delayRL:In" } { output = "delayRL:Out" input="convRL_L:In" } { output = "delayRL:Out" input="convRL_R:In" }
+        { output = "copyRR:Out" input="delayRR:In" } { output = "delayRR:Out" input="convRR_R:In" } { output = "delayRR:Out" input="convRR_L:In" }
+        { output = "copySL:Out" input="delaySL:In" } { output = "delaySL:Out" input="convSL_L:In" } { output = "delaySL:Out" input="convSL_R:In" }
+        { output = "copySR:Out" input="delaySR:In" } { output = "delaySR:Out" input="convSR_R:In" } { output = "delaySR:Out" input="convSR_L:In" }
+)";
+    }
+    if (alignment.delay_lfe) {
+        alignment_nodes += "\n        { type = builtin label = delay name = delayLFE config = { \"max-delay\" = 0.02 } control = { \"Delay (s)\" = " +
+                           std::to_string(alignment.seconds) + " } }\n";
+    }
+
+    const char *mode_name = lfe_mode == LfeMode::Balanced ? "balanced"
+                            : lfe_mode == LfeMode::Reference ? "reference"
+                                                             : "impact";
+    qInfo("build_effects_module_args: LFE mode %s (upmix %s%s%s)", mode_name,
+          upmix_enabled ? "on" : "off", lfe_send ? ", bass send" : "",
+          alignment.delay_main ? ", main aligned" : alignment.delay_lfe ? ", LFE aligned" : "");
+
     if (upmix_enabled) {
         const QString plugin_path = find_ladspa_plugin();
         if (plugin_path.isEmpty()) {
             qWarning("build_effects_module_args: FreeSurround LADSPA plugin not found");
-            Q_EMIT error_occurred(QStringLiteral("The FreeSurround upmix plugin (freesurround_ladspa.so) "
-                                                 "was not found. Reinstall this application or copy the "
-                                                 "plugin into a LADSPA directory like /usr/lib/ladspa."));
+            Q_EMIT error_occurred(QStringLiteral("未找到 FreeSurround 上混插件（freesurround_ladspa.so）。请重新安装本应用，或把插件复制到 /usr/lib/ladspa 等 LADSPA 目录。"));
             return {};
         }
         qInfo("create_virtual_surround_module: Using FreeSurround plugin '%s'", plugin_path.toStdString().c_str());
 
+        // The plugin also runs in this process (the filter-chain module loads it
+        // here), so dlopen() returns the already loaded object. The state export
+        // is read later by upmix_auto_state() for the live input detection.
+        if (!upmix_state_handle) {
+            const QByteArray plugin_path_utf8 = plugin_path.toUtf8();
+            upmix_state_handle = dlopen(plugin_path_utf8.constData(), RTLD_LAZY | RTLD_NOLOAD);
+            if (!upmix_state_handle)
+                upmix_state_handle = dlopen(plugin_path_utf8.constData(), RTLD_LAZY);
+            if (upmix_state_handle) {
+                upmix_state = reinterpret_cast<std::atomic<int> *>(dlsym(upmix_state_handle, "vsm_auto_upmix_state"));
+                upmix_blocks = reinterpret_cast<std::atomic<uint64_t> *>(dlsym(upmix_state_handle, "vsm_auto_blocks"));
+            } else {
+                qWarning("build_effects_module_args: Could not open '%s' to read the upmix detection state",
+                         plugin_path_utf8.constData());
+            }
+            if (!upmix_state)
+                qWarning("build_effects_module_args: The plugin does not export vsm_auto_upmix_state");
+        }
+
         // FreeSurround stereo to 7.1 upmixer with the Real3D-VST auto-detection:
         // stereo content is upmixed, real multichannel content is passed through
-        // unchanged (with matching latency compensation). Bass redirection uses a
-        // 70-90 Hz transition whose midpoint sits on the THX-standard 80 Hz bass
-        // management crossover. The LFE path's own lowpass is separate (120 Hz,
-        // Dolby LFE band limit).
+        // unchanged (with matching latency compensation). Bass redirection stays
+        // off (use_lfe=0); the LFE send is handled by this graph instead.
         upmix_nodes = R"(
         # FreeSurround stereo to 7.1 upmixer with automatic stereo detection:
         # only upmixes while all non-L/R input channels are silent
@@ -628,8 +1433,9 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
               "rear_sep" = 1.0
               "bass_lo" = 70.0
               "bass_hi" = 90.0
-              "use_lfe" = 1.0
+              "use_lfe" = )" + use_lfe + R"(
               "upmix_enable" = 1.0
+              "lfe_send" = )" + send_gain_text + R"(
           }
         }
 )";
@@ -638,20 +1444,34 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
         { output = "fs:Out FL"  input="copyFL:In"  }
         { output = "fs:Out FR"  input="copyFR:In"  }
         { output = "fs:Out FC"  input="copyFC:In"  }
-        { output = "fs:Out LFE" input="copyLFE:In" }
         { output = "fs:Out RL"  input="copyRL:In"  }
         { output = "fs:Out RR"  input="copyRR:In"  }
         { output = "fs:Out SL"  input="copySL:In"  }
         { output = "fs:Out SR"  input="copySR:In"  }
 )";
+        upmix_links += R"(
+        # The plugin's LFE output is the native LFE in bypass mode and the
+        # mono main-sum send while upmixing, so the graph always takes it.
+        { output = "fs:Out LFE" input="copyLFE:In" }
+)";
         graph_inputs = R"(  [ "fs:In FL" "fs:In FR" "fs:In FC" "fs:In LFE" "fs:In RL" "fs:In RR" "fs:In SL" "fs:In SR" ])";
     }
 
-    // LFE gain: native LFE content is recorded 10 dB low (70mm-film convention) and
-    // compensated at playback, which HeSuVi's lfc.txt does with 2x gain (EqualizerAPO's
-    // "Filter: ON LP Fc 111 Hz" plus 200% LFE). Bass extracted from stereo by the
-    // upmixer is at full level, so per the professional monitoring convention (+10 dB
-    // applies only to the native LFE channel, not redirected bass) it gets unity gain.
+    if (alignment.delay_lfe) {
+        lfe_source_link = R"({ output = "copyLFE:Out" input="delayLFE:In" })";
+        lfe_align_links = R"(
+        { output = "delayLFE:Out" input="lfeLP1:In" }
+)";
+    }
+
+    // LFE gain: native LFE content is recorded 10 dB low (70mm-film convention),
+    // and HeSuVi's lfc.txt applies a 2x makeup. In binaural rendering the net
+    // reference is +5.5 dB (10 dB speaker makeup minus 4.5 dB for the two-point-
+    // source headphone rendering), which 2x + the center-HRIR-normalized delta
+    // matches. The graph uses unity while upmix is enabled: the native LFE gets
+    // its 2x in the auto plugin's bypass branch (and the balanced send is already
+    // at its intended level); with upmix disabled only native LFE remains, so the
+    // graph applies the 2x itself.
     const string lfe_gain = upmix_enabled ? "1.0" : "2.0";
     // Set 7.1 filter graph for virtual surround module, automatically creating playback and capture nodes
     const string filter_graph = R"(
@@ -666,6 +1486,7 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
         { type = builtin label = copy name = copySL  }
         { type = builtin label = copy name = copySR  }
         { type = builtin label = copy name = copyLFE }
+
 
         # apply hrir - HeSuVi 14-channel WAV (not the *-.wav variants) (note: 44 in HeSuVi are the same, but resampled to 44100)
         # Channel order follows HeSuVi's convolution channel line
@@ -718,17 +1539,19 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
         # LFE path lowpass: 4th-order Linkwitz-Riley (two cascaded Butterworth biquads,
         # in-phase flat recombination - the professional crossover standard) at 120 Hz,
         # the Dolby LFE band limit (AVR "LPF of LFE" defaults to 48 dB/oct; 24 dB/oct
-        # keeps the phase rotation gentler). Then rendered through the center channel
-        # HRIRs at a level that depends on the source: 2x for native LFE channels,
-        # 1x for bass extracted by the upmixer
+        # keeps the phase rotation gentler). Then rendered through the normalized
+        # delta IR; gain is 2x for native LFE channels when the plugin is not in
+        # the chain, and 1x while the plugin's bypass branch applies the makeup
         { type = builtin label = bq_lowpass name = lfeLP1 control = { "Freq" = 120.0 "Q" = 0.7071 } }
         { type = builtin label = bq_lowpass name = lfeLP2 control = { "Freq" = 120.0 "Q" = 0.7071 } }
+)" + lfe_phase_nodes + R"(
         { type = builtin label = linear name = gainLFE_L control = { "Mult" = )" + lfe_gain + R"( } }
         { type = builtin label = linear name = gainLFE_R control = { "Mult" = )" + lfe_gain + R"( } }
 
         # stereo output
         { type = builtin label = mixer name = mixL }
         { type = builtin label = mixer name = mixR }
+)" + alignment_nodes + R"(
 
         # Output headroom, matching HeSuVi's level budget: its upmix matrix attenuates the
         # main channels (L=0.5*L, R=0.5*R, ...) so the 8 binaural channels can sum up
@@ -738,24 +1561,11 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
     ]
     links = [)" + upmix_links + R"(
         # input
-        { output = "copyFL:Out"  input="convFL_L:In"  }
-        { output = "copyFL:Out"  input="convFL_R:In"  }
-        { output = "copySL:Out"  input="convSL_L:In"  }
-        { output = "copySL:Out"  input="convSL_R:In"  }
-        { output = "copyRL:Out"  input="convRL_L:In"  }
-        { output = "copyRL:Out"  input="convRL_R:In"  }
-        { output = "copyFC:Out"  input="convFC_L:In"  }
-        { output = "copyFR:Out"  input="convFR_R:In"  }
-        { output = "copyFR:Out"  input="convFR_L:In"  }
-        { output = "copySR:Out"  input="convSR_R:In"  }
-        { output = "copySR:Out"  input="convSR_L:In"  }
-        { output = "copyRR:Out"  input="convRR_R:In"  }
-        { output = "copyRR:Out"  input="convRR_L:In"  }
-        { output = "copyFC:Out"  input="convFC_R:In"  }
-        { output = "copyLFE:Out" input="lfeLP1:In" }
+        )" + main_input_links + R"(
+        )" + lfe_source_link + R"(
+        )" + lfe_align_links + R"(
         { output = "lfeLP1:Out" input="lfeLP2:In" }
-        { output = "lfeLP2:Out" input="gainLFE_L:In" }
-        { output = "lfeLP2:Out" input="gainLFE_R:In" }
+        )" + lfe_phase_links + R"(
         { output = "gainLFE_L:Out" input="convLFE_L:In" }
         { output = "gainLFE_R:Out" input="convLFE_R:In" }
 
@@ -799,7 +1609,9 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
 {
     node.name = )" + capture_name +
                                          R"(
+    node.description = "虚拟环绕声（内部效果）"
     media.class = "Audio/Sink"
+    priority.session = 0
     node.latency = "1024/48000"
     audio.rate = 48000
     audio.channels = 8
@@ -823,8 +1635,8 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
     // Combine the properites to a single JSON string
     const string args = R"(
 {
-    node.description = "Virtual Surround Manager"
-    media.name = "Virtual Surround Manager"
+    node.description = "虚拟环绕声（内部效果）"
+    media.name = "虚拟环绕声（内部效果）"
     filter.graph = )" +
                filter_graph +
                R"(,
@@ -840,7 +1652,7 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
 
 bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled) {
     if (!is_valid()) {
-        Q_EMIT error_occurred(QStringLiteral("Failed connecting to PipeWire audio service."));
+        Q_EMIT error_occurred(QStringLiteral("连接 PipeWire 音频服务失败。"));
         return false;
     }
     if (bridge_module) {
@@ -861,7 +1673,7 @@ bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path
         effects_capture_node_name.clear();
         effects_playback_node_name.clear();
         pw_thread_loop_unlock(thread_loop);
-        Q_EMIT error_occurred(QStringLiteral("Error creating virtual surround device."));
+        Q_EMIT error_occurred(QStringLiteral("创建虚拟环绕声设备失败。"));
         return false;
     }
 
@@ -876,7 +1688,7 @@ bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path
         effects_playback_node_name.clear();
         pw_thread_loop_unlock(thread_loop);
         qWarning("create_virtual_surround_module: Failed to load the bridge module");
-        Q_EMIT error_occurred(QStringLiteral("Error creating virtual surround device."));
+        Q_EMIT error_occurred(QStringLiteral("创建虚拟环绕声设备失败。"));
         return false;
     }
 
@@ -894,7 +1706,7 @@ bool PipeWireManager::replace_virtual_surround_module(const string &hrir_wav_pat
         return create_virtual_surround_module(hrir_wav_path, upmix_enabled);
 
     if (!is_valid()) {
-        Q_EMIT error_occurred(QStringLiteral("Failed connecting to PipeWire audio service."));
+        Q_EMIT error_occurred(QStringLiteral("连接 PipeWire 音频服务失败。"));
         return false;
     }
 
@@ -925,7 +1737,7 @@ bool PipeWireManager::replace_virtual_surround_module(const string &hrir_wav_pat
     if (bridge_playback_id == SPA_ID_INVALID || old_capture_id == SPA_ID_INVALID) {
         pw_thread_loop_unlock(thread_loop);
         qWarning("replace_virtual_surround_module: Bridge or effects nodes are not known yet");
-        Q_EMIT error_occurred(QStringLiteral("The virtual surround device is not ready yet. Please try again."));
+        Q_EMIT error_occurred(QStringLiteral("虚拟环绕声设备尚未就绪，请重试。"));
         return false;
     }
 
@@ -938,8 +1750,7 @@ bool PipeWireManager::replace_virtual_surround_module(const string &hrir_wav_pat
         effects_generation = old_generation;
         pw_thread_loop_unlock(thread_loop);
         qWarning("replace_virtual_surround_module: Failed to load the new effects module, keeping the old one");
-        Q_EMIT error_occurred(QStringLiteral("Could not switch the virtual surround profile. "
-                                             "The previous one is still active; check the selected HRIR file."));
+        Q_EMIT error_occurred(QStringLiteral("无法切换虚拟环绕声配置。上一配置仍在运行，请检查所选 HRIR 文件。"));
         return false;
     }
 
@@ -999,7 +1810,7 @@ bool PipeWireManager::replace_virtual_surround_module(const string &hrir_wav_pat
             effects_playback_id = old_playback_id;
             effects_generation = old_generation;
             pw_thread_loop_unlock(thread_loop);
-            Q_EMIT error_occurred(QStringLiteral("Could not switch the virtual surround profile. The previous one is still active."));
+            Q_EMIT error_occurred(QStringLiteral("无法切换虚拟环绕声配置。上一配置仍在运行。"));
             return false;
         }
 
@@ -1013,6 +1824,14 @@ bool PipeWireManager::replace_virtual_surround_module(const string &hrir_wav_pat
     qDebug("replace_virtual_surround_module: After bridge move, effects playback link: %d, bridge link: %d",
            has_outgoing_link(effects_playback_id), has_link(bridge_playback_id, new_capture_id));
 
+    // WirePlumber updates its link bookkeeping asynchronously. Do not destroy the
+    // old sink while the bridge is still linked to it: mpris-pause.lua follows the
+    // upstream link from the removed sink and pauses the application's player.
+    if (old_capture_id != SPA_ID_INVALID) {
+        const bool old_released = wait_for([this, old_capture_id]() { return !has_input_link(old_capture_id); }, 1200);
+        qDebug("replace_virtual_surround_module: Old effects sink input link cleared: %d", old_released);
+    }
+
     pw_impl_module *old_effects = effects_module;
     effects_module = new_effects;
     sync_with_core(1);
@@ -1022,7 +1841,7 @@ bool PipeWireManager::replace_virtual_surround_module(const string &hrir_wav_pat
     // The old sink stays around briefly: WirePlumber updates its link bookkeeping
     // asynchronously, and removing a sink it still considers linked would pause
     // MPRIS media players. By now it has no input link anymore, so it is silent.
-    schedule_effects_destroy(old_effects);
+    schedule_effects_destroy(old_effects, old_capture_id);
 
     qInfo("replace_virtual_surround_module: Successfully replaced effects graph in %lld ms",
           static_cast<long long>(switch_timer.elapsed()));
@@ -1030,18 +1849,39 @@ bool PipeWireManager::replace_virtual_surround_module(const string &hrir_wav_pat
     return true;
 }
 
-void PipeWireManager::schedule_effects_destroy(pw_impl_module *old_module) {
+void PipeWireManager::schedule_effects_destroy(pw_impl_module *old_module, uint32_t old_sink_id, int attempts_left) {
     if (!old_module || !thread_loop)
         return;
+    if (!pending_effects_destroy.contains(old_module))
+        pending_effects_destroy.append(old_module);
 
-    pending_effects_destroy.append(old_module);
-
-    QTimer::singleShot(250, this, [this, old_module]() {
+    // Keep the silent old graph around long enough for WirePlumber's MPRIS link
+    // bookkeeping to process the link removal (it syncs after the link event).
+    // 250 ms was too short once graph creation started taking ~1 s: the old sink
+    // was destroyed while links_in still remembered the bridge link, and
+    // mpris-pause.lua paused the player even though the actual link was gone.
+    QTimer::singleShot(1200, this, [this, old_module, old_sink_id, attempts_left]() {
         // The shutdown path or a following replace may have collected it already
-        if (!pending_effects_destroy.removeOne(old_module) || !thread_loop)
+        if (!pending_effects_destroy.contains(old_module) || !thread_loop)
             return;
 
         pw_thread_loop_lock(thread_loop);
+        const bool still_linked = old_sink_id != SPA_ID_INVALID && has_input_link(old_sink_id);
+        if (still_linked && attempts_left > 0) {
+            pw_thread_loop_unlock(thread_loop);
+            qDebug("schedule_effects_destroy: Old effects sink is still linked, retrying");
+            schedule_effects_destroy(old_module, old_sink_id, attempts_left - 1);
+            return;
+        }
+        if (still_linked) {
+            // Removing it now would pause the player; leave it alive until the
+            // final teardown instead
+            pw_thread_loop_unlock(thread_loop);
+            qWarning("schedule_effects_destroy: Old effects sink stayed linked, keeping it alive");
+            return;
+        }
+
+        pending_effects_destroy.removeOne(old_module);
         pw_impl_module_destroy(old_module);
         sync_with_core(1);
         pw_thread_loop_unlock(thread_loop);
@@ -1107,8 +1947,9 @@ string PipeWireManager::build_bridge_module_args(const string &effects_sink_name
     const string capture_props = R"(
 {
     node.name = )" + string(capture_node_name_base) + R"(
-    node.description = "Virtual Surround Manager"
+    node.description = "虚拟环绕声"
     media.class = "Audio/Sink"
+    priority.session = 0
     node.latency = "1024/48000"
     audio.rate = 48000
     audio.channels = 8
@@ -1154,8 +1995,8 @@ string PipeWireManager::build_bridge_module_args(const string &effects_sink_name
 
     return R"(
 {
-    node.description = "Virtual Surround Manager"
-    media.name = "Virtual Surround Manager"
+    node.description = "虚拟环绕声"
+    media.name = "虚拟环绕声"
     filter.graph = )" +
         filter_graph + R"(,
     capture.props = )" + capture_props + R"(,
@@ -1334,7 +2175,10 @@ void PipeWireManager::disable_routing() {
     // WirePlumber pause their MPRIS players.
     if (bridge_capture_id != SPA_ID_INVALID) {
         sync_with_core(1);
-        if (!wait_for([this]() { return !has_input_link(bridge_capture_id); }, 500))
+        // Long enough for WirePlumber's link bookkeeping under load; exiting a
+        // little later is much better than removing the sink while a stream is
+        // still linked, which makes mpris-pause.lua pause the player.
+        if (!wait_for([this]() { return !has_input_link(bridge_capture_id); }, 1500))
             qWarning("disable_routing: Streams did not leave the bridge sink in time");
     }
 
@@ -1343,7 +2187,14 @@ void PipeWireManager::disable_routing() {
     for (auto it = node_bindings.begin(); it != node_bindings.end(); ++it)
         destroy_binding(it.value());
     node_bindings.clear();
+    for (auto it = sink_bindings.begin(); it != sink_bindings.end(); ++it) {
+        spa_hook_remove(&it.value()->listener);
+        pw_proxy_destroy(it.value()->proxy);
+        delete it.value();
+    }
+    sink_bindings.clear();
     metadata_targets.clear();
+    effects_redirect_ms.clear();
     sinks.clear();
     decided_streams.clear();
     links.clear();
@@ -1370,6 +2221,56 @@ void PipeWireManager::disable_routing() {
 
 bool PipeWireManager::is_valid() const {
     return thread_loop && context && core;
+}
+
+void PipeWireManager::set_lfe_mode(LfeMode mode) {
+    lfe_mode = mode;
+}
+
+int PipeWireManager::upmix_auto_state() const {
+    if (!upmix_state)
+        return -1;
+    return upmix_state->load(std::memory_order_relaxed);
+}
+
+PipeWireManager::HrirAnalysis PipeWireManager::analyze_hrir(const string &path) const {
+    HrirAnalysis result;
+    if (path.empty())
+        return result;
+
+    const double gain = lfe_reference_gain(path);
+    if (gain <= 0.0)
+        return result;
+    result.reference_gain = gain;
+    result.reference_gain_db = 20.0 * std::log10(gain);
+
+    const LfeAlignment alignment = lfe_alignment(path, 48000);
+    if (!alignment.valid)
+        return result;
+
+    result.valid = true;
+    result.alignment_ms = alignment.seconds * 1000.0;
+    result.delay_main = alignment.delay_main;
+    result.delay_lfe = alignment.delay_lfe;
+    result.residual_degrees = alignment.residual_degrees;
+    result.average_residual_degrees = alignment.average_residual_degrees;
+    result.worst_channel_residual_degrees = alignment.worst_channel_residual_degrees;
+    result.allpass_valid = alignment.allpass_valid;
+    result.allpass_freq = alignment.allpass_freq;
+    result.allpass_q = alignment.allpass_q;
+    result.allpass_residual_degrees = alignment.allpass_residual_degrees;
+    result.allpass_worst_channel_degrees = alignment.allpass_worst_channel_degrees;
+    return result;
+}
+
+uint64_t PipeWireManager::upmix_block_count() const {
+    if (!upmix_blocks)
+        return 0;
+    return upmix_blocks->load(std::memory_order_relaxed);
+}
+
+bool PipeWireManager::is_speaker_bypass() const {
+    return speaker_bypass.load(std::memory_order_relaxed);
 }
 
 void PipeWireManager::on_core_done(void *data, [[maybe_unused]] uint32_t id, int seq) {
@@ -1480,8 +2381,23 @@ PipeWireManager::PipeWireManager() {
 PipeWireManager::~PipeWireManager() {
     // Release the routed streams first (disable_routing waits until they have left
     // the bridge sink), then tear the device down
+    const bool was_playing = is_audio_playing();
     disable_routing();
+    if (was_playing) {
+        // WirePlumber's MPRIS link bookkeeping is asynchronous. Removing the
+        // bridge immediately after its last input link disappears can still make
+        // mpris-pause.lua pause the player, so give the server a moment to settle.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    }
     remove_virtual_surround_module();
+
+    // Drop the extra reference taken for reading the detector state
+    if (upmix_state_handle) {
+        dlclose(upmix_state_handle);
+        upmix_state_handle = nullptr;
+        upmix_state = nullptr;
+        upmix_blocks = nullptr;
+    }
 
     if (thread_loop) {
         pw_thread_loop_lock(thread_loop);

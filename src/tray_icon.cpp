@@ -20,12 +20,12 @@ TrayIcon::TrayIcon(QObject *parent) : QObject(parent) {
     m_menu = new QMenu(nullptr);
 
     // Build context menu
-    auto *open_action = m_menu->addAction(i18nc("@action", "Open"));
-    m_toggle_action = m_menu->addAction(i18nc("@action:switch", "Enabled"));
+    auto *open_action = m_menu->addAction(i18nc("@action", "打开"));
+    m_toggle_action = m_menu->addAction(i18nc("@action:switch", "已启用"));
     m_toggle_action->setCheckable(true);
-    m_profile_menu = m_menu->addMenu(i18nc("@action", "Profiles"));
+    m_profile_menu = m_menu->addMenu(i18nc("@action", "配置文件"));
     m_menu->addSeparator();
-    auto *quit_action = m_menu->addAction(i18nc("@action", "Quit"));
+    auto *quit_action = m_menu->addAction(i18nc("@action", "退出"));
 
     // Connect actions
     QObject::connect(open_action, &QAction::triggered, this, &TrayIcon::show_main_window);
@@ -68,7 +68,7 @@ void TrayIcon::setup(const QString &icon_name) {
         icon.addFile(destination);
     }
     m_tray_icon->setIcon(icon);
-    m_tray_icon->setToolTip(i18nc("@title", "Virtual Surround"));
+    m_tray_icon->setToolTip(i18nc("@title", "虚拟环绕声"));
     m_tray_icon->setContextMenu(m_menu);
 }
 
@@ -108,8 +108,8 @@ void TrayIcon::quit_application() {
     // device; ask first when that would interrupt something
     if (m_frontend_manager && m_frontend_manager->is_audio_playing()) {
         const auto answer = QMessageBox::question(
-            nullptr, i18nc("@title:dialog", "Audio is playing"),
-            i18nc("@info:dialog", "Closing the application will move the playing audio back to your default output device. Do you want to quit?"),
+            nullptr, i18nc("@title:dialog", "音频正在播放"),
+            i18nc("@info:dialog", "退出应用会把正在播放的音频移回默认输出设备。是否退出？"),
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
         if (answer != QMessageBox::Yes)
             return;
@@ -127,8 +127,8 @@ void TrayIcon::toggle_virtual_surround() {
     const bool enabled = !m_frontend_manager->get_virtual_surround_enabled();
     if (!enabled && m_frontend_manager->is_audio_playing()) {
         const auto answer = QMessageBox::question(
-            nullptr, i18nc("@title:dialog", "Audio is playing"),
-            i18nc("@info:dialog", "Disabling virtual surround will move the playing audio to your default output device. Do you want to continue?"),
+            nullptr, i18nc("@title:dialog", "音频正在播放"),
+            i18nc("@info:dialog", "关闭虚拟环绕声会把正在播放的音频移到默认输出设备。是否继续？"),
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
         if (answer != QMessageBox::Yes) {
             update_ui_state();
@@ -178,7 +178,7 @@ void TrayIcon::update_profile_menu() {
     const int current_index = m_frontend_manager->get_hrir_wav_file_name_index();
 
     if (profiles.isEmpty()) {
-        auto *no_profiles_action = m_profile_menu->addAction(i18nc("@label", "No profiles available"));
+        auto *no_profiles_action = m_profile_menu->addAction(i18nc("@label", "没有可用的配置文件"));
         no_profiles_action->setEnabled(false);
         return;
     }
