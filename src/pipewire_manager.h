@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QMap>
+#include <QHash>
 #include <QObject>
 #include <QSet>
 #include <QString>
@@ -106,6 +107,20 @@ class PipeWireManager : public QObject {
     uint32_t playback_node_id = SPA_ID_INVALID;
     pw_impl_module *module = nullptr;
 
+    // Modules that were replaced but whose teardown is deferred (see
+    // schedule_module_destroy): WirePlumber relinks the moved streams asynchronously
+    // and destroying the previous graph too early drops them onto the physical device
+    QList<pw_impl_module *> pending_destroy;
+
+    // Until this deadline (steady clock, ms) a routed stream whose target is cleared
+    // is pulled back to the graph. WirePlumber answers a re-target write with
+    // "follow the default sink" once the previous graph is gone, which drops the
+    // stream onto the physical device: loud (no graph attenuation) and enough for
+    // media players to pause.
+    qint64 pin_routes_until_ms = 0;
+    // Last pin write per node, to keep a possible ping-pong with WirePlumber bounded
+    QHash<uint32_t, qint64> last_pin_ms;
+
     // Written from the PipeWire thread, read from the UI thread
     std::atomic<bool> audio_playing{false};
 
@@ -193,6 +208,17 @@ class PipeWireManager : public QObject {
     // Must be called from the PipeWire thread.
     //
     void update_playing_state();
+
+    //
+    // Defers destruction of a replaced module until the streams have certainly been
+    // re-linked to the new graph. Callers must not hold the thread loop lock.
+    //
+    void schedule_module_destroy(pw_impl_module *old_module);
+
+    //
+    // Destroys all deferred modules. Must be called with the thread loop lock held.
+    //
+    void destroy_pending_modules_locked();
 
     //
     // Builds the libpipewire-module-filter-chain JSON arguments for the given

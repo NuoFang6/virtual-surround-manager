@@ -3,10 +3,13 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QList>
 #include <QStandardPaths>
+#include <QTimer>
 #include <QtEndian>
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <string_view>
 #include <time.h>
@@ -300,11 +303,21 @@ int PipeWireManager::on_metadata_property(void *data,
     else
         manager->metadata_targets[subject] = value;
 
-    if (value == nullptr && manager->routed_node_ids.contains(subject)) {
+    if (no_target && manager->routed_node_ids.contains(subject)) {
         // Re-assert routing if a stream we virtualize had its target cleared.
-        // Only react to a full removal, re-asserting on "-1" could start a write battle with WirePlumber.
-        pw_metadata_set_property(manager->metadata, subject, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", manager->capture_node_name.c_str());
-        qDebug("on_metadata_property: Node %u re-routed to sink '%s'", subject, manager->capture_node_name.c_str());
+        // A full removal is always countered. Clears to "-1" are normally left alone
+        // (re-asserting on them could start a write battle with WirePlumber), but
+        // right after a graph replacement they are how WirePlumber drops the stream
+        // back onto the physical device - so pin them for a short window, rate limited.
+        const qint64 now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch())
+                                  .count();
+        const bool in_pin_window = no_target && value != nullptr && manager->pin_routes_until_ms > now_ms;
+        if ((value == nullptr || in_pin_window) && now_ms - manager->last_pin_ms.value(subject, 0) >= 250) {
+            manager->last_pin_ms[subject] = now_ms;
+            pw_metadata_set_property(manager->metadata, subject, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", manager->capture_node_name.c_str());
+            qDebug("on_metadata_property: Pinned node %u to sink '%s'", subject, manager->capture_node_name.c_str());
+        }
     } else if (!no_target && manager->routed_node_ids.contains(subject) &&
                strcmp(value, manager->capture_node_name.c_str()) != 0) {
         // The stream was explicitly moved to another device, so it is no longer ours
@@ -830,6 +843,11 @@ bool PipeWireManager::replace_virtual_surround_module(const string &hrir_wav_pat
     // disappears. Streams only ever move between two virtual sinks here - with the
     // old code they briefly fell back to the physical output device (unattenuated,
     // different volume) which caused an audible level jump and made players pause.
+    // While the swap settles, pin the target back if WirePlumber clears it ("-1"),
+    // which is how it would drop the stream onto the physical device.
+    pin_routes_until_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch()).count()
+        + 6000;
     if (is_registry_listener_added && metadata) {
         for (const uint32_t id : routed_node_ids) {
             pw_metadata_set_property(metadata, id, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", new_capture_name.c_str());
@@ -848,16 +866,64 @@ bool PipeWireManager::replace_virtual_surround_module(const string &hrir_wav_pat
     pw_impl_module *old_module = module;
     module = new_module;
 
-    pw_impl_module_destroy(old_module);
-
-    // Wait until the server has actually destroyed the old nodes
+    // Also sweep up any module whose deferred teardown has not run yet, so that
+    // repeated quick switches do not stack up
+    destroy_pending_modules_locked();
     sync_with_core(2);
 
     pw_thread_loop_unlock(thread_loop);
 
+    // The re-target writes above only become effective once WirePlumber has
+    // re-linked the streams, which happens asynchronously. Destroying the previous
+    // graph right away drops the streams onto the physical device for a moment:
+    // audible as a loud level jump (no graph attenuation, different device volume)
+    // and enough to make media players pause.
+    schedule_module_destroy(old_module);
+
     qInfo("replace_virtual_surround_module: Successfully replaced module");
 
     return true;
+}
+
+void PipeWireManager::schedule_module_destroy(pw_impl_module *old_module) {
+    if (!old_module || !thread_loop)
+        return;
+
+    pending_destroy.append(old_module);
+
+    QTimer::singleShot(2000, this, [this, old_module]() {
+        // The shutdown path or a following replace may have collected it already
+        if (!pending_destroy.removeOne(old_module) || !thread_loop)
+            return;
+
+        pw_thread_loop_lock(thread_loop);
+
+        // Safety net: if WirePlumber dropped a stream elsewhere while the graphs were
+        // swapped (e.g. onto the physical device, or cleared its target so it follows
+        // the default sink again), pull it back to the current graph
+        if (metadata) {
+            for (const uint32_t id : std::as_const(routed_node_ids)) {
+                const string target = metadata_targets.value(id, string());
+                if (target != capture_node_name) {
+                    qInfo("schedule_module_destroy: Node %u target is '%s', pinning back to graph", id,
+                          target.empty() ? "(default)" : target.c_str());
+                    pw_metadata_set_property(metadata, id, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", capture_node_name.c_str());
+                }
+            }
+        }
+
+        pw_impl_module_destroy(old_module);
+        sync_with_core(2);
+        pw_thread_loop_unlock(thread_loop);
+
+        qInfo("schedule_module_destroy: Destroyed replaced module");
+    });
+}
+
+void PipeWireManager::destroy_pending_modules_locked() {
+    for (pw_impl_module *m : std::as_const(pending_destroy))
+        pw_impl_module_destroy(m);
+    pending_destroy.clear();
 }
 
 bool PipeWireManager::is_audio_playing() const {
@@ -883,6 +949,8 @@ void PipeWireManager::remove_virtual_surround_module() {
         pw_impl_module_destroy(module);
         module = nullptr;
     }
+    // Any graph whose teardown was deferred must also go away now
+    destroy_pending_modules_locked();
     // The playback node disappears with the module; do not keep its now stale ID
     playback_node_id = SPA_ID_INVALID;
     audio_playing.store(false, std::memory_order_relaxed);
@@ -1088,6 +1156,9 @@ PipeWireManager::~PipeWireManager() {
             pw_proxy_destroy((pw_proxy *)metadata);
             metadata = nullptr;
         }
+
+        // No deferred teardown survives the connection: destroy replaced graphs now
+        destroy_pending_modules_locked();
 
         // Make sure the server has processed the target clears above before the
         // connection goes away
