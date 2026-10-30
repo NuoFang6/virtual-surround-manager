@@ -2,6 +2,7 @@
 
 #include <KConfig>
 #include <KConfigGroup>
+#include <QHash>
 #include <QObject>
 #include <QString>
 #include <QStringList>
@@ -29,6 +30,14 @@ class FrontendManager : public QObject {
     Q_PROPERTY(bool upmixEnabled READ get_upmix_enabled WRITE set_upmix_enabled NOTIFY upmix_enabled_changed)
     // Low-frequency handling mode: "balanced", "reference" or "impact"
     Q_PROPERTY(QString lfeMode READ get_lfe_mode WRITE set_lfe_mode NOTIFY lfe_mode_changed)
+    // LFE IR/timbre: "diffuse" (default), "delta" or "center". The LFE low-pass
+    // (Butterworth 4th) and per-ear alignment are fixed defaults.
+    Q_PROPERTY(QString lfeTimbre READ get_lfe_timbre WRITE set_lfe_timbre NOTIFY lfe_timbre_changed)
+    // Optional: normalize the overall gain of each HRIR preset to the median
+    // A-weighted level of the current preset list
+    Q_PROPERTY(bool presetLevelMatch READ get_preset_level_match WRITE set_preset_level_match NOTIFY preset_level_match_changed)
+    // Optional: 5 ms lookahead output safety limiter (-1.5 dBFS)
+    Q_PROPERTY(bool outputLimiter READ get_output_limiter WRITE set_output_limiter NOTIFY output_limiter_changed)
     // Live input detection text for the main page (refreshed while it is visible)
     Q_PROPERTY(QString inputDetectionText READ get_input_detection_text NOTIFY input_detection_text_changed)
     // Diagnostic line for the selected HRIR (normalization gain and alignment delay)
@@ -78,6 +87,18 @@ class FrontendManager : public QObject {
     void set_lfe_mode(const QString &value);
     Q_SIGNAL void lfe_mode_changed();
 
+    QString get_lfe_timbre() const;
+    void set_lfe_timbre(const QString &value);
+    Q_SIGNAL void lfe_timbre_changed();
+
+    bool get_preset_level_match() const;
+    void set_preset_level_match(bool value);
+    Q_SIGNAL void preset_level_match_changed();
+
+    bool get_output_limiter() const;
+    void set_output_limiter(bool value);
+    Q_SIGNAL void output_limiter_changed();
+
     QString get_input_detection_text() const;
     Q_SIGNAL void input_detection_text_changed();
 
@@ -101,8 +122,13 @@ class FrontendManager : public QObject {
     bool m_virtual_surround_auto_enabled = false;
     bool m_upmix_enabled = false;
     QString m_lfe_mode = QStringLiteral("balanced");
+    QString m_lfe_timbre = QStringLiteral("diffuse");
+    bool m_preset_level_match = false;
+    bool m_output_limiter = false;
+    QHash<QString, double> m_hrir_levels;
     QString m_input_detection_text;
-    QString m_hrir_analysis_text;
+    QString m_hrir_analysis_text = QStringLiteral("HRIR 分析：尚未获取");
+    quint64 m_hrir_analysis_generation = 0;
     uint64_t m_last_auto_blocks = 0;
     qint64 m_last_audio_ms = 0;
 
@@ -113,6 +139,25 @@ class FrontendManager : public QObject {
     QString hrir_wav_subpath = QStringLiteral("/hrir_wav");
 
     bool does_hrir_wav_file_exist(const QString &file_path);
+
+    //
+    // Cached relative A-weighted level of one HRIR (see hrir_level_db).
+    //
+    double hrir_level_for_path(const QString &file_path);
+
+    //
+    // Overall output trim in dB. 0 when preset loudness matching is off;
+    // otherwise the selected preset is moved to the median level of all
+    // readable 14-channel presets (bounded to +/-8 dB).
+    //
+    double output_trim_db();
+
+    //
+    // Replaces the diagnostic line with an explicit "refreshing" sentinel, so
+    // the UI never keeps showing values from a previous preset/settings while
+    // the graph is rebuilt or the analysis is unavailable.
+    //
+    void invalidate_hrir_analysis(const QString &reason);
 
     //
     // Recomputes the diagnostic line for the currently selected HRIR.

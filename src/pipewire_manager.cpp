@@ -5,6 +5,8 @@
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
+#include <spa/param/props.h>
+#include <spa/pod/builder.h>
 #include <QList>
 #include <QStandardPaths>
 #include <QTimer>
@@ -22,6 +24,9 @@
 #include <string_view>
 #include <thread>
 #include <time.h>
+
+using LfeLowpass = PipeWireManager::LfeLowpass;
+using LfeTimbre = PipeWireManager::LfeTimbre;
 
 //
 // Escapes a path for embedding into a JSON string value of the module
@@ -197,15 +202,115 @@ struct LfeAlignment {
     double allpass_q = 0.0;
     double allpass_residual_degrees = 0.0;
     double allpass_worst_channel_degrees = 0.0;
+    // Sample rate of the HRIR file itself. The graph always runs at 48 kHz; a
+    // non-48 kHz file is resampled at load time by the convolver, so the phase
+    // is measured on the file's time axis while the LR4/all-pass are designed
+    // for the graph rate.
+    uint32_t source_rate = 0;
+
+    // Selected LFE path configuration (manager defaults: BW4/diffuse/per-ear).
+    LfeLowpass lowpass = LfeLowpass::Butterworth4;
+    LfeTimbre timbre = LfeTimbre::Diffuse;
+    bool per_ear = true;
+    double main_delay_seconds = 0.0;
+    double lfe_delay_l_seconds = 0.0;
+    double lfe_delay_r_seconds = 0.0;
+    double average_residual_l_degrees = 0.0;
+    double average_residual_r_degrees = 0.0;
+    double worst_channel_residual_l_degrees = 0.0;
+    double worst_channel_residual_r_degrees = 0.0;
+    bool allpass_l_valid = false;
+    double allpass_l_freq = 0.0;
+    double allpass_l_q = 0.0;
+    double allpass_l_residual_degrees = 0.0;
+    double allpass_l_worst_channel_degrees = 0.0;
+    bool allpass_r_valid = false;
+    double allpass_r_freq = 0.0;
+    double allpass_r_q = 0.0;
+    double allpass_r_residual_degrees = 0.0;
+    double allpass_r_worst_channel_degrees = 0.0;
 };
 
+// Phase error the send has to survive. The post-alignment absolute residual is
+// the right metric: a clean delay fit (small slope residual) can still leave a
+// large absolute offset when no delay was inserted. The -6 dB send is only 6 dB
+// below the main path, so a large residual can still produce audible
+// frequency-dependent cancellation; 30 deg is the chosen bound for any send.
+// 15 deg is required for the 0 dB impact send. Measured bad presets:
+// AtmosRenderer-Far 249 deg, dtshx 143 deg; aligned presets are 2-8 deg.
+static double lfe_effective_residual_degrees(const LfeAlignment &alignment) {
+    if (alignment.per_ear) {
+        const double left = alignment.allpass_l_valid ? alignment.allpass_l_residual_degrees
+                                                       : alignment.average_residual_l_degrees;
+        const double right = alignment.allpass_r_valid ? alignment.allpass_r_residual_degrees
+                                                        : alignment.average_residual_r_degrees;
+        return std::max(left, right);
+    }
+    return alignment.allpass_valid ? alignment.allpass_residual_degrees : alignment.average_residual_degrees;
+}
+
+struct LfeLowpassSpec {
+    int sections = 2;
+    std::array<double, 4> q{0.7071067811865476, 0.7071067811865476, 0.0, 0.0};
+};
+
+// A 4th-order Butterworth low-pass is two biquads with the standard Q pair
+// (0.5412, 1.3066); two Q=0.7071 sections would be a Linkwitz-Riley (and -6 dB
+// at the corner instead of -3 dB).
+
+static LfeLowpassSpec lfe_lowpass_spec(LfeLowpass lowpass) {
+    switch (lowpass) {
+    case LfeLowpass::Butterworth4:
+        return {2, {0.5411961001461970, 1.3065629648763770, 0.0, 0.0}};
+    case LfeLowpass::Butterworth8:
+        return {4, {0.5097955791041592, 0.6013448869350453, 0.8999762231364156, 2.5629154477415055}};
+    case LfeLowpass::Lr4:
+    default:
+        return {2, {0.7071067811865476, 0.7071067811865476, 0.0, 0.0}};
+    }
+}
+
+static std::complex<double> bq_lowpass_response(double f, double fc, double q, uint32_t rate) {
+    const double w0 = 2.0 * std::numbers::pi * fc / static_cast<double>(rate);
+    const double cosw0 = std::cos(w0);
+    const double alpha = std::sin(w0) / (2.0 * q);
+    const double b0 = (1.0 - cosw0) / 2.0;
+    const double b1 = 1.0 - cosw0;
+    const double b2 = b0;
+    const double a0 = 1.0 + alpha;
+    const double a1 = -2.0 * cosw0;
+    const double a2 = 1.0 - alpha;
+    const std::complex<double> z = std::exp(std::complex<double>(0.0, -2.0 * std::numbers::pi * f / rate));
+    return (b0 + b1 * z + b2 * z * z) / (a0 + a1 * z + a2 * z * z);
+}
+
+static std::complex<double> lfe_lowpass_response(LfeLowpass lowpass, double f, uint32_t rate) {
+    const LfeLowpassSpec spec = lfe_lowpass_spec(lowpass);
+    std::complex<double> result = 1.0;
+    for (int s = 0; s < spec.sections; ++s)
+        result *= bq_lowpass_response(f, 120.0, spec.q[s], rate);
+    return result;
+}
+
+// Shared frequency grid for the LFE/main alignment.
+constexpr double kLfeFitFreqs[] = {20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0};
+constexpr size_t kLfeFitCount = std::size(kLfeFitFreqs);
+
+static bool lfe_send_safe(const LfeAlignment &alignment) {
+    return alignment.valid && lfe_effective_residual_degrees(alignment) <= 30.0;
+}
+
+static bool lfe_impact_allowed(const LfeAlignment &alignment) {
+    return alignment.valid && lfe_effective_residual_degrees(alignment) <= 15.0;
+}
+
 //
-// The LFE path's 120 Hz LR4 has a group delay of roughly 4.4 ms at 40-120 Hz,
+// The LFE path's 120 Hz low-pass has several ms of group delay at 40-120 Hz,
 // while each HRIR has its own low-frequency group delay. Without compensation
 // the send/native LFE and the main HRIR bass arrive with a frequency-dependent
 // phase difference (measured -37..-171 degrees for the bundled presets), which
 // makes a larger LFE send cancel instead of reinforce. Fit the phase difference
-// between the LR4 and the summed main HRIR response over 40-120 Hz; delay the
+// between the low-pass and the summed main HRIR response over 40-120 Hz; delay the
 // main path when the LFE path lags, or the LFE path when the HRIR is longer.
 // Presets whose phase is not a clean delay (e.g. synthetic AtmosRenderer) get
 // no correction rather than a wrong one.
@@ -229,27 +334,169 @@ static double allpass_phase_radians(double f, double f0, double q, double rate) 
     return std::arg(num / den);
 }
 
+// One ear's (or the common path's) phase fit. Shared by the production
+// low-pass/timbre/per-ear path; lfe_alignment() below is retained only as the
+// old reference implementation.
+struct PhaseFit {
+    bool valid = false;
+    double tau = 0.0;              // signed: >0 main delay, <0 LFE delay
+    double slope_residual = 0.0;
+    double average_residual = 0.0;
+    double worst_channel = 0.0;
+    bool allpass_valid = false;
+    double allpass_freq = 0.0;
+    double allpass_q = 0.0;
+    double allpass_residual = 0.0;
+    double allpass_worst_channel = 0.0;
+};
+
+static PhaseFit fit_phase(const double diff_in[kLfeFitCount],
+                          const std::complex<double> channel_resp[14][kLfeFitCount],
+                          const int *channels, int n_channels,
+                          const std::complex<double> lfe_resp[kLfeFitCount],
+                          uint32_t graph_rate) {
+    PhaseFit result;
+    double diff[kLfeFitCount];
+    for (size_t i = 0; i < kLfeFitCount; ++i)
+        diff[i] = diff_in[i];
+    for (size_t i = 1; i < kLfeFitCount; ++i) {
+        while (diff[i] - diff[i - 1] > std::numbers::pi)
+            diff[i] -= 2.0 * std::numbers::pi;
+        while (diff[i] - diff[i - 1] < -std::numbers::pi)
+            diff[i] += 2.0 * std::numbers::pi;
+    }
+
+    const double mean_f = std::accumulate(std::begin(kLfeFitFreqs), std::end(kLfeFitFreqs), 0.0) / kLfeFitCount;
+    const double mean_d = std::accumulate(std::begin(diff), std::end(diff), 0.0) / kLfeFitCount;
+    double num = 0.0, den = 0.0;
+    for (size_t i = 0; i < kLfeFitCount; ++i) {
+        num += (kLfeFitFreqs[i] - mean_f) * (diff[i] - mean_d);
+        den += (kLfeFitFreqs[i] - mean_f) * (kLfeFitFreqs[i] - mean_f);
+    }
+    const double slope = num / den;
+    double slope_residual_sq = 0.0;
+    for (size_t i = 0; i < kLfeFitCount; ++i) {
+        const double predicted = mean_d + slope * (kLfeFitFreqs[i] - mean_f);
+        slope_residual_sq += std::pow(diff[i] - predicted, 2);
+    }
+    const double slope_residual = std::sqrt(slope_residual_sq / kLfeFitCount);
+
+    double tau = -slope / (2.0 * std::numbers::pi);
+    if (slope_residual > 0.26)
+        tau = 0.0;
+    else if (std::abs(tau) < 0.0002)
+        tau = 0.0;
+    else {
+        tau = std::clamp(tau, -0.02, 0.02);
+        tau = std::round(tau * graph_rate) / graph_rate;
+    }
+
+    double average_sq = 0.0;
+    for (size_t i = 0; i < kLfeFitCount; ++i) {
+        const double r = diff[i] + 2.0 * std::numbers::pi * kLfeFitFreqs[i] * tau;
+        average_sq += r * r;
+    }
+    const double average_residual = std::sqrt(average_sq / kLfeFitCount);
+
+    double worst = 0.0;
+    for (int k = 0; k < n_channels; ++k) {
+        double sum = 0.0;
+        for (size_t i = 0; i < kLfeFitCount; ++i) {
+            double r = std::arg(lfe_resp[i] / channel_resp[channels[k]][i]) +
+                       2.0 * std::numbers::pi * kLfeFitFreqs[i] * tau;
+            r = std::remainder(r, 2.0 * std::numbers::pi);
+            sum += r * r;
+        }
+        worst = std::max(worst, std::sqrt(sum / kLfeFitCount));
+    }
+
+    result.valid = true;
+    result.tau = tau;
+    result.slope_residual = slope_residual;
+    result.average_residual = average_residual;
+    result.worst_channel = worst;
+
+    if (slope_residual <= 0.26) {
+        double target[kLfeFitCount];
+        bool can_lead = false;
+        for (size_t i = 0; i < kLfeFitCount; ++i) {
+            const double r = diff[i] + 2.0 * std::numbers::pi * kLfeFitFreqs[i] * tau;
+            target[i] = -r;
+            if (target[i] > 1e-9)
+                can_lead = true;
+        }
+        if (!can_lead) {
+            double best_error = 1e9, best_freq = 0.0, best_q = 0.0;
+            constexpr int kFreqSteps = 80;
+            constexpr int kQSteps = 40;
+            const double f_min = 20.0, f_max = 12000.0;
+            const double q_min = 0.1, q_max = 10.0;
+            for (int fi = 0; fi < kFreqSteps; ++fi) {
+                const double f0 = f_min * std::pow(f_max / f_min, static_cast<double>(fi) / (kFreqSteps - 1));
+                for (int qi = 0; qi < kQSteps; ++qi) {
+                    const double q = q_min * std::pow(q_max / q_min, static_cast<double>(qi) / (kQSteps - 1));
+                    double error = 0.0;
+                    for (size_t i = 0; i < kLfeFitCount; ++i) {
+                        const double err = allpass_phase_radians(kLfeFitFreqs[i], f0, q, graph_rate) - target[i];
+                        error += err * err;
+                    }
+                    error = std::sqrt(error / kLfeFitCount);
+                    if (error < best_error) {
+                        best_error = error;
+                        best_freq = f0;
+                        best_q = q;
+                    }
+                }
+            }
+            if (best_error < average_residual - 0.0087) {
+                result.allpass_valid = true;
+                result.allpass_freq = best_freq;
+                result.allpass_q = best_q;
+                result.allpass_residual = best_error;
+                double worst_after = 0.0;
+                for (int k = 0; k < n_channels; ++k) {
+                    double sum = 0.0;
+                    for (size_t i = 0; i < kLfeFitCount; ++i) {
+                        double r = std::arg(lfe_resp[i] / channel_resp[channels[k]][i]) +
+                                   2.0 * std::numbers::pi * kLfeFitFreqs[i] * tau +
+                                   allpass_phase_radians(kLfeFitFreqs[i], best_freq, best_q, graph_rate);
+                        r = std::remainder(r, 2.0 * std::numbers::pi);
+                        sum += r * r;
+                    }
+                    worst_after = std::max(worst_after, std::sqrt(sum / kLfeFitCount));
+                }
+                result.allpass_worst_channel = worst_after;
+            }
+        }
+    }
+    return result;
+}
+
 //
-// The LFE path's 120 Hz LR4 has a group delay of roughly 4.4 ms at low
+// The LFE path's 120 Hz low-pass has several ms of group delay at low
 // frequencies, while each HRIR has its own low-frequency group delay. Without
 // compensation the send/native LFE and the main HRIR bass arrive with a
 // frequency-dependent phase difference, which makes a larger LFE send cancel
-// instead of reinforce. Fit the phase difference between the LR4 and the summed
+// instead of reinforce. Fit the phase difference between the low-pass and the summed
 // main HRIR response over 20-120 Hz; delay the main path when the LFE path lags,
 // or the LFE path when the HRIR is longer. The remaining absolute phase error is
 // then reduced with an automatically fitted all-pass section in the LFE path.
 // Presets whose phase is not a clean delay (e.g. synthetic AtmosRenderer) get
 // no correction rather than a wrong one.
 //
-static LfeAlignment lfe_alignment(const string &hrir_path, uint32_t rate) {
+// Retained as the reference implementation for the old LR4/delta/common path.
+// The application now uses lfe_alignment_configured(), so this function is not
+// called anymore.
+[[maybe_unused]] static LfeAlignment lfe_alignment(const string &hrir_path, uint32_t graph_rate) {
     uint32_t channels = 0, samples = 0, block_align = 0;
+    uint32_t source_rate = 0;
     uint16_t bits = 0, format_tag = 0;
     size_t data_offset = 0;
-    if (!parse_wav_format(hrir_path, channels, rate, block_align, bits, format_tag, samples, data_offset))
+    if (!parse_wav_format(hrir_path, channels, source_rate, block_align, bits, format_tag, samples, data_offset))
         return {};
     const bool supported = (format_tag == 3 && bits == 32) ||
                            (format_tag == 1 && (bits == 16 || bits == 24 || bits == 32));
-    if (channels != 14 || samples == 0 || !supported || rate == 0)
+    if (channels != 14 || samples == 0 || !supported || source_rate == 0 || graph_rate == 0)
         return {};
 
     QFile file(QString::fromStdString(hrir_path));
@@ -260,8 +507,10 @@ static LfeAlignment lfe_alignment(const string &hrir_path, uint32_t rate) {
     if (data_offset + static_cast<size_t>(samples) * block_align > static_cast<size_t>(data.size()))
         return {};
 
-    // LR4 coefficients (same as the graph's two bq_lowpass sections)
-    const double w0 = 2.0 * std::numbers::pi * 120.0 / rate;
+    // LR4 coefficients (same as the graph's two bq_lowpass sections). They must
+    // use the graph's rate: the bq_lowpass nodes run at 48 kHz even when the IR
+    // file is 44.1/96 kHz.
+    const double w0 = 2.0 * std::numbers::pi * 120.0 / graph_rate;
     const double cosw0 = std::cos(w0);
     const double alpha = std::sin(w0) / (2.0 * 0.7071067811865476);
     const double b0 = (1.0 - cosw0) / 2.0;
@@ -284,7 +533,7 @@ static LfeAlignment lfe_alignment(const string &hrir_path, uint32_t rate) {
             double im = 0.0;
             for (uint32_t n = 0; n < samples; ++n) {
                 const double sample = wav_sample(data, data_offset, block_align, format_tag, bits, n, channel);
-                const double phase = 2.0 * std::numbers::pi * f * static_cast<double>(n) / rate;
+                const double phase = 2.0 * std::numbers::pi * f * static_cast<double>(n) / source_rate;
                 re += sample * std::cos(phase);
                 im -= sample * std::sin(phase);
             }
@@ -308,7 +557,7 @@ static LfeAlignment lfe_alignment(const string &hrir_path, uint32_t rate) {
         if (std::abs(main_bass) < 1e-9)
             return {};
 
-        const std::complex<double> z = std::exp(std::complex<double>(0.0, -2.0 * std::numbers::pi * f / rate));
+        const std::complex<double> z = std::exp(std::complex<double>(0.0, -2.0 * std::numbers::pi * f / graph_rate));
         const std::complex<double> lp = (b0 + b1 * z + b2 * z * z) / (a0 + a1 * z + a2 * z * z);
         lfe_resp[i] = lp * lp;
         diff[i] = std::arg(lfe_resp[i] / main_bass);
@@ -341,6 +590,7 @@ static LfeAlignment lfe_alignment(const string &hrir_path, uint32_t rate) {
 
     LfeAlignment result;
     result.valid = true;
+    result.source_rate = source_rate;
     result.residual_degrees = slope_residual * 180.0 / std::numbers::pi;
 
     double tau = -slope / (2.0 * std::numbers::pi);
@@ -352,8 +602,9 @@ static LfeAlignment lfe_alignment(const string &hrir_path, uint32_t rate) {
         tau = 0.0;
     } else {
         tau = std::clamp(tau, -0.02, 0.02);
-        // Quantize to whole samples so the graph's delay exactly represents the fit
-        tau = std::round(tau * rate) / rate;
+        // Quantize to whole graph samples so the delay node exactly represents
+        // the fit (the delay runs at 48 kHz, not at the HRIR file rate).
+        tau = std::round(tau * graph_rate) / graph_rate;
     }
 
     result.seconds = std::abs(tau);
@@ -412,7 +663,7 @@ static LfeAlignment lfe_alignment(const string &hrir_path, uint32_t rate) {
                     const double q = q_min * std::pow(q_max / q_min, static_cast<double>(qi) / (kQSteps - 1));
                     double error = 0.0;
                     for (size_t i = 0; i < count; ++i) {
-                        const double err = allpass_phase_radians(freqs[i], f0, q, rate) - target[i];
+                        const double err = allpass_phase_radians(freqs[i], f0, q, graph_rate) - target[i];
                         error += err * err;
                     }
                     error = std::sqrt(error / count);
@@ -435,7 +686,7 @@ static LfeAlignment lfe_alignment(const string &hrir_path, uint32_t rate) {
                     for (size_t i = 0; i < count; ++i) {
                         double r = std::arg(lfe_resp[i] / channel_resp[channel][i]) +
                                    2.0 * std::numbers::pi * freqs[i] * tau +
-                                   allpass_phase_radians(freqs[i], best_freq, best_q, rate);
+                                   allpass_phase_radians(freqs[i], best_freq, best_q, graph_rate);
                         r = std::remainder(r, 2.0 * std::numbers::pi);
                         sum += r * r;
                     }
@@ -446,15 +697,229 @@ static LfeAlignment lfe_alignment(const string &hrir_path, uint32_t rate) {
         }
     }
 
-    qInfo("lfe_alignment: '%s' fit %.2f ms, slope-residual %.2f deg, absolute avg %.2f deg, worst channel %.2f deg%s",
-          hrir_path.c_str(), result.seconds * 1000.0, result.residual_degrees, result.average_residual_degrees,
-          result.worst_channel_residual_degrees,
+    qInfo("lfe_alignment: '%s' source %u Hz, graph %u Hz, fit %.2f ms, slope-residual %.2f deg, absolute avg %.2f deg, worst channel %.2f deg%s",
+          hrir_path.c_str(), source_rate, graph_rate, result.seconds * 1000.0, result.residual_degrees,
+          result.average_residual_degrees, result.worst_channel_residual_degrees,
           result.allpass_valid ? " (+ all-pass)" : "");
     if (result.allpass_valid) {
         qInfo("lfe_alignment: all-pass %.1f Hz Q %.3f, avg %.2f deg, worst channel %.2f deg",
               result.allpass_freq, result.allpass_q, result.allpass_residual_degrees,
               result.allpass_worst_channel_degrees);
     }
+    return result;
+}
+
+static const char *lfe_lowpass_name(LfeLowpass lowpass) {
+    switch (lowpass) {
+    case LfeLowpass::Butterworth4: return "butterworth4";
+    case LfeLowpass::Butterworth8: return "butterworth8";
+    case LfeLowpass::Lr4:
+    default: return "lr4";
+    }
+}
+
+static const char *lfe_timbre_name(LfeTimbre timbre) {
+    switch (timbre) {
+    case LfeTimbre::CenterHrir: return "center-hrir";
+    case LfeTimbre::Diffuse: return "diffuse";
+    case LfeTimbre::Delta:
+    default: return "delta";
+    }
+}
+
+//
+// Configured LFE alignment: same fit as lfe_alignment(), but with the selected
+// low-pass/timbre and optionally separate left/right LFE delays and all-pass
+// sections. The main path keeps one common delay (Dmain), while the LFE path can
+// be delayed independently per ear (Dlfe = Dmain - tau_ear) so each ear gets its
+// own best fit. This is the production path; the old lfe_alignment() below is
+// retained only as a reference.
+//
+static LfeAlignment lfe_alignment_configured(const string &hrir_path, uint32_t graph_rate,
+                                               LfeLowpass lowpass, LfeTimbre timbre,
+                                               bool per_ear) {
+    uint32_t channels = 0, samples = 0, block_align = 0, source_rate = 0;
+    uint16_t bits = 0, format_tag = 0;
+    size_t data_offset = 0;
+    if (!parse_wav_format(hrir_path, channels, source_rate, block_align, bits, format_tag, samples, data_offset))
+        return {};
+    const bool supported = (format_tag == 3 && bits == 32) ||
+                           (format_tag == 1 && (bits == 16 || bits == 24 || bits == 32));
+    if (channels != 14 || samples == 0 || !supported || source_rate == 0 || graph_rate == 0)
+        return {};
+    QFile file(QString::fromStdString(hrir_path));
+    if (!file.open(QIODevice::ReadOnly))
+        return {};
+    const QByteArray data = file.readAll();
+    file.close();
+    if (data_offset + static_cast<size_t>(samples) * block_align > static_cast<size_t>(data.size()))
+        return {};
+
+    std::complex<double> channel_resp[14][kLfeFitCount];
+    for (uint32_t channel = 0; channel < 14; ++channel) {
+        for (size_t i = 0; i < kLfeFitCount; ++i) {
+            const double f = kLfeFitFreqs[i];
+            double re = 0.0, im = 0.0;
+            for (uint32_t n = 0; n < samples; ++n) {
+                const double sample = wav_sample(data, data_offset, block_align, format_tag, bits, n, channel);
+                const double phase = 2.0 * std::numbers::pi * f * static_cast<double>(n) / source_rate;
+                re += sample * std::cos(phase);
+                im -= sample * std::sin(phase);
+            }
+            channel_resp[channel][i] = std::complex<double>(re, im);
+        }
+    }
+
+    std::complex<double> left[kLfeFitCount], right[kLfeFitCount];
+    for (size_t i = 0; i < kLfeFitCount; ++i) {
+        left[i] = 0.0;
+        right[i] = 0.0;
+        for (uint32_t channel = 0; channel < 14; ++channel)
+            (channel % 2 == 0 ? left[i] : right[i]) += channel_resp[channel][i];
+        if (std::abs(left[i]) < 1e-9 || std::abs(right[i]) < 1e-9)
+            return {};
+    }
+
+    std::complex<double> lpf[kLfeFitCount];
+    for (size_t i = 0; i < kLfeFitCount; ++i)
+        lpf[i] = lfe_lowpass_response(lowpass, kLfeFitFreqs[i], graph_rate);
+
+    std::complex<double> timbre_l[kLfeFitCount], timbre_r[kLfeFitCount];
+    if (timbre == LfeTimbre::CenterHrir) {
+        for (size_t i = 0; i < kLfeFitCount; ++i) {
+            timbre_l[i] = channel_resp[6][i];
+            timbre_r[i] = channel_resp[13][i];
+        }
+    } else if (timbre == LfeTimbre::Diffuse) {
+        // The diffuse-field LFE IR is the average of the seven left/right HRIRs,
+        // normalized to the center pair's 40-80 Hz magnitude so the LFE level
+        // stays comparable across timbre modes. With the BW4 low-pass the native
+        // LFE lands at +6.0 dB at 60 Hz (0.5 dB above the +5.5 dB reference; the
+        // old LR4 gave +5.5). The writer below uses the same normalization.
+        //
+        // This is also the same seven-HRIR average that forms the main sum, so
+        // lfe/left below is exactly a real multiple of the low-pass. The HRIR
+        // phase cancels: for diffuse the fit is preset-independent and the L/R
+        // (per-ear) results are identical.
+        const double center_gain = lfe_reference_gain(hrir_path);
+        if (center_gain <= 0.0)
+            return {};
+        double diffuse_gain = 0.0;
+        int diffuse_count = 0;
+        for (size_t i = 0; i < kLfeFitCount; ++i) {
+            if (kLfeFitFreqs[i] < 40.0 || kLfeFitFreqs[i] > 80.0)
+                continue;
+            diffuse_gain += (std::abs(left[i]) + std::abs(right[i])) / (2.0 * 7.0);
+            ++diffuse_count;
+        }
+        if (diffuse_count == 0 || diffuse_gain <= 1e-9)
+            return {};
+        diffuse_gain /= diffuse_count;
+        const double scale = center_gain / diffuse_gain;
+        for (size_t i = 0; i < kLfeFitCount; ++i) {
+            timbre_l[i] = (left[i] / 7.0) * scale;
+            timbre_r[i] = (right[i] / 7.0) * scale;
+        }
+    } else {
+        for (size_t i = 0; i < kLfeFitCount; ++i) {
+            timbre_l[i] = 1.0;
+            timbre_r[i] = 1.0;
+        }
+    }
+
+    std::complex<double> lfe_l[kLfeFitCount], lfe_r[kLfeFitCount];
+    for (size_t i = 0; i < kLfeFitCount; ++i) {
+        lfe_l[i] = lpf[i] * timbre_l[i];
+        lfe_r[i] = lpf[i] * timbre_r[i];
+    }
+
+    LfeAlignment result;
+    result.valid = true;
+    result.source_rate = source_rate;
+    result.lowpass = lowpass;
+    result.timbre = timbre;
+    result.per_ear = per_ear;
+
+    int all_channels[14];
+    int even_channels[7] = {0, 2, 4, 6, 8, 10, 12};
+    int odd_channels[7] = {1, 3, 5, 7, 9, 11, 13};
+    for (int c = 0; c < 14; ++c)
+        all_channels[c] = c;
+
+    if (!per_ear) {
+        std::complex<double> lfe_avg[kLfeFitCount];
+        double diff[kLfeFitCount];
+        for (size_t i = 0; i < kLfeFitCount; ++i) {
+            lfe_avg[i] = (lfe_l[i] + lfe_r[i]) / 2.0;
+            const std::complex<double> main_avg = (left[i] + right[i]) / 2.0;
+            if (std::abs(main_avg) < 1e-9)
+                return {};
+            diff[i] = std::arg(lfe_avg[i] / main_avg);
+        }
+        const PhaseFit fit = fit_phase(diff, channel_resp, all_channels, 14, lfe_avg, graph_rate);
+        result.delay_main = fit.tau > 0.0;
+        result.delay_lfe = fit.tau < 0.0;
+        result.seconds = std::abs(fit.tau);
+        result.residual_degrees = fit.slope_residual * 180.0 / std::numbers::pi;
+        result.average_residual_degrees = fit.average_residual * 180.0 / std::numbers::pi;
+        result.worst_channel_residual_degrees = fit.worst_channel * 180.0 / std::numbers::pi;
+        result.allpass_valid = fit.allpass_valid;
+        result.allpass_freq = fit.allpass_freq;
+        result.allpass_q = fit.allpass_q;
+        result.allpass_residual_degrees = fit.allpass_residual * 180.0 / std::numbers::pi;
+        result.allpass_worst_channel_degrees = fit.allpass_worst_channel * 180.0 / std::numbers::pi;
+        qInfo("lfe_experiment: '%s' source %u graph %u lowpass %s timbre %s common, fit %.2f ms, "
+              "slope-residual %.2f deg, absolute avg %.2f deg, worst %.2f deg%s",
+              hrir_path.c_str(), source_rate, graph_rate, lfe_lowpass_name(lowpass), lfe_timbre_name(timbre),
+              std::abs(fit.tau) * 1000.0, result.residual_degrees, result.average_residual_degrees,
+              result.worst_channel_residual_degrees, fit.allpass_valid ? " (+ all-pass)" : "");
+        return result;
+    }
+
+    double diff_l[kLfeFitCount], diff_r[kLfeFitCount];
+    for (size_t i = 0; i < kLfeFitCount; ++i) {
+        diff_l[i] = std::arg(lfe_l[i] / left[i]);
+        diff_r[i] = std::arg(lfe_r[i] / right[i]);
+    }
+    const PhaseFit fit_l = fit_phase(diff_l, channel_resp, even_channels, 7, lfe_l, graph_rate);
+    const PhaseFit fit_r = fit_phase(diff_r, channel_resp, odd_channels, 7, lfe_r, graph_rate);
+
+    // Realize both ear fits with one common main delay and per-ear LFE delays.
+    // Dmain >= max(0, tauL, tauR), Dlfe = Dmain - tau, so both delays are causal.
+    const double main_delay = std::max({0.0, fit_l.tau, fit_r.tau});
+    const double lfe_delay_l = main_delay - fit_l.tau;
+    const double lfe_delay_r = main_delay - fit_r.tau;
+    result.main_delay_seconds = main_delay;
+    result.lfe_delay_l_seconds = std::max(0.0, lfe_delay_l);
+    result.lfe_delay_r_seconds = std::max(0.0, lfe_delay_r);
+    result.delay_main = main_delay > 0.0;
+    result.delay_lfe = result.lfe_delay_l_seconds > 0.0 || result.lfe_delay_r_seconds > 0.0;
+    result.seconds = main_delay > 0.0 ? main_delay
+                                      : std::max(result.lfe_delay_l_seconds, result.lfe_delay_r_seconds);
+    result.average_residual_l_degrees = fit_l.average_residual * 180.0 / std::numbers::pi;
+    result.average_residual_r_degrees = fit_r.average_residual * 180.0 / std::numbers::pi;
+    result.worst_channel_residual_l_degrees = fit_l.worst_channel * 180.0 / std::numbers::pi;
+    result.worst_channel_residual_r_degrees = fit_r.worst_channel * 180.0 / std::numbers::pi;
+    result.residual_degrees = std::max(fit_l.slope_residual, fit_r.slope_residual) * 180.0 / std::numbers::pi;
+    result.average_residual_degrees = std::max(result.average_residual_l_degrees,
+                                               result.average_residual_r_degrees);
+    result.worst_channel_residual_degrees = std::max(result.worst_channel_residual_l_degrees,
+                                                     result.worst_channel_residual_r_degrees);
+    result.allpass_l_valid = fit_l.allpass_valid;
+    result.allpass_l_freq = fit_l.allpass_freq;
+    result.allpass_l_q = fit_l.allpass_q;
+    result.allpass_l_residual_degrees = fit_l.allpass_residual * 180.0 / std::numbers::pi;
+    result.allpass_l_worst_channel_degrees = fit_l.allpass_worst_channel * 180.0 / std::numbers::pi;
+    result.allpass_r_valid = fit_r.allpass_valid;
+    result.allpass_r_freq = fit_r.allpass_freq;
+    result.allpass_r_q = fit_r.allpass_q;
+    result.allpass_r_residual_degrees = fit_r.allpass_residual * 180.0 / std::numbers::pi;
+    result.allpass_r_worst_channel_degrees = fit_r.allpass_worst_channel * 180.0 / std::numbers::pi;
+    qInfo("lfe_experiment: '%s' source %u graph %u lowpass %s timbre %s per-ear, "
+          "main %.2f ms, LFE L %.2f / R %.2f ms, residual L %.2f / R %.2f deg",
+          hrir_path.c_str(), source_rate, graph_rate, lfe_lowpass_name(lowpass), lfe_timbre_name(timbre),
+          main_delay * 1000.0, result.lfe_delay_l_seconds * 1000.0, result.lfe_delay_r_seconds * 1000.0,
+          result.average_residual_l_degrees, result.average_residual_r_degrees);
     return result;
 }
 
@@ -552,6 +1017,130 @@ static bool write_lfe_bypass_delta(const string &hrir_path, const string &delta_
 
     const bool ok = file.write(header) == header.size() && file.write(samples) == samples.size();
     file.close();
+    return ok;
+}
+
+//
+// Experimental diffuse-field LFE IR: the average of the seven left/right HRIRs,
+// normalized to the center pair's 40-80 Hz magnitude (the same reference as the
+// delta IR). The result is a 2-channel WAV at the source rate/format/length; the
+// LFE path convolves L with channel 0 and R with channel 1.
+//
+static bool write_lfe_diffuse_ir(const string &hrir_path, const string &diffuse_path) {
+    uint32_t channels = 0, rate = 0, block_align = 0, frames = 0;
+    uint16_t bits = 0, format_tag = 0;
+    size_t data_offset = 0;
+    if (!parse_wav_format(hrir_path, channels, rate, block_align, bits, format_tag, frames, data_offset))
+        return false;
+    const bool supported = (format_tag == 3 && bits == 32) ||
+                           (format_tag == 1 && (bits == 16 || bits == 24 || bits == 32));
+    if (channels != 14 || frames == 0 || rate == 0 || !supported)
+        return false;
+    if (frames > rate * 10)
+        frames = rate * 10;
+
+    QFile file(QString::fromStdString(hrir_path));
+    if (!file.open(QIODevice::ReadOnly))
+        return false;
+    const QByteArray data = file.readAll();
+    file.close();
+    if (data_offset + static_cast<size_t>(frames) * block_align > static_cast<size_t>(data.size()))
+        return false;
+
+    std::vector<double> left(frames), right(frames);
+    for (uint32_t n = 0; n < frames; ++n) {
+        double l = 0.0, r = 0.0;
+        for (uint32_t channel = 0; channel < 14; ++channel) {
+            const double s = wav_sample(data, data_offset, block_align, format_tag, bits, n, channel);
+            (channel % 2 == 0 ? l : r) += s;
+        }
+        left[n] = l / 7.0;
+        right[n] = r / 7.0;
+    }
+
+    const double center_gain = lfe_reference_gain(hrir_path);
+    if (center_gain <= 0.0)
+        return false;
+    double diffuse_gain = 0.0;
+    int diffuse_count = 0;
+    for (const double f : {40.0, 50.0, 60.0, 70.0, 80.0}) {
+        double re_l = 0.0, im_l = 0.0, re_r = 0.0, im_r = 0.0;
+        const double w = 2.0 * std::numbers::pi * f / static_cast<double>(rate);
+        for (uint32_t n = 0; n < frames; ++n) {
+            const double phase = w * static_cast<double>(n);
+            const double c = std::cos(phase);
+            const double s = std::sin(phase);
+            re_l += left[n] * c;
+            im_l -= left[n] * s;
+            re_r += right[n] * c;
+            im_r -= right[n] * s;
+        }
+        diffuse_gain += (std::sqrt(re_l * re_l + im_l * im_l) +
+                         std::sqrt(re_r * re_r + im_r * im_r)) / 2.0;
+        ++diffuse_count;
+    }
+    if (diffuse_count == 0 || diffuse_gain <= 1e-9)
+        return false;
+    const double scale = center_gain / (diffuse_gain / diffuse_count);
+
+    const uint32_t frame_size = bits / 8;
+    const uint32_t data_size = frames * 2 * frame_size;
+    QFile out(QString::fromStdString(diffuse_path));
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return false;
+
+    auto le32 = [](uint32_t v) { return QByteArray(reinterpret_cast<const char *>(&v), 4); };
+    auto le16 = [](uint16_t v) { return QByteArray(reinterpret_cast<const char *>(&v), 2); };
+    const bool is_float = format_tag == 3;
+    if (is_float && bits != 32)
+        return false;
+
+    QByteArray fmt;
+    fmt += le16(format_tag);
+    fmt += le16(2);
+    fmt += le32(rate);
+    fmt += le32(rate * 2 * frame_size);
+    fmt += le16(2 * frame_size);
+    fmt += le16(bits);
+
+    QByteArray header;
+    header += QByteArray("RIFF", 4);
+    header += le32(4 + 8 + 16 + 8 + data_size);
+    header += QByteArray("WAVE", 4);
+    header += QByteArray("fmt ", 4);
+    header += le32(16);
+    header += fmt;
+    header += QByteArray("data", 4);
+    header += le32(data_size);
+
+    QByteArray samples;
+    samples.reserve(data_size);
+    auto append_sample = [&](double v) {
+        v = std::clamp(v, -1.0, 1.0);
+        if (is_float) {
+            const float f = static_cast<float>(v);
+            samples.append(reinterpret_cast<const char *>(&f), 4);
+        } else if (bits == 16) {
+            const int16_t s = static_cast<int16_t>(std::lround(32767.0 * v));
+            samples.append(reinterpret_cast<const char *>(&s), 2);
+        } else if (bits == 24) {
+            const int32_t s = static_cast<int32_t>(std::lround(8388607.0 * v));
+            const uint8_t bytes[3] = {static_cast<uint8_t>(s & 0xFF),
+                                      static_cast<uint8_t>((s >> 8) & 0xFF),
+                                      static_cast<uint8_t>((s >> 16) & 0xFF)};
+            samples.append(reinterpret_cast<const char *>(bytes), 3);
+        } else if (bits == 32) {
+            const int32_t s = static_cast<int32_t>(std::lround(2147483647.0 * v));
+            samples.append(reinterpret_cast<const char *>(&s), 4);
+        }
+    };
+    for (uint32_t n = 0; n < frames; ++n) {
+        append_sample(left[n] * scale);
+        append_sample(right[n] * scale);
+    }
+
+    const bool ok = out.write(header) == header.size() && out.write(samples) == samples.size();
+    out.close();
     return ok;
 }
 
@@ -718,6 +1307,97 @@ void PipeWireManager::release_routed_streams() {
     update_playing_state();
 }
 
+void PipeWireManager::write_stream_mute(struct pw_node *node, bool mute) {
+    if (!node)
+        return;
+    uint8_t buffer[512];
+    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+    // The value type comes from the vararg protocol as a *string* tag ("b" for
+    // bool), not as a SPA_TYPE_* id (see AGENTS.md §5).
+    const struct spa_pod *pod = reinterpret_cast<const struct spa_pod *>(
+        spa_pod_builder_add_object(&b, SPA_TYPE_OBJECT_Props, SPA_PARAM_Props,
+                                   SPA_POD_Prop(SPA_PROP_mute, SPA_POD_Bool(mute))));
+    pw_node_set_param(node, SPA_PARAM_Props, 0, pod);
+}
+
+void PipeWireManager::write_stream_volume(struct pw_node *node, float volume) {
+    if (!node)
+        return;
+    uint8_t buffer[512];
+    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+    const struct spa_pod *pod = reinterpret_cast<const struct spa_pod *>(
+        spa_pod_builder_add_object(&b, SPA_TYPE_OBJECT_Props, SPA_PARAM_Props,
+                                   SPA_POD_Prop(SPA_PROP_volume, SPA_POD_Float(volume))));
+    pw_node_set_param(node, SPA_PARAM_Props, 0, pod);
+}
+
+bool PipeWireManager::gate_effects_output_locked() {
+    if (!effects_playback_control_proxy || !graph_upmix_enabled.load(std::memory_order_relaxed))
+        return false;
+    pw_proxy *proxy = effects_playback_control_proxy;
+    write_stream_mute(reinterpret_cast<struct pw_node *>(proxy), true);
+    const uint64_t generation = ++output_gate_generation;
+    qInfo("gate_effects_output: muted for 150 ms (generation %llu)", static_cast<unsigned long long>(generation));
+    QTimer::singleShot(150, this, [this, proxy, generation]() {
+        if (!thread_loop)
+            return;
+        pw_thread_loop_lock(thread_loop);
+        if (generation != output_gate_generation.load(std::memory_order_relaxed) ||
+            effects_playback_control_proxy != proxy) {
+            pw_thread_loop_unlock(thread_loop);
+            return;
+        }
+        // Unmute at zero gain, then ramp up over ~100 ms. A hard unmute at a
+        // non-zero sample is audible as a click (measured 0.135 step with a
+        // continuous tone); the ramp keeps the track start smooth.
+        write_stream_volume(reinterpret_cast<struct pw_node *>(proxy), 0.0f);
+        write_stream_mute(reinterpret_cast<struct pw_node *>(proxy), false);
+        qInfo("gate_effects_output: fade-in start (generation %llu)",
+              static_cast<unsigned long long>(generation));
+        pw_thread_loop_unlock(thread_loop);
+        for (int step = 1; step <= 20; ++step) {
+            QTimer::singleShot(step * 5, this, [this, proxy, generation, step]() {
+                if (!thread_loop)
+                    return;
+                pw_thread_loop_lock(thread_loop);
+                if (generation == output_gate_generation.load(std::memory_order_relaxed) &&
+                    effects_playback_control_proxy == proxy) {
+                    write_stream_volume(reinterpret_cast<struct pw_node *>(proxy),
+                                        static_cast<float>(step) / 20.0f);
+                }
+                pw_thread_loop_unlock(thread_loop);
+            });
+        }
+    });
+    return true;
+}
+
+void PipeWireManager::fade_in_new_stream(uint32_t id) {
+    auto it = node_bindings.find(id);
+    if (it == node_bindings.end() || !it.value()->proxy)
+        return;
+    // While upmixing, the post-graph gate is the reliable place to suppress a
+    // new stream: the first samples may already be inside the 128 ms FreeSurround
+    // delay line before we discover the stream, so muting the source cannot
+    // remove them (measured). The gate also covers the previous track's delay
+    // line. Only fall back to the source mute when no gate is available.
+    if (gate_effects_output_locked()) {
+        qInfo("fade_in_new_stream: Node %u output-gated for 150 ms", id);
+        return;
+    }
+    write_stream_mute(reinterpret_cast<struct pw_node *>(it.value()->proxy), true);
+    qInfo("fade_in_new_stream: Node %u muted for 30 ms", id);
+    QTimer::singleShot(30, this, [this, id]() {
+        if (!thread_loop)
+            return;
+        pw_thread_loop_lock(thread_loop);
+        auto binding = node_bindings.find(id);
+        if (binding != node_bindings.end() && routed_node_ids.contains(id) && binding.value()->proxy)
+            write_stream_mute(reinterpret_cast<struct pw_node *>(binding.value()->proxy), false);
+        pw_thread_loop_unlock(thread_loop);
+    });
+}
+
 void PipeWireManager::route_default_streams() {
     if (!metadata || speaker_bypass.load(std::memory_order_relaxed))
         return;
@@ -727,6 +1407,9 @@ void PipeWireManager::route_default_streams() {
             continue;
         if (!stream_follows_default(id, it.value()->props_target))
             continue;
+        // New stream: start with 30 ms of silence so the physical-device-first
+        // block / bridge move cannot pop at the first sample of the track.
+        fade_in_new_stream(id);
         pw_metadata_set_property(metadata, id, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", capture_node_name.c_str());
         routed_node_ids.insert(id);
         attach_binding_listener(it.value());
@@ -795,6 +1478,7 @@ void PipeWireManager::decide_stream(uint32_t id, const string &props_target) {
     if (explicitly_ours || stream_follows_default(id, props_target)) {
         // This also redirects a stream manually assigned to the internal effects
         // sink to the stable bridge, so a later graph replacement cannot move it.
+        fade_in_new_stream(id);
         pw_metadata_set_property(metadata, id, PW_KEY_TARGET_OBJECT, "Spa:String:JSON", capture_node_name.c_str());
         routed_node_ids.insert(id);
         qInfo("decide_stream: Node %u routed to sink '%s'", id, capture_node_name.c_str());
@@ -1127,10 +1811,17 @@ void PipeWireManager::registry_event_global(void *data,
         return;
     if (node_name && strncmp(node_name, manager->playback_node_name_base, strlen(manager->playback_node_name_base)) == 0) {
         manager->internal_playback_ids.insert(id);
-        if (strcmp(node_name, manager->playback_node_name_base) == 0)
+        if (strcmp(node_name, manager->playback_node_name_base) == 0) {
             manager->bridge_playback_id = id;
-        else if (node_name == manager->effects_playback_node_name)
+        } else if (node_name == manager->effects_playback_node_name) {
             manager->effects_playback_id = id;
+            if (manager->effects_playback_control_proxy) {
+                pw_proxy_destroy(manager->effects_playback_control_proxy);
+                manager->effects_playback_control_proxy = nullptr;
+            }
+            manager->effects_playback_control_proxy =
+                static_cast<pw_proxy *>(pw_registry_bind(manager->registry, id, PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, 0));
+        }
         if (manager->link_wait_active.load(std::memory_order_relaxed))
             pw_thread_loop_signal(manager->thread_loop, false);
         return;
@@ -1212,6 +1903,12 @@ void PipeWireManager::registry_event_global_remove(void *data, uint32_t id) {
     manager->internal_capture_ids.remove(id);
 
     // Do not let stale IDs suppress metadata handling of future nodes reusing them
+    if (manager->effects_playback_id == id) {
+        if (manager->effects_playback_control_proxy) {
+            pw_proxy_destroy(manager->effects_playback_control_proxy);
+            manager->effects_playback_control_proxy = nullptr;
+        }
+    }
     if (manager->bridge_capture_id == id)
         manager->bridge_capture_id = SPA_ID_INVALID;
     if (manager->bridge_playback_id == id)
@@ -1252,7 +1949,8 @@ void PipeWireManager::attach_binding_listener(NodeBinding *binding) {
 }
 
 string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, bool upmix_enabled,
-                                                  const string &capture_name, const string &playback_name) {
+                                                  const string &capture_name, const string &playback_name,
+                                                  double output_trim_db, bool output_limiter) {
     if (hrir_wav_path.empty()) {
         qWarning("build_effects_module_args: No HRIR file provided");
         return {};
@@ -1261,24 +1959,45 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
     // The path is interpolated into the JSON module arguments, so escape it
     const string hrir_path = json_escape(hrir_wav_path);
 
-    // Generate the unit impulse IR for the LFE path: it renders LFE without HRIR
-    // coloring (equal L/R, no spatial processing) while keeping the convolver
-    // branch identical in IR length - and therefore in processing latency - to the
-    // convolved channels it sums with. Regenerated per HRIR for that reason.
-    const QString delta_file =
-        QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/lfe_bypass_delta.wav");
-    QDir().mkpath(QFileInfo(delta_file).absolutePath());
-    if (!write_lfe_bypass_delta(hrir_wav_path, delta_file.toStdString())) {
-        qWarning("build_effects_module_args: Could not create LFE bypass impulse for '%s'", hrir_wav_path.c_str());
-        Q_EMIT error_occurred(QStringLiteral("无法使用所选 HRIR。它必须是有效的 14 声道 HeSuVi WAV 文件（参见配置文件列表说明）。"));
-        return {};
+    // LFE impulse response. Default = the normalized diffuse-field pair; the
+    // options are the uncolored delta or the center HRIR pair. All keep the same
+    // IR length as the selected HRIR (see write_lfe_bypass_delta /
+    // write_lfe_diffuse_ir). Only the delta is strictly uncolored and equal-L/R;
+    // the diffuse and center variants deliberately apply HRIR-derived timbre.
+    const QString app_data = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    QDir().mkpath(app_data);
+    string lfe_conv_path;
+    string lfe_channel_l = "0";
+    string lfe_channel_r = "0";
+    if (lfe_timbre == LfeTimbre::CenterHrir) {
+        lfe_conv_path = hrir_path;
+        lfe_channel_l = "6";
+        lfe_channel_r = "13";
+    } else if (lfe_timbre == LfeTimbre::Diffuse) {
+        const QString diffuse_file = app_data + QStringLiteral("/lfe_diffuse_ir.wav");
+        if (!write_lfe_diffuse_ir(hrir_wav_path, diffuse_file.toStdString())) {
+            qWarning("build_effects_module_args: Could not create the diffuse LFE IR for '%s'", hrir_wav_path.c_str());
+            Q_EMIT error_occurred(QStringLiteral("无法为所选 HRIR 生成扩散场 LFE IR。"));
+            return {};
+        }
+        lfe_conv_path = json_escape(diffuse_file.toStdString());
+        lfe_channel_l = "0";
+        lfe_channel_r = "1";
+    } else {
+        const QString delta_file = app_data + QStringLiteral("/lfe_bypass_delta.wav");
+        if (!write_lfe_bypass_delta(hrir_wav_path, delta_file.toStdString())) {
+            qWarning("build_effects_module_args: Could not create LFE bypass impulse for '%s'", hrir_wav_path.c_str());
+            Q_EMIT error_occurred(QStringLiteral("无法使用所选 HRIR。它必须是有效的 14 声道 HeSuVi WAV 文件（参见配置文件列表说明）。"));
+            return {};
+        }
+        lfe_conv_path = json_escape(delta_file.toStdString());
     }
-    const string lfe_delta_path = json_escape(delta_file.toStdString());
-    const string lfe_channel_l = "0";
-    const string lfe_channel_r = "0";
 
-    // Align the LFE/send and main HRIR bass per preset (see lfe_alignment).
-    const LfeAlignment alignment = lfe_alignment(hrir_wav_path, 48000);
+    // Align the LFE/send and main HRIR bass per preset. The production path uses
+    // the configured low-pass/timbre and per-ear LFE delays/all-pass; the old
+    // lfe_alignment() is retained only as a reference implementation.
+    const LfeAlignment alignment = lfe_alignment_configured(hrir_wav_path, 48000, lfe_lowpass,
+                                                             lfe_timbre, lfe_per_ear_alignment);
 
     // The FreeSurround upmixer is only part of the graph while upmixing is enabled;
     // without it the graph inputs are the copy nodes directly and the bundled
@@ -1287,11 +2006,11 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
     string upmix_links;
     string graph_inputs = R"(  [ "copyFL:In" "copyFR:In" "copyFC:In" "copyLFE:In" "copyRL:In" "copyRR:In" "copySL:In" "copySR:In" ])";
 
-    // Low-frequency handling (2026-10-28). The LFE channel itself is always
-    // rendered uncolored through the normalized delta IR. The 120 Hz LR4 in
-    // that path has ~4.4 ms of group delay at 40-120 Hz, while every HRIR has
-    // its own low-frequency delay; lfe_alignment() compensates the difference
-    // with a delay on the main or LFE path. Without it the send and main bass
+    // Low-frequency handling (2026-10-28; defaults 2026-10-30). The LFE channel
+    // is rendered through the selected LFE timbre IR (diffuse-field by default).
+    // The 120 Hz BW4 in that path has several ms of group delay at 40-120 Hz,
+    // while every HRIR has its own low-frequency delay; lfe_alignment_configured()
+    // compensates the difference with a delay on the main or LFE path. Without it the send and main bass
     // partially cancel above 90 Hz (measured -95..-171 degrees), which is why a
     // louder send sounded worse instead of stronger.
     // - Balanced: mono sum of the seven full-range main channels, -6 dB into the
@@ -1301,41 +2020,126 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
     // - Impact: the same aligned send at 0 dB instead of -6 dB (6 dB more,
     //   i.e. 2x amplitude). It adds density and punch without the muddy broad
     //   shelf of the previous implementation.
-    const bool lfe_send = upmix_enabled && lfe_mode != LfeMode::Reference;
+    // A send is only safe when the post-alignment phase residual is small. The
+    // old code gated only the impact level and always added -6 dB for balanced;
+    // for presets without a usable delay fit that send can cancel the main bass
+    // (measured -4.6 dB at 40 Hz for AtmosRenderer-Far and -3.5 dB at 100 Hz for
+    // dtshx). Disable the send entirely in that case; impact additionally needs
+    // the tighter 15 deg bound for its 0 dB level.
+    const bool send_safe = lfe_send_safe(alignment);
+    const bool bass_aligned = lfe_impact_allowed(alignment);
+    const bool lfe_send = upmix_enabled && lfe_mode != LfeMode::Reference && send_safe;
     const string use_lfe = "0.0";
-    // A stronger send is only safe once the LFE/main bass phases are aligned;
-    // presets whose phase is not a clean delay (alignment skipped) keep the
-    // balanced level instead of risking more cancellation.
-    const double effective_phase_residual = alignment.allpass_valid ? alignment.allpass_residual_degrees
-                                                                     : alignment.average_residual_degrees;
-    const bool bass_aligned = alignment.valid && effective_phase_residual <= 15.0;
     const double send_db = (lfe_mode == LfeMode::Impact && bass_aligned) ? 0.0 : -6.0;
     const string send_gain_text = std::to_string(lfe_send ? std::pow(10.0, send_db / 20.0) : 0.0);
+    if (upmix_enabled && lfe_mode != LfeMode::Reference && !send_safe) {
+        qInfo("build_effects_module_args: LFE send disabled for this HRIR "
+              "(post-alignment residual %.1f deg > 30 deg)",
+              lfe_effective_residual_degrees(alignment));
+    }
     // The LFE output of the auto plugin carries either the native LFE (bypass
     // branch) or the stereo upmix branch's mono main-sum send. There is no
     // separate graph mixer: adding a send outside the plugin would also add it
     // to real multichannel content, doubling that content's bass.
-    string lfe_source_link = R"({ output = "copyLFE:Out" input="lfeLP1:In" })";
+    // Low-pass topology: fixed 120 Hz Butterworth-4 (24 dB/oct). The enum keeps
+    // the older LR4/8th-order shapes for the reference path.
+    const LfeLowpassSpec lpf = lfe_lowpass_spec(lfe_lowpass);
+    string lpf_nodes;
+    string lpf_chain;
+    for (int s = 0; s < lpf.sections; ++s) {
+        lpf_nodes += "        { type = builtin label = bq_lowpass name = lfeLP" + std::to_string(s + 1) +
+                     " control = { \"Freq\" = 120.0 \"Q\" = " + std::to_string(lpf.q[s]) + " } }\n";
+        if (s > 0)
+            lpf_chain += "        { output = \"lfeLP" + std::to_string(s) + ":Out\" input=\"lfeLP" +
+                         std::to_string(s + 1) + ":In\" }\n";
+    }
+    const string lpf_first = "lfeLP1";
+    const string lpf_last = "lfeLP" + std::to_string(lpf.sections);
+
+    string alignment_nodes;
+    string lfe_source_link = R"({ output = "copyLFE:Out" input=")" + lpf_first + R"(:In" })";
     string lfe_align_links;
     string lfe_phase_nodes;
-    string lfe_phase_links = R"(
-        { output = "lfeLP2:Out" input="gainLFE_L:In" }
-        { output = "lfeLP2:Out" input="gainLFE_R:In" }
+    string lfe_phase_links;
+    if (!alignment.per_ear) {
+        if (alignment.delay_lfe) {
+            lfe_source_link = R"({ output = "copyLFE:Out" input="delayLFE:In" })";
+            lfe_align_links = R"(
+        { output = "delayLFE:Out" input=")" + lpf_first + R"(:In" }
 )";
-    if (alignment.allpass_valid) {
-        lfe_phase_nodes = R"(
+            alignment_nodes += "\n        { type = builtin label = delay name = delayLFE config = { \"max-delay\" = 0.02 } control = { \"Delay (s)\" = " +
+                               std::to_string(alignment.seconds) + " } }\n";
+        }
+        if (alignment.allpass_valid) {
+            lfe_phase_nodes = R"(
         # Automatic all-pass phase correction for the LFE path (per HRIR).
         # Unity magnitude; only the low-frequency phase is rotated.
         { type = builtin label = bq_allpass name = apLFE control = { "Freq" = )" + std::to_string(alignment.allpass_freq) + R"( "Q" = )" + std::to_string(alignment.allpass_q) + R"( } }
 )";
-        lfe_phase_links = R"(
-        { output = "lfeLP2:Out" input="apLFE:In" }
+            lfe_phase_links = R"(
+        { output = ")" + lpf_last + R"(:Out" input="apLFE:In" }
         { output = "apLFE:Out" input="gainLFE_L:In" }
         { output = "apLFE:Out" input="gainLFE_R:In" }
 )";
+        } else {
+            lfe_phase_links = R"(
+        { output = ")" + lpf_last + R"(:Out" input="gainLFE_L:In" }
+        { output = ")" + lpf_last + R"(:Out" input="gainLFE_R:In" }
+)";
+        }
+    } else {
+        // Per-ear mode: one common main delay, independent LFE delays and
+        // all-pass sections for L/R. The low-pass stays shared.
+        const string delay_l = std::to_string(alignment.lfe_delay_l_seconds);
+        const string delay_r = std::to_string(alignment.lfe_delay_r_seconds);
+        if (alignment.lfe_delay_l_seconds > 0.0) {
+            lfe_phase_nodes += R"json(
+        { type = builtin label = delay name = delayLFE_L config = { "max-delay" = 0.02 } control = { "Delay (s)" = )json" +
+                               delay_l + R"json( } }
+)json";
+        }
+        if (alignment.lfe_delay_r_seconds > 0.0) {
+            lfe_phase_nodes += R"json(
+        { type = builtin label = delay name = delayLFE_R config = { "max-delay" = 0.02 } control = { "Delay (s)" = )json" +
+                               delay_r + R"json( } }
+)json";
+        }
+        if (alignment.allpass_l_valid) {
+            lfe_phase_nodes += R"(
+        { type = builtin label = bq_allpass name = apLFE_L control = { "Freq" = )" +
+                               std::to_string(alignment.allpass_l_freq) + R"( "Q" = )" +
+                               std::to_string(alignment.allpass_l_q) + R"( } }
+)";
+        }
+        if (alignment.allpass_r_valid) {
+            lfe_phase_nodes += R"(
+        { type = builtin label = bq_allpass name = apLFE_R control = { "Freq" = )" +
+                               std::to_string(alignment.allpass_r_freq) + R"( "Q" = )" +
+                               std::to_string(alignment.allpass_r_q) + R"( } }
+)";
+        }
+
+        auto per_ear_links = [&](const char *side, double delay_seconds, bool allpass_valid) {
+            const string gain = "gainLFE_" + string(side);
+            const string delay = "delayLFE_" + string(side);
+            const string ap = "apLFE_" + string(side);
+            string links;
+            const string first = allpass_valid ? ap : gain;
+            if (delay_seconds > 0.0) {
+                links += "        { output = \"" + lpf_last + ":Out\" input=\"" + delay + ":In\" }\n";
+                links += "        { output = \"" + delay + ":Out\" input=\"" + first + ":In\" }\n";
+            } else {
+                links += "        { output = \"" + lpf_last + ":Out\" input=\"" + first + ":In\" }\n";
+            }
+            if (allpass_valid)
+                links += "        { output = \"" + ap + ":Out\" input=\"" + gain + ":In\" }\n";
+            return links;
+        };
+
+        lfe_phase_links = "\n" + per_ear_links("L", alignment.lfe_delay_l_seconds, alignment.allpass_l_valid) +
+                          per_ear_links("R", alignment.lfe_delay_r_seconds, alignment.allpass_r_valid);
     }
 
-    string alignment_nodes;
     string main_input_links = R"(
         { output = "copyFL:Out"  input="convFL_L:In"  }
         { output = "copyFL:Out"  input="convFL_R:In"  }
@@ -1355,8 +2159,8 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
     if (alignment.delay_main) {
         const string delay_s = std::to_string(alignment.seconds);
         const string control = R"ctl( config = { "max-delay" = 0.02 } control = { "Delay (s)" = )ctl" + delay_s + R"ctl( } })ctl";
-        alignment_nodes = R"(
-        # Per-HRIR bass alignment (LR4 vs. HRIR low-frequency group delay)
+        alignment_nodes += R"(
+        # Per-HRIR bass alignment (low-pass vs. HRIR low-frequency group delay)
         { type = builtin label = delay name = delayFL )" + control + R"(
         { type = builtin label = delay name = delayFR )" + control + R"(
         { type = builtin label = delay name = delayFC )" + control + R"(
@@ -1383,17 +2187,45 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
     const char *mode_name = lfe_mode == LfeMode::Balanced ? "balanced"
                             : lfe_mode == LfeMode::Reference ? "reference"
                                                              : "impact";
-    qInfo("build_effects_module_args: LFE mode %s (upmix %s%s%s)", mode_name,
-          upmix_enabled ? "on" : "off", lfe_send ? ", bass send" : "",
-          alignment.delay_main ? ", main aligned" : alignment.delay_lfe ? ", LFE aligned" : "");
+    qInfo("build_effects_module_args: LFE mode %s (upmix %s%s%s%s), output trim %+.2f dB (outGain %.4f)",
+          mode_name, upmix_enabled ? "on" : "off", lfe_send ? ", bass send" : "",
+          lfe_mode == LfeMode::Impact && !bass_aligned ? ", impact falls back to -6 dB" : "",
+          alignment.delay_main ? ", main aligned" : alignment.delay_lfe ? ", LFE aligned" : "",
+          output_trim_db, 0.30 * std::pow(10.0, output_trim_db / 20.0));
+
+    QString plugin_path;
+    if (upmix_enabled || output_limiter)
+        plugin_path = find_ladspa_plugin();
+    if (upmix_enabled && plugin_path.isEmpty()) {
+        qWarning("build_effects_module_args: FreeSurround LADSPA plugin not found");
+        Q_EMIT error_occurred(QStringLiteral("未找到 FreeSurround 上混插件（freesurround_ladspa.so）。请重新安装本应用，或把插件复制到 /usr/lib/ladspa 等 LADSPA 目录。"));
+        return {};
+    }
+    const bool limiter_enabled = output_limiter && !plugin_path.isEmpty();
+    if (output_limiter && !limiter_enabled)
+        qWarning("build_effects_module_args: Output limiter requested but the LADSPA plugin is missing; limiter disabled");
+
+    string limiter_nodes;
+    string limiter_links;
+    string graph_outputs = R"( [ "outGainL:Out" "outGainR:Out" ])";
+    if (limiter_enabled) {
+        const string limiter_plugin = json_escape(plugin_path.toStdString());
+        limiter_nodes = R"json(
+        # Optional output safety limiter (stereo-linked, 5 ms lookahead,
+        # -1.5 dBFS threshold, 100 ms release). Transparent below threshold;
+        # adds 5 ms latency. The user can turn it off in Settings.
+        { type = ladspa name = limiter plugin = ")json" + limiter_plugin + R"json(" label = "output_limiter"
+          control = { "Threshold (dBFS)" = -1.5 "Release (ms)" = 100.0 "Lookahead (ms)" = 5.0 } }
+)json";
+        limiter_links = R"json(
+        { output = "outGainL:Out" input="limiter:In L" }
+        { output = "outGainR:Out" input="limiter:In R" }
+)json";
+        graph_outputs = R"( [ "limiter:Out L" "limiter:Out R" ])";
+        qInfo("build_effects_module_args: Output limiter enabled (-1.5 dBFS, 5 ms lookahead)");
+    }
 
     if (upmix_enabled) {
-        const QString plugin_path = find_ladspa_plugin();
-        if (plugin_path.isEmpty()) {
-            qWarning("build_effects_module_args: FreeSurround LADSPA plugin not found");
-            Q_EMIT error_occurred(QStringLiteral("未找到 FreeSurround 上混插件（freesurround_ladspa.so）。请重新安装本应用，或把插件复制到 /usr/lib/ladspa 等 LADSPA 目录。"));
-            return {};
-        }
         qInfo("create_virtual_surround_module: Using FreeSurround plugin '%s'", plugin_path.toStdString().c_str());
 
         // The plugin also runs in this process (the filter-chain module loads it
@@ -1457,21 +2289,15 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
         graph_inputs = R"(  [ "fs:In FL" "fs:In FR" "fs:In FC" "fs:In LFE" "fs:In RL" "fs:In RR" "fs:In SL" "fs:In SR" ])";
     }
 
-    if (alignment.delay_lfe) {
-        lfe_source_link = R"({ output = "copyLFE:Out" input="delayLFE:In" })";
-        lfe_align_links = R"(
-        { output = "delayLFE:Out" input="lfeLP1:In" }
-)";
-    }
-
     // LFE gain: native LFE content is recorded 10 dB low (70mm-film convention),
     // and HeSuVi's lfc.txt applies a 2x makeup. In binaural rendering the net
     // reference is +5.5 dB (10 dB speaker makeup minus 4.5 dB for the two-point-
-    // source headphone rendering), which 2x + the center-HRIR-normalized delta
-    // matches. The graph uses unity while upmix is enabled: the native LFE gets
-    // its 2x in the auto plugin's bypass branch (and the balanced send is already
-    // at its intended level); with upmix disabled only native LFE remains, so the
-    // graph applies the 2x itself.
+    // source headphone rendering); 2x + the center-normalized timbre IR targets
+    // it, and with BW4 measures +6.0 dB at 60 Hz (0.5 dB high). The graph uses
+    // unity while upmix is enabled: the native LFE gets its 2x in the auto
+    // plugin's bypass branch (and the balanced send is already at its intended
+    // level); with upmix disabled only native LFE remains, so the graph applies
+    // the 2x itself.
     const string lfe_gain = upmix_enabled ? "1.0" : "2.0";
     // Set 7.1 filter graph for virtual surround module, automatically creating playback and capture nodes
     const string filter_graph = R"(
@@ -1496,55 +2322,58 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
         # the speaker labels. Independently verified via the ITD and level
         # asymmetry of the IR files themselves (see "HRIR channel mapping" in
         # README.md) - do not "fix" these based on recordings.
+        # resample_quality = 14: PipeWire's convolver defaults to 4 when the IR
+        # file rate differs from the graph rate. Imported 44.1/96 kHz HeSuVi
+        # presets then get the highest-quality one-time IR resample; 48 kHz
+        # files are not resampled, so this costs nothing for the bundled set.
         { type = builtin label = convolver name = convFL_L config = { filename = ")" +
-                                    hrir_path + R"(" channel =  0 } }
+                                    hrir_path + R"(" channel =  0 resample_quality = 14 } }
         { type = builtin label = convolver name = convFL_R config = { filename = ")" +
-                                        hrir_path + R"(" channel =  1 } }
+                                        hrir_path + R"(" channel =  1 resample_quality = 14 } }
         { type = builtin label = convolver name = convSL_L config = { filename = ")" +
-                                        hrir_path + R"(" channel =  2 } }
+                                        hrir_path + R"(" channel =  2 resample_quality = 14 } }
         { type = builtin label = convolver name = convSL_R config = { filename = ")" +
-                                        hrir_path + R"(" channel =  3 } }
+                                        hrir_path + R"(" channel =  3 resample_quality = 14 } }
         { type = builtin label = convolver name = convRL_L config = { filename = ")" +
-                                        hrir_path + R"(" channel =  4 } }
+                                        hrir_path + R"(" channel =  4 resample_quality = 14 } }
         { type = builtin label = convolver name = convRL_R config = { filename = ")" +
-                                        hrir_path + R"(" channel =  5 } }
+                                        hrir_path + R"(" channel =  5 resample_quality = 14 } }
         { type = builtin label = convolver name = convFC_L config = { filename = ")" +
-                                        hrir_path + R"(" channel =  6 } }
+                                        hrir_path + R"(" channel =  6 resample_quality = 14 } }
         { type = builtin label = convolver name = convFR_R config = { filename = ")" +
-                                        hrir_path + R"(" channel =  7 } }
+                                        hrir_path + R"(" channel =  7 resample_quality = 14 } }
         { type = builtin label = convolver name = convFR_L config = { filename = ")" +
-                                        hrir_path + R"(" channel =  8 } }
+                                        hrir_path + R"(" channel =  8 resample_quality = 14 } }
         { type = builtin label = convolver name = convSR_R config = { filename = ")" +
-                                        hrir_path + R"(" channel =  9 } }
+                                        hrir_path + R"(" channel =  9 resample_quality = 14 } }
         { type = builtin label = convolver name = convSR_L config = { filename = ")" +
-                                        hrir_path + R"(" channel = 10 } }
+                                        hrir_path + R"(" channel = 10 resample_quality = 14 } }
         { type = builtin label = convolver name = convRR_R config = { filename = ")" +
-                                        hrir_path + R"(" channel = 11 } }
+                                        hrir_path + R"(" channel = 11 resample_quality = 14 } }
         { type = builtin label = convolver name = convRR_L config = { filename = ")" +
-                                        hrir_path + R"(" channel = 12 } }
+                                        hrir_path + R"(" channel = 12 resample_quality = 14 } }
         { type = builtin label = convolver name = convFC_R config = { filename = ")" +
-                                        hrir_path + R"(" channel = 13 } }
+                                        hrir_path + R"(" channel = 13 resample_quality = 14 } }
 
-        # LFE path: rendered without HRIR convolution (conventional headphone-virtualizer
-        # design for the LFE channel). Convolving with a unit impulse of the exact same
-        # length as the selected HRIR yields an uncolored, equal-L/R signal while keeping
-        # both convolver branches time-aligned (identical IR length -> identical latency)
+        # LFE path: convolved with the selected LFE timbre IR, all of the same length
+        # as the HRIR so both branches stay time-aligned. delta = unit impulse
+        # (uncolored, equal L/R); diffuse = 7-pair average; center = center HRIR
+        # pair. The last two deliberately apply HRIR timbre and may differ slightly
+        # between ears; only delta is the strict conventional LFE render.
         { type = builtin label = convolver name = convLFE_L config = { filename = ")" +
-                                        lfe_delta_path + R"(" channel = )" +
-                                        lfe_channel_l + R"( } }
+                                        lfe_conv_path + R"(" channel = )" +
+                                        lfe_channel_l + R"( resample_quality = 14 } }
         { type = builtin label = convolver name = convLFE_R config = { filename = ")" +
-                                        lfe_delta_path + R"(" channel = )" +
-                                        lfe_channel_r + R"( } }
+                                        lfe_conv_path + R"(" channel = )" +
+                                        lfe_channel_r + R"( resample_quality = 14 } }
 
-        # LFE path lowpass: 4th-order Linkwitz-Riley (two cascaded Butterworth biquads,
-        # in-phase flat recombination - the professional crossover standard) at 120 Hz,
-        # the Dolby LFE band limit (AVR "LPF of LFE" defaults to 48 dB/oct; 24 dB/oct
-        # keeps the phase rotation gentler). Then rendered through the normalized
-        # delta IR; gain is 2x for native LFE channels when the plugin is not in
-        # the chain, and 1x while the plugin's bypass branch applies the makeup
-        { type = builtin label = bq_lowpass name = lfeLP1 control = { "Freq" = 120.0 "Q" = 0.7071 } }
-        { type = builtin label = bq_lowpass name = lfeLP2 control = { "Freq" = 120.0 "Q" = 0.7071 } }
-)" + lfe_phase_nodes + R"(
+        # LFE path low-pass: fixed 120 Hz Butterworth-4 (Q=0.5412/1.3066, 24 dB/oct).
+        # At 120 Hz this is -3 dB, so the LFE is 3 dB hotter at 100-120 Hz than the
+        # earlier -6 dB LR4; that is the intended BW4 impact, not a level bug.
+        # The IR is the selected diffuse/delta/center LFE timbre IR; gain is 2x
+        # for native LFE channels when the plugin is not in the chain, and 1x
+        # while the plugin's bypass applies the makeup.
+)" + lpf_nodes + lfe_phase_nodes + R"(
         { type = builtin label = linear name = gainLFE_L control = { "Mult" = )" + lfe_gain + R"( } }
         { type = builtin label = linear name = gainLFE_R control = { "Mult" = )" + lfe_gain + R"( } }
 
@@ -1556,16 +2385,17 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
         # Output headroom, matching HeSuVi's level budget: its upmix matrix attenuates the
         # main channels (L=0.5*L, R=0.5*R, ...) so the 8 binaural channels can sum up
         # without clipping. Users compensate with the system volume, applied after here.
-        { type = builtin label = linear name = outGainL control = { "Mult" = 0.30 } }
-        { type = builtin label = linear name = outGainR control = { "Mult" = 0.30 } }
+        # The optional preset loudness match multiplies both channels by the same trim.
+        { type = builtin label = linear name = outGainL control = { "Mult" = )" + std::to_string(0.30 * std::pow(10.0, output_trim_db / 20.0)) + R"( } }
+        { type = builtin label = linear name = outGainR control = { "Mult" = )" + std::to_string(0.30 * std::pow(10.0, output_trim_db / 20.0)) + R"( } }
+)" + limiter_nodes + R"(
     ]
     links = [)" + upmix_links + R"(
         # input
         )" + main_input_links + R"(
         )" + lfe_source_link + R"(
         )" + lfe_align_links + R"(
-        { output = "lfeLP1:Out" input="lfeLP2:In" }
-        )" + lfe_phase_links + R"(
+        )" + lpf_chain + lfe_phase_links + R"(
         { output = "gainLFE_L:Out" input="convLFE_L:In" }
         { output = "gainLFE_R:Out" input="convLFE_R:In" }
 
@@ -1588,9 +2418,10 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
         { output = "convLFE_L:Out" input="mixL:In 8" }
         { output = "mixL:Out" input="outGainL:In" }
         { output = "mixR:Out" input="outGainR:In" }
+)" + limiter_links + R"(
     ]
     inputs  = )" + graph_inputs + R"(
-    outputs = [ "outGainL:Out" "outGainR:Out" ]
+    outputs = )" + graph_outputs + R"(
 }
         )";
 
@@ -1650,7 +2481,8 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
     return args;
 }
 
-bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled) {
+bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled,
+                                                     double output_trim_db, bool output_limiter) {
     if (!is_valid()) {
         Q_EMIT error_occurred(QStringLiteral("连接 PipeWire 音频服务失败。"));
         return false;
@@ -1668,7 +2500,7 @@ bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path
 
     pw_thread_loop_lock(thread_loop);
 
-    pw_impl_module *new_effects = load_effects_module_locked(hrir_wav_path, upmix_enabled);
+    pw_impl_module *new_effects = load_effects_module_locked(hrir_wav_path, upmix_enabled, output_trim_db, output_limiter);
     if (!new_effects) {
         effects_capture_node_name.clear();
         effects_playback_node_name.clear();
@@ -1701,9 +2533,10 @@ bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path
     return true;
 }
 
-bool PipeWireManager::replace_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled) {
+bool PipeWireManager::replace_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled,
+                                                      double output_trim_db, bool output_limiter) {
     if (!bridge_module)
-        return create_virtual_surround_module(hrir_wav_path, upmix_enabled);
+        return create_virtual_surround_module(hrir_wav_path, upmix_enabled, output_trim_db, output_limiter);
 
     if (!is_valid()) {
         Q_EMIT error_occurred(QStringLiteral("连接 PipeWire 音频服务失败。"));
@@ -1741,7 +2574,7 @@ bool PipeWireManager::replace_virtual_surround_module(const string &hrir_wav_pat
         return false;
     }
 
-    pw_impl_module *new_effects = load_effects_module_locked(hrir_wav_path, upmix_enabled);
+    pw_impl_module *new_effects = load_effects_module_locked(hrir_wav_path, upmix_enabled, output_trim_db, output_limiter);
     if (!new_effects) {
         effects_capture_node_name = old_capture_name;
         effects_playback_node_name = old_playback_name;
@@ -1896,13 +2729,15 @@ void PipeWireManager::destroy_pending_effects_locked() {
     pending_effects_destroy.clear();
 }
 
-pw_impl_module *PipeWireManager::load_effects_module_locked(const string &hrir_wav_path, bool upmix_enabled) {
+pw_impl_module *PipeWireManager::load_effects_module_locked(const string &hrir_wav_path, bool upmix_enabled,
+                                                            double output_trim_db, bool output_limiter) {
     const uint32_t new_generation = effects_generation + 1;
     const string generation = std::to_string(new_generation);
     const string capture_name = string(capture_node_name_base) + ".effects." + generation;
     const string playback_name = string(playback_node_name_base) + ".effects." + generation;
 
-    const string args = build_effects_module_args(hrir_wav_path, upmix_enabled, capture_name, playback_name);
+    const string args = build_effects_module_args(hrir_wav_path, upmix_enabled, capture_name, playback_name,
+                                                  output_trim_db, output_limiter);
     if (args.empty())
         return nullptr;
 
@@ -1923,6 +2758,7 @@ pw_impl_module *PipeWireManager::load_effects_module_locked(const string &hrir_w
     }
 
     effects_generation = new_generation;
+    graph_upmix_enabled.store(upmix_enabled, std::memory_order_relaxed);
     return new_module;
 }
 
@@ -2227,6 +3063,12 @@ void PipeWireManager::set_lfe_mode(LfeMode mode) {
     lfe_mode = mode;
 }
 
+void PipeWireManager::set_lfe_options(LfeLowpass lowpass, LfeTimbre timbre, bool per_ear_alignment) {
+    lfe_lowpass = lowpass;
+    lfe_timbre = timbre;
+    lfe_per_ear_alignment = per_ear_alignment;
+}
+
 int PipeWireManager::upmix_auto_state() const {
     if (!upmix_state)
         return -1;
@@ -2244,12 +3086,13 @@ PipeWireManager::HrirAnalysis PipeWireManager::analyze_hrir(const string &path) 
     result.reference_gain = gain;
     result.reference_gain_db = 20.0 * std::log10(gain);
 
-    const LfeAlignment alignment = lfe_alignment(path, 48000);
+    const LfeAlignment alignment = lfe_alignment_configured(path, 48000, lfe_lowpass, lfe_timbre,
+                                                              lfe_per_ear_alignment);
     if (!alignment.valid)
         return result;
 
     result.valid = true;
-    result.alignment_ms = alignment.seconds * 1000.0;
+    result.alignment_ms = (alignment.per_ear ? alignment.main_delay_seconds : alignment.seconds) * 1000.0;
     result.delay_main = alignment.delay_main;
     result.delay_lfe = alignment.delay_lfe;
     result.residual_degrees = alignment.residual_degrees;
@@ -2260,7 +3103,96 @@ PipeWireManager::HrirAnalysis PipeWireManager::analyze_hrir(const string &path) 
     result.allpass_q = alignment.allpass_q;
     result.allpass_residual_degrees = alignment.allpass_residual_degrees;
     result.allpass_worst_channel_degrees = alignment.allpass_worst_channel_degrees;
+    result.source_rate = alignment.source_rate;
+    result.resampled = alignment.source_rate != 48000;
+    result.per_ear_alignment = alignment.per_ear;
+    result.per_ear_values_valid = alignment.per_ear;
+    result.timbre = alignment.timbre;
+    result.main_delay_ms = alignment.main_delay_seconds * 1000.0;
+    result.lfe_delay_l_ms = alignment.lfe_delay_l_seconds * 1000.0;
+    result.lfe_delay_r_ms = alignment.lfe_delay_r_seconds * 1000.0;
+    result.average_residual_l_degrees = alignment.average_residual_l_degrees;
+    result.average_residual_r_degrees = alignment.average_residual_r_degrees;
+    result.worst_channel_residual_l_degrees = alignment.worst_channel_residual_l_degrees;
+    result.worst_channel_residual_r_degrees = alignment.worst_channel_residual_r_degrees;
+    result.allpass_l_valid = alignment.allpass_l_valid;
+    result.allpass_l_freq = alignment.allpass_l_freq;
+    result.allpass_l_q = alignment.allpass_l_q;
+    result.allpass_l_residual_degrees = alignment.allpass_l_residual_degrees;
+    result.allpass_l_worst_channel_degrees = alignment.allpass_l_worst_channel_degrees;
+    result.allpass_r_valid = alignment.allpass_r_valid;
+    result.allpass_r_freq = alignment.allpass_r_freq;
+    result.allpass_r_q = alignment.allpass_r_q;
+    result.allpass_r_residual_degrees = alignment.allpass_r_residual_degrees;
+    result.allpass_r_worst_channel_degrees = alignment.allpass_r_worst_channel_degrees;
+    result.send_safe = lfe_send_safe(alignment);
+    result.impact_allowed = lfe_impact_allowed(alignment);
+    result.level_db = hrir_level_db(path);
     return result;
+}
+
+double PipeWireManager::hrir_level_db(const string &path) const {
+    uint32_t channels = 0, rate = 0, block_align = 0, frames = 0;
+    uint16_t bits = 0, format_tag = 0;
+    size_t data_offset = 0;
+    if (!parse_wav_format(path, channels, rate, block_align, bits, format_tag, frames, data_offset))
+        return -1000.0;
+    const bool supported = (format_tag == 3 && bits == 32) ||
+                           (format_tag == 1 && (bits == 16 || bits == 24 || bits == 32));
+    if (channels != 14 || frames == 0 || rate == 0 || !supported)
+        return -1000.0;
+
+    QFile file(QString::fromStdString(path));
+    if (!file.open(QIODevice::ReadOnly))
+        return -1000.0;
+    const QByteArray data = file.readAll();
+    file.close();
+    if (data_offset + static_cast<size_t>(frames) * block_align > static_cast<size_t>(data.size()))
+        return -1000.0;
+
+    // A center-weighted binaural impulse response: the C pair plus half of the
+    // front pair. This follows how a centered source is distributed by the
+    // upmixer and gives a stable relative level for every preset.
+    std::vector<double> hl(frames), hr(frames);
+    for (uint32_t n = 0; n < frames; ++n) {
+        const double left = wav_sample(data, data_offset, block_align, format_tag, bits, n, 6);
+        const double right = wav_sample(data, data_offset, block_align, format_tag, bits, n, 13);
+        const double fl_l = wav_sample(data, data_offset, block_align, format_tag, bits, n, 0);
+        const double fl_r = wav_sample(data, data_offset, block_align, format_tag, bits, n, 1);
+        const double fr_l = wav_sample(data, data_offset, block_align, format_tag, bits, n, 8);
+        const double fr_r = wav_sample(data, data_offset, block_align, format_tag, bits, n, 7);
+        hl[n] = left + 0.5 * (fl_l + fr_l);
+        hr[n] = right + 0.5 * (fl_r + fr_r);
+    }
+
+    // 1/3-octave A-weighted energy. The absolute value is arbitrary; only the
+    // difference between presets is used.
+    double energy_sum = 0.0;
+    int bands = 0;
+    for (double f = 20.0; f <= 20000.0; f *= 1.2599210498948732) {
+        double re_l = 0.0, im_l = 0.0, re_r = 0.0, im_r = 0.0;
+        const double w = 2.0 * std::numbers::pi * f / static_cast<double>(rate);
+        for (uint32_t n = 0; n < frames; ++n) {
+            const double phase = w * static_cast<double>(n);
+            const double c = std::cos(phase);
+            const double s = std::sin(phase);
+            re_l += hl[n] * c;
+            im_l -= hl[n] * s;
+            re_r += hr[n] * c;
+            im_r -= hr[n] * s;
+        }
+        const double f2 = f * f;
+        const double ra = (12194.0 * 12194.0 * f2 * f2) /
+                          ((f2 + 20.6 * 20.6) * std::sqrt((f2 + 107.7 * 107.7) * (f2 + 737.9 * 737.9)) *
+                           (f2 + 12194.0 * 12194.0));
+        const double a_weight = std::pow(10.0, (20.0 * std::log10(ra) + 2.0) / 10.0);
+        const double energy = (re_l * re_l + im_l * im_l + re_r * re_r + im_r * im_r) / 2.0;
+        energy_sum += energy * a_weight;
+        ++bands;
+    }
+    if (bands == 0 || energy_sum <= 0.0)
+        return -1000.0;
+    return 10.0 * std::log10(energy_sum / static_cast<double>(bands));
 }
 
 uint64_t PipeWireManager::upmix_block_count() const {

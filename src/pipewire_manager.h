@@ -36,6 +36,20 @@ class PipeWireManager : public QObject {
     };
     void set_lfe_mode(LfeMode mode);
 
+    // Experimental low-frequency processing options (defaults reproduce the
+    // long-standing chain). They are exposed in Settings for A/B listening.
+    enum class LfeLowpass {
+        Lr4,          // current: two cascaded Q=0.7071 low-passes, -6 dB at 120
+        Butterworth4, // flat passband, -3 dB at 120, 24 dB/oct
+        Butterworth8, // flat passband, -3 dB at 120, 48 dB/oct (AVR-like)
+    };
+    enum class LfeTimbre {
+        Delta,      // current: uncolored normalized impulse
+        CenterHrir, // center HRIR pair, colored center-like LFE
+        Diffuse,    // diffuse-field average of the seven HRIR pairs
+    };
+    void set_lfe_options(LfeLowpass lowpass, LfeTimbre timbre, bool per_ear_alignment);
+
     //
     // Diagnostic result for one HRIR: the delta-IR normalization gain and the
     // per-preset LFE/main alignment delay. Used by the UI so imported presets
@@ -56,8 +70,52 @@ class PipeWireManager : public QObject {
         double allpass_q = 0.0;
         double allpass_residual_degrees = 0.0;
         double allpass_worst_channel_degrees = 0.0;
+        // Source WAV sample rate. The graph is always 48 kHz; a different rate
+        // is resampled at load time (quality 14), and the alignment above is
+        // already computed for the 48 kHz graph.
+        uint32_t source_rate = 0;
+        bool resampled = false;
+        // Whether adding the LFE send is safe for this preset. send_safe gates
+        // any send (30 deg post-alignment residual); impact_allowed gates only
+        // the 0 dB impact level (15 deg).
+        bool send_safe = false;
+        bool impact_allowed = false;
+        // A-weighted energy of the center-weighted binaural impulse response,
+        // used only for relative preset loudness matching.
+        double level_db = 0.0;
+        // Per-ear LFE alignment. In this mode the LFE path gets separate L/R
+        // delays and all-pass sections while the main path uses one common
+        // delay. per_ear_values_valid is false when the analyser returned no
+        // L/R values at all (the UI must show "—", not 0.00).
+        bool per_ear_alignment = false;
+        bool per_ear_values_valid = false;
+        LfeTimbre timbre = LfeTimbre::Diffuse;
+        double main_delay_ms = 0.0;
+        double lfe_delay_l_ms = 0.0;
+        double lfe_delay_r_ms = 0.0;
+        double average_residual_l_degrees = 0.0;
+        double average_residual_r_degrees = 0.0;
+        double worst_channel_residual_l_degrees = 0.0;
+        double worst_channel_residual_r_degrees = 0.0;
+        bool allpass_l_valid = false;
+        double allpass_l_freq = 0.0;
+        double allpass_l_q = 0.0;
+        double allpass_l_residual_degrees = 0.0;
+        double allpass_l_worst_channel_degrees = 0.0;
+        bool allpass_r_valid = false;
+        double allpass_r_freq = 0.0;
+        double allpass_r_q = 0.0;
+        double allpass_r_residual_degrees = 0.0;
+        double allpass_r_worst_channel_degrees = 0.0;
     };
     HrirAnalysis analyze_hrir(const string &path) const;
+
+    //
+    // Relative A-weighted level of one HRIR (center + half of FL/FR). Only
+    // differences between presets are meaningful; used by the optional preset
+    // loudness matching in the frontend.
+    //
+    double hrir_level_db(const string &path) const;
 
     //
     // The auto upmixer's current decision: 1 = stereo (upmixing), 0 = multichannel
@@ -94,7 +152,8 @@ class PipeWireManager : public QObject {
     // ("dirac delta") IR of the same length as the selected HRIR, matching the
     // conventional headphone-virtualizer design for the LFE channel.
     //
-    bool create_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled);
+    bool create_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled,
+                                        double output_trim_db = 0.0, bool output_limiter = false);
 
     //
     // Replaces only the effects graph behind the permanent bridge sink. Applications
@@ -104,7 +163,8 @@ class PipeWireManager : public QObject {
     // graph is destroyed only after the new link is observed.
     // Falls back to create_virtual_surround_module() when no device exists.
     //
-    bool replace_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled);
+    bool replace_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled,
+                                         double output_trim_db = 0.0, bool output_limiter = false);
 
     //
     // True while at least one of the streams routed to the virtual sink is running
@@ -161,6 +221,11 @@ class PipeWireManager : public QObject {
     uint32_t effects_generation = 0;
 
     LfeMode lfe_mode = LfeMode::Balanced;
+    // The former experiments are now the defaults: Butterworth 4th-order LFE
+    // low-pass, diffuse-field LFE IR and per-ear LFE alignment.
+    LfeLowpass lfe_lowpass = LfeLowpass::Butterworth4;
+    LfeTimbre lfe_timbre = LfeTimbre::Diffuse;
+    bool lfe_per_ear_alignment = true;
 
     // Handle and symbol of the LADSPA plugin's exported auto-detection state.
     // The filter-chain module loads the plugin in this process, so dlopen()
@@ -179,6 +244,13 @@ class PipeWireManager : public QObject {
     QSet<uint32_t> decided_streams;
     pw_impl_module *bridge_module = nullptr;
     pw_impl_module *effects_module = nullptr;
+
+    // Proxy for the effects playback node (the 2ch stream feeding the physical
+    // device). It lets us gate the post-graph output so a new track cannot
+    // leak its first samples or the previous track's delay-line residue.
+    pw_proxy *effects_playback_control_proxy = nullptr;
+    std::atomic<bool> graph_upmix_enabled{false};
+    std::atomic<uint64_t> output_gate_generation{0};
 
     // Replaced effects graphs stay alive for a short settle period after the bridge
     // has moved: WirePlumber updates its own link bookkeeping asynchronously, and a
@@ -324,6 +396,17 @@ class PipeWireManager : public QObject {
     void update_playing_state();
 
     //
+    // Mutes a freshly routed stream for a very short moment, then unmutes it.
+    // This masks the pop caused by a new stream starting on the physical device
+    // / being moved to the bridge at the first sample of a new track. It is not
+    // the old 2 s graph-swap silence: 30 ms, only on a newly routed stream.
+    //
+    void fade_in_new_stream(uint32_t id);
+    void write_stream_mute(struct pw_node *node, bool mute);
+    void write_stream_volume(struct pw_node *node, float volume);
+    bool gate_effects_output_locked();
+
+    //
     // Schedules destruction of a replaced effects graph. Callers must not hold the
     // thread loop lock.
     //
@@ -341,7 +424,8 @@ class PipeWireManager : public QObject {
     // generated.
     //
     string build_effects_module_args(const string &hrir_wav_path, bool upmix_enabled,
-                                     const string &capture_name, const string &playback_name);
+                                     const string &capture_name, const string &playback_name,
+                                     double output_trim_db, bool output_limiter);
 
     //
     // Builds the permanent bridge graph: an 8-channel sink that fans out to an
@@ -355,7 +439,8 @@ class PipeWireManager : public QObject {
     // thread loop lock held. Returns nullptr (and restores the previous names) on
     // failure.
     //
-    pw_impl_module *load_effects_module_locked(const string &hrir_wav_path, bool upmix_enabled);
+    pw_impl_module *load_effects_module_locked(const string &hrir_wav_path, bool upmix_enabled,
+                                               double output_trim_db, bool output_limiter);
 
     //
     // Loads the bridge module if it does not exist yet. Must be called with the
