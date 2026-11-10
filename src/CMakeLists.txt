@@ -12,6 +12,8 @@ target_sources(virtual-surround-manager
     main.cpp
     pipewire_manager.h
     pipewire_manager.cpp
+    hrir_wav.h
+    hrir_wav.cpp
     tray_icon.h
     tray_icon.cpp
 )

@@ -1,8 +1,178 @@
 # 项目手册（AGENTS.md）
 
-> **本文件是该项目唯一、最新的上下文文档**，合并了历代会话记录、决策依据与实测数据。
-> 面向未来的 LLM/协作者：先读完本文件再动手。发现内容与代码不一致时，以代码和新的实测为准，并更新本文件。
-> 最后更新：2026-10-30。
+> **本文件包含项目上下文及历史记录，不是正确性证明。** 2026-11-09 用户要求：不要完全信任接手前的文档或代码；以接口规范、实际实现与可复现实测为依据，冲突时更新记录。
+> 面向未来的 LLM/协作者：先阅读本文件；历史数据的适用版本必须区分。
+> 最后更新：2026-11-10（深夜：FFT 4096 回滚定稿 + 文档精简，见 §0F/§0G）。
+
+## 0. 2026-11-09～10 审查修复（优先于下方旧记录）
+
+### 工作授权
+- 明确的 bug、健壮性改进和必要重构直接实施，不必逐项询问；涉及音色/延迟等设计取舍才询问。
+- **不使用子智能体**（用户本轮明确要求）。测试不得干扰宿主音频；sudo/系统安装前仍须告知，不保存密码。
+- 下方“唯一真相”“已验证”等历史措辞不能代替新验证。本轮没有重新认可所有旧声学论断。
+
+### 实现更新
+- PipeWire 模块增加 destroy listener 和世代检查：模块自行销毁后清除 active/pending 引用，修复服务断开后退出 double-free。连接状态不再靠指针非空判断；断开后前端关闭启用状态，服务恢复后点击启用可重新连接。定时等待使用 PipeWire 的 deadline API。
+- 换图必须确认新输出链接和桥链接；失败回滚不销毁旧控制代理、不提前改变上混状态，不再“两边均未确认仍返回成功”。延迟销毁按模块身份/世代核验。
+- 新 `src/hrir_wav.{h,cpp}` 统一校验：14ch、完整 RIFF/fmt/data、帧布局、PCM16/24/32/float32、完整 EXTENSIBLE GUID；容器位深与有效位深分开，修复24有效位/32容器误读；拒绝NaN/Inf。所有音色（包括center）共用校验。10秒上限改为拒绝而非只截LFE，另设256MiB音频负载内存上限。
+- δ/diffuse中间IR统一float32、QSaveFile原子写入，不再逐tap夹到±1；参考幅度不再夹到0.05～1。默认系数/目标未主动调音；合法低电平/高峰值导入文件的行为会纠正。旧未调用的 `lfe_alignment()` 已删除；低通历史枚举仍在内部分析API，UI仍固定BW4/每耳。
+- DSP FIFO明确补足FFT块延迟，所有测过的块长/变块长上混与旁路均为6144样本。auto不再要求非L/R连续持续6144+crossfade样本，而是检测事件随音频延迟并保留一秒旁路迟滞；短事件不再全吞。20ms过渡仍会衰减新原生事件的开头，不能描述为任意瞬态逐样本无损。
+- 大块不再写16384帧临时数组；普通stereo latency端口接线修复；限幅在延迟后的实际立体声样本上守住ceiling，运行中控制生效，默认5ms/−1.5dBFS/100ms不变。
+- 换歌门控变为独立图节点 `gateL/gateR:Mult`（SPA_PROP_params），不再操作用户mute/volume，也不再源流静音回退。上混150ms、关闭上混30ms，之后100ms淡入；失效/换图/关闭时解除应用自己的门控。
+- 重载HRIR列表会实际换图（包括同路径文件更新），失败保留上一选择；重建前失效响度缓存，失败结果不永久缓存。空列表也允许关闭已启用音效。
+- 自启动原子写入/错误回滚，AppImage Exec转义，Flatpak portal完成回调；无可用托盘不隐藏主窗口；托盘切预设时延迟删除正在派发信号的QAction。后两种打包环境未做运行时集成验收。
+
+### 本轮证据
+- 基线原有测试通过，但新增探针复现：WAV fmt堆越界、断连double-free、NaN被接受、24-in-32参考0.25误读0.05、7ch center被接受；源流/输出用户mute被解除；列表显示B而仍运行A。
+- 基线上混冲激延迟：512块5632样本、1024块5120、4096块2048，而旁路6144；修后1/256/512/1000/1024/2048/4096/8192/16385/32768及混合块长逐样本一致，6144样本。
+- 基线约43ms中置burst输入峰0.25→输出0；修后峰0.25（原生LFE补偿2×）。限幅孤立脉冲输入10→1.006369、100→2.627524；修后均≤0.841395。
+- ASan断连回归修后exit0、valid0/enabled0；隔离服务重启后再次启用valid1/enabled1。源流与效果输出mute前后均true。center7ch拒绝。重载后effects generation1→2。
+- 图内门控用null-sink monitor录音：最大10ms窗RMS0.002331，最小0，16个静音10ms窗（量化约150ms门控）；录音Link快照留档。
+- 隔离假MPRIS+mpv：7次预设/上混切换（含24-bit HRIR）+正常退出，Pause0；强杀测试实例对照Pause1。该测试未做完整切换电平/音频空洞阈值统计，不把旧数据当本轮结果。
+- 仓库新增CTest：`hrir_wav`、`hrir_analysis`、`plugin_regression`、`plugin_smoke`，加原appstream共5项。命令：`cmake -B build -G Ninja -DBUILD_TESTING=ON -DBUILD_LADSPA_TEST_HOST=ON && cmake --build build && ctest --test-dir build --output-on-failure`。分析测试强制连接空的私人runtime，不连接宿主音频。
+- 临时复现源码/日志：`/tmp/vsm-audit-20261109-HOJMD2/`；原审查报告 `audit-report.md` 为修复前快照。临时工具构建/环境失败曾发生并已修正，不混淆为项目测试通过。
+
+### 待决策/未覆盖
+- **center_image 保持 no-op（2026-11-10 晚决定）**：0 与 1 输出逐样本相同；上游 FreeSurround、Kodi、Real3D-VST、旧提交都只保存该参数。2026-11-10 白天曾实现后处理，晚已按用户要求还原（§0D）。
+- 128ms目标延迟、上混开关重建带来的时间错位/灌注，以及延迟传播到应用端仍是设计/集成问题，不因本轮修复就宣称解决。
+- 未安装系统版本、未重启宿主音频或应用、未重新打包AppImage/Flatpak；未完成真实桌面托盘/portal测试。不会宣称已消除所有可能bug。
+
+
+## 0A. 2026-11-10 声学理论复核（理论解释以此及 docs/acoustics.md 为准）
+
+用户要求重新核实理论、科学和设计合理性。**下方§2～14为历史设计/测试记录，包含本轮已撤回的结论，不能继续当作当前科学依据。** 完整公式、数值、原始资料及限制见 `docs/acoustics.md`；可复跑脚本 `tools/analyze_acoustics.py`。
+
+### 撤回/修正的主张
+- 配置`diffuse`实际为**七方向HRIR相干平均**`ΣH/7`，不是物理扩散场功率平均`Σ|H|²/7`；UI更名但配置键和音色保持兼容。七个水平方向也不足以代表完整球面扩散场。
+- +5.5dB来自二手文章对特定Dolby双耳行为的转述，不是任意耳机/HRIR的通用校准；Apple官方LFE Off只表示不做距离建模。原生2×保留为产品数字增益约定，不再声称已达到普适标准。当前60Hz LFE/FC双耳功率比27_95 +6.008dB、AtmosFar +7.458dB。
+- δ仅“不加HRIR音色”，不是严格中性/耳机校准；完整通路仍有低通/全通/延迟/耳机响应。全通单位幅度不等于零群延迟或不可闻；默认全通20–120Hz群延迟约0.361～0.367ms。
+- 206样本是频带拟合延迟，不是每频率群延迟。BW4@120为−3.0103dB，24dB/oct是渐近斜率；相对LR4在80/100/120Hz为+1.40/+2.51/+3.01dB，不是整个频段固定+3dB。
+- 等权相干模型下HRIR相位抵消，不保证任意上混分布不抵消。实际插件9种输入关系×11频点测试，impact双耳功率增量可达27_95 +8.65dB、sbx100 +12.38dB；“固定增加3～6dB”撤回。balanced/impact是附加重复低频的听感效果，不是恢复真实LFE或标准分频。
+- 当前限幅是**采样峰值**，不是true-peak或听力保护；采样峰0.84可重建为1.18794。0.30固定余量也不保证任意相关多声道不削波。
+- `node.latency`只是建议，不保证minimum quantum；HRIR等长不保证相位/时延相同，0-block-latency卷积不表示整链零延迟。HRIR不自动包含当前耳机的校准响应；不可把“HRTF近似最小相位”推广为“相位均不可闻/可去掉ITD”。
+- 不能把reference称为普适“最耐听”，也不能以dBFS阈值保证可闻性；UI已删除这类客观化听感承诺。门控会丢失内容，也会影响共享效果图的其他流，是折中而非无损处理。
+
+### 本轮算法修正
+- 相位误差改为圆周RMS（359°等价−1°），仅斜率拟合解缠；全通目标也按圆周误差搜索，不再把正主值相位一概当作非因果。零幅度的相位未定义，不能视作0°通过；数值容差改为相对幅度，整体缩小HRIR不改变相位有效性。
+- 送量额外加入独立密集网格的最大参考相位≤90°检查（`cos φ≥0`的交叉项条件）；δ/中心按IR长度细化至≤min(1Hz,1/(4T))，3200万帧频点评估预算用尽则不通过。仍是参考筛查，不是对所有内容的安全证明。100ms纯延迟会在原10Hz网格整圈混叠，新测试能发现并禁止send。
+- 预设电平匹配改为**七路不相关等功率粉红噪声参考**的A计权输出功率积分，240个log中点、上限≤Nyquist；不再相干相加C/FL/FR。不是LUFS，也不保证节目等响。新默认列表27_95 trim约−2.00dB，开关仍默认关闭。
+- 共享HRIR频响计算使用复指数递推减少sin/cos重复计算；新增`src/acoustics.h`集中圆周相位与A计权公式。
+- 新回归：极性/相对纯延迟不变性、幅度减半−6.0206dB、低采样率Nyquist、极低电平相位有效性、零响应相位、≤180°圆周RMS及100ms延迟混叠。原五项CTest保持通过。
+
+### 验证边界与设计待定
+- 原始资料已核对：ITU-R BS.1770-5（K计权、节目门限、true-peak）、Apple Logic LFE Off、W3C EQ Cookbook、PipeWire本机官方手册/HeSuVi映射。不要扩大资料适用范围。
+- 数值目录：`/tmp/vsm-acoustics-20261110-72dUeg/`，含实际LADSPA探针、全部预设结果及原始资料（未把下载资料执行为代码）。没有改动宿主音频。
+- 固定grid仍可能漏窄峰，密集网格也不是连续域数学保证；正式保证需要定义输入集合或内容自适应方案。
+- BW4、原生2×、平均音色、0.30、20ms淡化、128ms预算未随意更换；它们是选择，不因不是唯一标准就必然错误。真正扩散场目标、true-peak限幅、原生LFE与合成send是否分开相位处理仍需设计决定；center_image 已决定保持 no-op（§0D）。
+
+## 0B. 2026-11-10 白天音质架构（**已被 §0C–§0G 多轮回滚，仅存架构要点**）
+
+本轮曾把上混 FFT 改为 2048/64 ms、删除合成 LFE send、实现搁架/功率平均 IR/center_image。这些低频改动已全部回滚（见 §0F/§0G）；**仍然有效并保留的架构要点**：
+
+- 稳定桥 sink + 可重建效果图 + 运行时 upmix_enable / lfe_send 控制（上混/LFE 模式切换不重建图）；换 HRIR/音色/电平匹配/限幅仍重建图，跨世代逐样本 crossfade 未实施。
+- 常驻 auto 插件（旁路分支补原生 LFE ×2）、图内 gateL/gateR 应用门控节点、输出重建峰限幅（8×/48-tap）、七路粉噪电平匹配、`hrir_wav` 统一校验、断连/世代处理。
+- 已知残留：图重建短 IR 空洞（现为 ~128–150 ms 灌注）、延迟传播到应用端仍是集成问题。
+- 性能：限幅检测器 ~1.8%（1 GHz 单核）。
+
+## 0C. 2026-11-10 晚 低频回归修正（已回滚，仅存教训）
+
+教训（对后续工作有效）：搁架/功率平均等"理论上更正确"的低频方案被用户听感否决——稳态 RMS 相同不代表听感相同，LFE 层的**立体声/时间结构**（相干平均 IR 时域重心 ~14 样本 vs 功率版 ~3.9）决定"劲感"。测量数据原记录已精简；方法：隔离会话同录音窗 A/B + IR 时频分析。
+
+## 0D. 2026-11-10 晚 还原 FreeSurround center_image/归一化（**现行**）
+
+用户要求：不要改动 FreeSurround，还原原版，`center_image` 保持未使用，同时尽量保证音质。
+
+### 上游核对
+
+- `tygyh/FreeSurround` `source/FreeSurroundDecoder.cpp`：`set_center_image()` 只写成员；`buffered_decode()` 不读取。
+- `kodi-adsp/adsp.freesurround` `src/FreeSurroundDecoder.cpp`：`SetCenterImage()` 只写 `m_CenterImage`；解码不读。
+- `NuoFang6/Real3D-VST` `Source/dsp/freesurround_decoder.cpp`：同样只写；头文件 `freesurround_decoder.h:155-161` 虽描述 1.0/0.0/0.7 语义，但实现是 no-op。
+- 本仓库旧提交 `f615312` 与上游一致：只保存，不使用。
+
+结论：**中心重分配和全局功率归一化是 2026-11-10 白天本 fork 新增的，不是 FreeSurround 原版行为。** 头文件的语义描述是未实现的意图。
+
+### 已还原
+
+- 删除 `buffered_decode()` 中的 C→FL/FR phantom 分配和“7 主声道总功率归一化”，恢复上游的
+  `signal[c][f] = polar(amp_total * 插值权重, phase)` 与原始声像/电平律。
+- graph 不再设置 `"center_image"`；LADSPA 端口保留兼容，但只存储、不参与 DSP。
+- 保留 fork 中与 FreeSurround 音质无关的适配：`set_sample_rate`、`flush`、LFE bin 清零、48k/44.1k 图；这些不改变上混语义。
+- LFE 路径为 **mono LFE send + 相干 diffuse IR + 每耳对齐/allpass**（§0F），不是 FreeSurround 解码器的一部分。
+
+### 验证
+
+- 上游解码器 + `lfe_send=0.501` + 相干 diffuse IR 与旧版 `f615312` 行为一致（§0F/§0G 实测：IR 218 帧、能量重心 ~14、balanced/reference 形状一致）。
+- `plugin_regression` 改为断言 `center_image=0` 与 `=1` 输出**逐样本相同**；`plugin_smoke` 的 440 Hz FC 期望回到上游的 **0.66**（不再是中心重分配后的 0.476）；CTest **5/5**。
+- 应用侧 sink 延迟随 FFT 回到 128 ms 量级（filter-graph 报主/LFE 分支平均；未重测具体值，需要时用 pw-dump 实测）。
+- 原生多声道 bypass 不加 send、无搁架。
+
+### 本机安装（2026-11-10 09:01）
+
+- 旧 `/usr/bin` 实例 PID 2990901 已 SIGTERM 正常退出；旧安装备份在 `/tmp/vsm-sys-backup-20261110-090118/`（旧 app `74288736…` 485096 B、旧 plugin `29e84a7a…` 379096 B）。
+- 安装新构建：`/usr/bin/virtual-surround-manager` = `21a21dbe…`（485368 B）、`/usr/lib/ladspa/freesurround_ladspa.so` = `268a33f2…`（366808 B）；`/usr/lib64` 是 `/usr/lib` 的符号链接，`/usr/lib64/ladspa` 读到同一哈希。
+- 启动安装版 PID 3033920：日志确认 `Using FreeSurround plugin '/usr/lib/ladspa/freesurround_ladspa.so'`、`LFE send balanced 0.501`、`main 3.92 ms / LFE 0.00/0.02 ms`、allpass 6.28 kHz Q 0.127、`Enabled routing`；HRIR 使用用户 `~/.local/share/virtual-surround-manager/hrir_wav/27_95_142.wav`。
+- 备份在 `/tmp`，非持久；长期回退需重新构建或保留该目录。
+
+### 影响与限制
+
+- 旧版的中心/声像律回来；不再宣称 `center_image` 已实现。若要按头文件语义真正实现，应在**通道分配表/网格**层面调整 C 权重，而不是事后 phantom；本轮不做。
+- `lfe_send` 的 0.501/1.0 与旧版一致，相干 diffuse IR 下与旧版电平匹配；若以后改上混 FFT 或 IR，需要重测（§0G 证据：FFT 尺寸对低频不是中性的）。
+- 旧 shelf 的主 HRIR 前置低频提升不再存在；用户听到的低频层来自独立 mono diffuse LFE，而不是前置 HRIR 抬高。
+
+## 0E. 2026-11-10 晚 LFE IR 结构修正（已整节回滚，见 §0F）
+
+曾实现 stereo hybrid IR（65% 相干 + 35% 方向功率，4096 帧）。用户判断低频被改废，全部回滚。教训：在相干平均上混幅度域只会损失旧版冲击；LFE IR 结构改动必须先用时频/包络证据而非纯 RMS 评估。
+
+## 0F. 2026-11-10 深夜 低频全部回滚（**低频行为现行；FFT 尺寸见 §0G**）
+
+用户判断 2026-11-10 的低频改动（白天功率平均 IR → 晚间 hybrid IR）全部失败，要求**低频全部回滚到大改前 `f615312` 的行为，只保留 bug 修复和错误纠正**。
+
+### 删除（低频专属）
+- `binaural_bass` LADSPA label（BassInstance/descriptorBass/kDescriptors 第四项）；`quality_dsp.h` 整个文件；`dsp_config.h` 的 `bass_taps/bass_latency/balanced_boost_db/impact_boost_db`。插件现在只有三个 label：`freesurround71`、`freesurround71_auto`、`output_limiter`。
+- `src/ir_processing.{h,cpp}`（energy_average_ir / diffuse_ir_pair / ir_response 模板化后保留在 pipewire_manager.cpp 内）；`src/CMakeLists.txt`、`tests/CMakeLists.txt`、两个测试的引用同步删除。
+- `plugin_regression_test` 的全部 bass 搁架测试（对称/非负频响/DC/HF/相位/latency）；`hrir_analysis_test` 的 energy_average 与 diffuse pair 测试。
+- 图中搁架节点（此前已不插入）及其残留注释。
+
+### 恢复（= f615312 低频行为）
+- `write_lfe_diffuse_ir`：**七对 HRIR 相干平均**（每耳 Σ/7），40–80 Hz（40/50/60/70/80 五点）平均幅度按中心 HRIR 参考增益归一化，2 声道 IR（convLFE_L/R 用 ch0/1）。实现改用保留的 `HrirWav` 统一校验 + float32/QSaveFile 原子写入（bug 修复保留，不改数值）。
+- `lfe_alignment_configured` 的 diffuse 分支恢复相干 timbre 响应（`Σ channel_resp/7 × scale`），因此默认 diffuse 下 HRIR 相位精确抵消、所有预设通过门控（27_95 实测 main 4.29 ms、残差 ~11.8°，见 §6 历史数据）。
+- **30°/15° send 门控**：`lfe_effective_residual_degrees`/`lfe_send_safe`/`lfe_impact_allowed` 恢复；balanced = 上混分支 mono 主声道和 ×0.501，impact ×1.0（>15° 退回 −6 dB，>30° 完全禁用）。
+- UI：diffuse 标签恢复"扩散场 HRIR"；Settings.qml/README/插件 README/docs/acoustics.md 同步回退为相干平均描述。
+
+### 相对 f615312 的小改进（有意保留）
+- 门控值在建图时持久化为 `lfe_send_balanced_`/`lfe_send_impact_`，运行时 `update_processing` 只能在两者间选择，不会把未门控的 send 写进未对齐的图（旧版运行时切换模式直接写常量）。
+- send/门控/对齐仍工作在现行图架构上（常驻 auto 插件 + 运行时 upmix_enable/lfe_send 控制、gate 门控节点、稳定桥），而不是旧图结构。
+
+### 保留的 bug 修复/错误纠正（不属于低频）
+auto 检测 crossfade/迟滞、`hrir_wav` 统一校验、断连/世代处理、输出门控、限幅（8× 重建峰）、电平匹配、`center_image` 上游 no-op 还原（§0D）、CTest 其余断言。（FFT 尺寸最初保留 2048，后经 §0G 证据回滚为 4096。）
+
+### 验证状态（2026-11-10 深夜回滚版）
+- Release CTest **5/5**（bass 搁架/energy-average 测试随删除；`hrir_analysis` 恢复相干 diffuse 后主 4.29 ms、残差 11.73°，与 f615312 历史值一致）。
+- 隔离 PipeWire/D-Bus/null sink e2e（27_95、diffuse、per-ear、立体声正弦 0.2）：balanced 相对 reference 双耳幅度 **40/60/80/100/120 Hz = +3.67/+3.67/+3.62/+3.36/+2.67 dB**（0.501 send 生效；形状与 §6 历史 f615312 的 +3.57/+3.18/+2.73/+2.07 一致，绝对值差异来自测量方法：本轮为单音正交解调，旧数据为多音 RMS）。日志 `LFE mode balanced (send 0.501, residual within 30 deg)`、all-pass `5790.06 Hz Q 0.143 (res 5.81°)`（旧版 5.8°）。这些测量在 FFT 2048 下进行；4096 下的全链路复测见 §0G。
+- 生成的 `lfe_diffuse_ir.wav`：**218 帧、2ch、float32**，L/R distinct，能量重心 **14.13** 样本（f615312 历史 ~14；hybrid 版为 4096 帧 mono 化结构）。
+- 极低电平（1e-12）相位有效性测试恢复通过：diffuse 增益下限由绝对 `1e-9` 改为 `>0` 相对判断（bug 修复保留语义）。
+
+### 本机安装（2026-11-10 深夜回滚版）
+- hybrid 安装版（PID 3050174 已不在运行）备份到 `/tmp/vsm-sys-backup-20261110-prerollback/`。
+- 安装：`/usr/bin/virtual-surround-manager` = `a4c3385c…`（485368 B）；`/usr/lib/ladspa` 与 `/usr/lib64/ladspa` 的 `freesurround_ladspa.so` = `3f144f40…`（366320 B），与 `build/bin` 一致。
+- 重启 `/usr/bin/virtual-surround-manager`：日志确认 send/对齐/路由正常；用户数据 `lfe_diffuse_ir.wav` 重新生成为 218 帧 2ch（相干平均）。（此轮安装为 FFT 2048 版 `a4c3385c…`，已被 §0G 的 4096 版取代。）
+- 测试残留：隔离会话守护进程（`PIPEWIRE_RUNTIME_DIR=/tmp/vsm_rb/run`）已按 environ 识别后精确清除，宿主 PipeWire 未动；宿主应用曾在此过程中被误杀一次并已重启（重启后日志核验正常）。
+
+## 0G. 2026-11-10 深夜 FFT 4096 回滚（**现行定稿**）
+
+用户 A/B 后判定：`v20261110-shelf`/`v20261110-power` 低频最差，`v20261110-rollback`（FFT 2048）仍不如 `v20261030` 的低频音色/细节。调查发现**唯一残留的低频相关差异是解码器 FFT 4096→2048**（当初为把上混延迟从 128 ms 减半到 64 ms 而改，作为"架构"保留了下来）。
+
+**证据**（离线 harness，同一 20–400 Hz 粉噪直接喂两版插件的 `freesurround71`，无 HRIR/无图）：
+- 2048 vs 4096：各通道 RMS 均匀 −0.24 dB，但 mono 主声道和 **20–120 Hz 各带 −4.0…−5.0 dB**、120 Hz 以上 ±0.2 dB。机理：23.4 Hz bin（2048）下 20–120 Hz 只剩 2–4 个 bin，逐 bin 幅度/相位差估计变粗，低频 7.1 分配与能量改变。send 内容与主路径低频都来自解码器，故整链低频质感变化（全链路实测整体 −3.1 dB）。
+- 4096 回滚后：每通道 RMS 比 0.9989（−0.01 dB 均匀），20–120 Hz 各带差 ≤±0.04 dB，latency 端口 6144。
+
+**实现**：`dsp_config.h` `fft_size` 2048→4096（`upmix_latency`=6144）；CT 测试断言文本去数值化；UI/README/插件 README/acoustics.md 的 2048/3072/64 ms 全部改回 4096/6144/128 ms。**保留的无影响改进**：图架构（常驻插件/运行时控制/门控节点）、hrir_wav 校验、限幅、电平匹配、send 门控持久化、center_image 上游 no-op、float32 IR 中间格式。
+
+**取舍**：上混延迟回到 **128 ms**（6144 样本），图重建短 IR 空洞相应变大（~128–150 ms）。这是音质优先的用户决策，不要为了延迟再改回 2048 而不重测低频。
+
+**验证/部署**：CTest **5/5**；隔离冒烟 `上混FFT 4096 / 128 ms`、`LFE mode balanced (send 0.501…)`、Enabled routing。同录音 8ch 双脉冲/频域复核：关闭对齐时主−LFE−48000 = −201 样本、20–120 Hz 圆周 RMS 108.64°；启用后为 −9 样本、左右耳均 5.81°，与建图预测完全一致。安装 `/usr/bin/virtual-surround-manager` = `832df0e4…`、`/usr/lib(64)/ladspa/freesurround_ladspa.so` = `57c5123b…`（485368 B 应用 / 366320 B 插件）；应用已重启（4096 版）。版本库：`v20261110-rollback` 更新为 4096 版；原 2048 回滚版保留为 `v20261110-fft2048` 供 A/B。**文档精简**：删除 `docs/acoustics-measurements.json`、`docs/acoustics-upmix-measurements.json`、`tools/upmix_acoustics_probe.cpp`（早期审计数据，非当前测量）；§0B/0C/0E 压缩为教训摘要；`docs/acoustics.md` 全文刷新为当前架构与本轮数据。
+
+**版本切换工具**：`~/.local/bin/vsm-version`（`list/current/stop/start/<name>`），版本库 `~/.local/share/virtual-surround-manager/versions/`：`v20261030`（旧版）、`v20261110-fft2048`、`v20261110-shelf`、`v20261110-power`、`v20261110-hybrid`、`v20261110-rollback`（4096 现行）。切换会 sudo 安装应用+插件并重启应用。注意：切换脚本只换二进制；`lfe_diffuse_ir.wav` 由建图时自动重新生成，无需手动清理。
 
 ## 1. 项目概况
 
@@ -10,9 +180,11 @@
 - **功能**：创建 PipeWire filter-chain 虚拟 8 声道 sink（7.1），可选 FreeSurround 上混，然后经 HeSuVi 14 通道 HRIR 卷积做耳机双耳渲染，输出 2 声道。
 - **用户背景（重要）**：本仓库用户是 **Real3D-VST 的作者**（基于 FreeSurround 改写的插件，网上搜不到）。历史上 80/111 Hz 的分频值出自用户本人，非外部权威；现已改为 70/90（见 §3）。
 - **构建**：`cmake -B build -G Ninja && cmake --build build`，安装前缀 `/usr`（`sudo cmake --install build --config Release`）。启动方式见 §9。
-- **关键源码**：`src/pipewire_manager.cpp`（稳定桥 sink + 可重建效果图：`create_virtual_surround_module`、`replace_virtual_surround_module`、`build_bridge_module_args`、`build_effects_module_args`、`find_ladspa_plugin`、`write_lfe_bypass_delta`、`parse_wav_format`）、`src/frontend_manager.cpp`（配置与 Q_PROPERTY）、`src/qml/Settings.qml`、`third_party/freesurround_ladspa/`（LADSPA 插件，双 label：`freesurround71` 与 `freesurround71_auto`）。
+- **关键源码**：`src/pipewire_manager.cpp`（稳定桥 + 可重建效果图 + LFE/主路径对齐 + send 门控）、`src/frontend_manager.cpp`（配置/Q_PROPERTY/状态文本）、`src/qml/Settings.qml`、`src/hrir_wav.{h,cpp}`（14ch WAV 校验）、`src/acoustics.h`、`third_party/freesurround_ladspa/`（三个 label：`freesurround71`、`freesurround71_auto`、`output_limiter`；`dsp_config.h` 集中 FFT/延迟/send 常数）、`tests/`（CTest）。
 
-## 2. 当前信号链与参数（唯一真相）
+## 2. 历史信号链与参数（2026-10；已被 §0D–§0G 取代）
+
+> 本节及 §4、§12–14 是 2026-10-31 的历史快照。**当前实现以 §0D–§0G、代码与测试为准**（2026-11-10 定稿：4096 FFT/128 ms、mono LFE send + 30°/15° 门控、相干 diffuse IR）。
 
 ### 输入端（虚拟 sink，2026-10-28 起是永久稳定桥）
 | 项 | 值 | 说明 |
@@ -34,7 +206,7 @@
 ### 上混（可选，FreeSurround，label `freesurround71_auto`）
 | 控制 | 值 | 出处 |
 |---|---|---|
-| center_image | 0.7 | FreeSurround/Real3D 作者默认 |
+| center_image | 0.7（未使用） | 上游只保存不读；graph 已不设置（§0D） |
 | shift / focus | 0.0 | 同上 |
 | depth / front_sep / rear_sep | 1.0 | 同上 |
 | circular_wrap | 90.0 | 同上 |
@@ -332,21 +504,26 @@ Copy:    L0=LVI R1=LVI SL0=SLVI SR1=SLVI RL0=RLVI RR1=RLVI C0=CVI
 | 44.1k BW4+diffuse+per-ear | 图加载 | source 44100 / graph 48000，main 4.29 ms，11.73/11.73° | ✅ |
 | 定稿默认（BW4+diffuse+per-ear） | 新默认图加载、送量正确 | `lfe_experiment: lowpass butterworth4 timbre diffuse per-ear`；27_95 main 4.29 ms、LFE 0/0、11.73/11.73°；60 Hz RMS 0.02755、120 Hz 0.02469 | ✅ §4-29 |
 
-## 7. 已知问题与优化清单（按优先级）
+## 7. 已知问题与优化清单（2026-11-10 更新）
 
 **真问题**
-1. **上混延迟 128 ms**（FreeSurround 固有）——对游戏/交互是硬伤。方向：直通路径免延迟（需迟滞防抖）、缩小 FFT 块 4096→2048（需听感验证）。2026-10-30 的自动切换 wait+crossfade 已解决硬切换的 click/中置空洞，但不降低 128 ms 本身。
-2. **延迟未传播到 sink 输入端口**——应用侧（mpv 等）看到 0 → 音画同步风险。输出端口有 6144（开启输出限幅时另加 240），输入端口 0。疑似 PipeWire filter-chain 传播限制，可尝试上报上游；播放时复测确认。
+1. **上混延迟 128 ms**（4096 FFT / 6144 样本，§0G 定稿；2048/64 ms 方案因低频质感被回滚）。自动切换 wait+crossfade 已消除硬切换 click/中置空洞。
+2. **延迟上报**——filter-graph 报主/LFE 分支延迟的平均，不是最大分支（历史实测方法见本行旧记录；FFT 回滚后需按新延迟重测）。
+3. **图重建的 ~128–150 ms 空洞**（换 HRIR/音色/限幅/电平匹配时，短 IR）：新图需填满 6144 样本上混 + 对齐延迟灌注；旧图只有短 IR 尾巴。上混/模式切换已不重建图。跨世代逐样本 crossfade 未实施。
 
 **已关闭的疑虑**
-- "卷积器内部延迟未上报"：**PipeWire ≥1.4 的 convolver 是 0-latency 两段式 FFT 卷积**（小 FFT 处理头部 + 大 FFT 处理长尾，官方 1.4 release notes），不存在需要上报的卷积器延迟。实测互相关 −1 样本亦印证。唯一未传播到输入端口的是 LADSPA 的 128 ms（输出端口已报 6144）。
+- "卷积器内部延迟未上报"：PipeWire ≥1.4 convolver 是 0-latency 两段式 FFT 卷积，不存在需要上报的卷积器延迟。实测互相关约 −1 样本。
 
-**已关闭的问题（2026-10-30）**
-- **未对齐 HRIR 的 balanced send 抵消低频**：新增 send 安全门控（任何 send ≤30°，impact 0 dB ≤15°）。AtmosFar/dtshx 现在不加 send；27_95/Apple 不受影响（§4-28）。
-- **自动立体声↔多声道的硬切换**：等待旁路延迟线 + 20 ms 逐样本 crossfade。旧 1 kHz 中置测试的 85 ms 中置空洞、0.26 采样跳变、+5.5 dB 跳变已消失（§4-28）。
-- **非 48k HRIR 的对齐/重采样**：对齐/全通按 48k 图设计，HRIR 按自身采样率测相位；卷积器 q14；44.1k 图正常（§4-28）。
-- **换预设响度跳变**：可选 A 计权中位电平匹配（默认关闭，±8 dB，只改 outGain）（§4-28）。
-- **impact 极值可能削波**：可选立体声联动 lookahead 限幅（默认关闭，5 ms/−1.5 dBFS/100 ms）（§4-28）。
+**已关闭的问题（2026-11-10）**
+- **LFE/主路径相位对齐丢失**：新图最初用固定 512 延迟，导致 27_95 的低频 LFE 晚约 3.9 ms。现按实际音色 IR + BW4 在 20–120 Hz 拟合，主路径公共延迟 + LFE 每耳延迟 + 可选 allpass；两脉冲验证从 −160 样本改善到 +10 样本，60 Hz 相干和误差 0.2%。
+- **合成 LFE send 的相消/重复低频**（2026-11-10 白天历史，已被 §0C 取代）：当时删除 send，改为 `1+boost·|P|²` 搁架；2026-11-10 晚因听感偏弱/偏前恢复 send（仅上混分支），并保留功率平均 IR + 每耳对齐/allpass。
+- **扩散场音色实际是相干平均**：2026-11-10 白天改为 14 通道功率平均的最小相位实现；同日晚因听感偏 mono/前置，改为 stereo hybrid（§0E）；δ/center 仍可选。
+- **center_image 是 no-op**：2026-11-10 白天曾实现 constant-power 中置分配 + 总功率归一化；2026-11-10 晚已按用户要求还原为 upstream no-op（§0D）。
+- **sample-peak 限幅不是重建峰**：现为 8×/48-tap 多相重建峰检测；独立 32×/128-tap 测试 12k/23k/方波均 ≤约 0.84。
+- **bass/limiter 的逐 tap 取模开销**：改为双写线性窗口 + 连续点积；1 GHz powersave 下 bass 9.7%、limiter 1.8%，满频约 2–4%/<1%。
+- **非 48k HRIR 的对齐/重采样**：对齐按文件时间轴、BW4 按 48k 图；卷积器 q14；44.1k 图正常。
+- **换预设响度跳变**：可选 A 计权中位/参考电平匹配（默认关闭，±8 dB，只改 outGain）。
+- **impact 极值可能削波**：可选立体声联动 lookahead 限幅（默认关闭，5 ms/−1.5 dBFS/100 ms）。
 
 **已定稿（2026-10-30 用户试听/指定）**
 - 低频固定为 **BW4 + 每耳对齐**；LFE 音色可选 **diffuse（默认）/ delta / center**。旧的 LR4/BW8 与共耳选项及配置键已删除（§4-29）。
@@ -369,11 +546,8 @@ Copy:    L0=LVI R1=LVI SL0=SLVI SR1=SLVI RL0=RLVI RR1=RLVI C0=CVI
 
 **准问题（生态固有）**
 5. HRIR 预设是特定耳机测量，通用预设对任意耳机是近似。
-6. **上混 ON→OFF 的 128 ms 重叠 / OFF→ON 的短 IR 缺口**：
-   - ON→OFF：旧效果图的 FreeSurround 延迟线在新图开始输出后还会把最后 128 ms 音频放完，与新图实时输出叠加。实测峰值 **1.5–2.3× 基线（+3.5~+7 dB，相位相关，低于 3× 尖峰阈值）**，听感是短暂的"双声/隆起"，不是原来的持续 +10.5 dB 跳变。
-   - OFF→ON：新图需要 FreeSurround 的 128 ms 延迟线灌注；旧图（上混关）没有这条延迟线，只有 HRIR 尾巴。长 HeSuVi IR（~1 s）能覆盖；**短 IR（如 `27_95_142.wav`，4.5 ms）实测有 90 ms 静音**（§4-21）；本轮带对齐 delay 的切换实测仍会出现约 30–220 ms 的短下陷（随预置/系统负载变化），属于同一类灌注缺口。
-   - 自动内容类型切换（插件内 bypass↔upmix）已不是这个问题：2026-10-30 改为 wait+crossfade。**纯中置的 5.1 流在 L/R 静音时仍会有 kLatency 级空洞**，因为上混分支无内容可合成；正常 L/R 内容无空洞。彻底消除需要双效果图交叉淡化（会引入 128 ms 时间错位/回声）或切换时主动短静音；当前未实施。
-   - 缩小 FFT 4096→2048 可把上述 128 ms、90 ms 和 A/V 延迟都减半，但会改变 FreeSurround 的空间/低频分辨率；仍需用户试听决定。
+6. **图重建的短 IR 空洞**：换 HRIR/音色/限幅/电平匹配时，新图需要 6144 样本上混 + 对齐延迟灌注；短 IR（如 `27_95_142.wav`）约 128–150 ms 空洞（4096 FFT 后按比例增大）。上混开关/LFE 模式已是运行时控制，不再重建图。自动内容类型切换（插件内 bypass↔upmix）有 20 ms crossfade；纯中置 5.1 流在 L/R 静音时仍有 kLatency 级空洞。彻底消除需要双图并行/跨世代 crossfade，当前未实施。
+7. HRIR 滤波器本身的低频群延迟/音色随预置变化；对齐只保证等权相干参考，不保证任意权重。
 
 **优化想法（未实施）**
 7. 内置扬声器/耳机共用模拟输出时，用设备当前 Route/Port 精确区分（目前只按 form-factor=internal）。社区做法：HeSuVi/EqAPO 用户将 Preamp 调到 **Peak gain ≈ −0.1 dB**（按 IR 峰值校准），而我们的 0.30 固定值恰好等于"预留 10 dB headroom（×0.3）"的经验法则——可作为可选的自适应 preamp。
@@ -395,6 +569,7 @@ Copy:    L0=LVI R1=LVI SL0=SLVI SR1=SLVI RL0=RLVI RR1=RLVI C0=CVI
   - 隔离 PipeWire + null sink 验收（2026-10-28）：AppImage 内创建 `effect_input.virtual-surround-manager` 与 `….effects.1`；LADSPA 从 AppImage 的 `/usr/lib/ladspa` 加载；1 kHz 立体声被识别为“检测到立体声，上混已生效”；录音 RMS 0.03819、峰值 0.05585，与 AppDir 运行一致。上混关闭路径 RMS 0.02904。完整运行日志无缺库/启动错误。
   - 旧 `virtual-surround-manager-15fb76f-x86-64-v3.AppImage`（201 MB）构建于 LFE 重构之前，早于稳定桥/24-bit δ IR 修复，**不要再分发**。
 - 应用配置：`~/.config/virtual-surround-manager`（**单文件**，非目录；`lfe_mode=balanced|reference|impact`、`lfe_timbre=diffuse|delta|center`（默认 diffuse；旧 `lfe_lowpass`/`lfe_per_ear_alignment` 启动时删除）、`preset_level_match=false|true`、`output_limiter=false|true`）；HRIR 用户目录：`~/.local/share/virtual-surround-manager/hrir_wav/`；LFE 音色 IR：`~/.local/share/virtual-surround-manager/lfe_bypass_delta.wav`（δ，每次建图重新生成）、`lfe_diffuse_ir.wav`（扩散场，仅 `lfe_timbre=diffuse` 时生成；中心音色直接用 HRIR）。
+- **用户 HRIR 生成参数（27_95_142 / LR20260404）**：完整记录、来源截图、生成设置与 SHA-256 在 `docs/hrir/27_95_142/README.md` 和 `parameters.json`。2026-04-04 输入：`x1=14.0`、`x3=20.0` cm，`Input left ear only` 未勾选；`dL=1.94/0.43/1.92/6.41/0.56/1.30`，`dR=1.75/0.45/1.64/5.55/0.60/1.20`。不要与 2026-01-09 HRTF1 的 `x1=14.5`/`x3=19.5`/left-only 旧参数混用；0/95/265 通道可逐样本复现，27/142/333/218 依赖 MATLAB 专有 `interpolateHRTF`（最近邻+1 样本近似 0.984–0.996）。
 
 ## 9. 测试方法与环境速查
 
@@ -402,7 +577,7 @@ Copy:    L0=LVI R1=LVI SL0=SLVI SR1=SLVI RL0=RLVI RR1=RLVI C0=CVI
 - **隔离测试**：`pactl load-module module-null-sink sink_name=vsm_test_sink` → `pactl set-default-sink` → 重启应用（filter-chain 在创建时连默认设备）→ 测完恢复默认设备并卸载 null sink。
 - **录音**：必须用 `parec --device=vsm_test_sink.monitor --format=float32le --rate=48000 --channels=2 --raw` 走管道读固定字节数（timeout/SIGTERM 会截断 wav 文件）。`pw-record` 无法按名字连接 monitor，且目标不匹配会静默录麦克风——**务必先验证连接**（`pw-dump` 查 Link 对象确认）。
 - **测试信号**：8ch WAV，WAVEFORMATEXTENSIBLE + PCM(0x0001) 16-bit，通道掩码 0x63F；往返校验电平。
-- 项目自带：`ctest --test-dir build`（目前只有 appstream）；插件回归（必需，覆盖 auto 切换/wait+crossfade、中置连续性、稳态 block step、LFE 补偿与 send、输出限幅）：`cmake -B build -DBUILD_LADSPA_TEST_HOST=ON && cmake --build build --target freesurround_ladspa_test && ./build/bin/freesurround_ladspa_test build/bin/freesurround_ladspa.so`，期望 `OK (0 failures)`（440Hz→FC 0.66、60Hz→LFE 0.719、切换块无零、中置 min 0.0627、无 click、原生 LFE 2.0、FC 1.0、upmix send = 0.5×主和、limiter latency 240/hot 0.841/quiet 0.0841）。注意：**系统 `/usr/lib/ladspa` 必须安装与 `build/bin` 同批的插件**，否则 filter-chain 会在新 label（如 `output_limiter`）上报 “cannot create label”。
+- 项目自带：`cmake -B build -G Ninja -DBUILD_TESTING=ON -DBUILD_LADSPA_TEST_HOST=ON && cmake --build build && ctest --test-dir build --output-on-failure`（5 项：appstream、hrir_wav、hrir_analysis、plugin_regression、plugin_smoke）。`plugin_regression_test` 现在覆盖：任意/变块长、短原生事件、限幅脉冲/联动/阈值/最小 lookahead、bass 对称/非负频响/DC 增益/HF 单位增益/相位、独立 32× 重建峰（12k/23k/方波）、center_image no-op、auto 切换。ASan/UBSan 用同配置加 `-fsanitize=address,undefined`，约 372 s。注意：**系统 `/usr/lib/ladspa` 必须安装与 `build/bin` 同批的插件**，否则 filter-chain 会在新 label（`output_limiter`/`binaural_bass`）上报 “cannot create label”；`find_ladspa_plugin()` 现在要求这四个 label 都存在。
 - **端到端隔离播放（2026-10-30）**：`dbus-run-session` + `pipewire/wireplumber/pipewire-pulse` + null sink + `build/bin/virtual-surround-manager`；`paplay --volume=65536 --device=effect_input.virtual-surround-manager tone.wav`（**必须显式 volume**：隔离 Pulse 的 stream-restore 可能把 paplay 恢复到 0%，会误判成应用静音）；`parec --device=vsm_test_sink.monitor ...`。27_95 balanced/440 Hz 实测 RMS 0.018020、peak 0.027624，限幅开/关一致。
 - **44.1k HRIR 测试**：`ffmpeg -i 27_95_142.wav -af aresample=44100:resampler=soxr:precision=28 -c:a pcm_f32le 27_95_44k.wav` 放入隔离 `XDG_DATA_HOME/virtual-surround-manager/hrir_wav/`；应用日志应出现 `source 44100 Hz, graph 48000 Hz`、`fit 3.98 ms`、`all-pass 11066.6 Hz Q 0.143`；δ 文件为 44.1 kHz，图正常加载。
 - **LFE 定稿默认测试（2026-10-30）**：配置只写 `lfe_timbre=diffuse|delta|center`（不写时默认 diffuse）。日志应出现 `lfe_experiment: ... lowpass butterworth4 timbre diffuse per-ear, main ... ms, LFE L ... / R ... ms, residual L ... / R ... deg`；启动后分析行应直接显示正确 LFE 送量（不再是“上混关闭”）。27_95 默认 60 Hz 端到端 RMS 0.02755、120 Hz 0.02469。`/tmp/vsm_exp_case.sh`（图）与 `/tmp/vsm_exp_e2e.sh`（60/120 Hz 录音）可复跑；换歌爆音的隔离测试用 `/tmp/vsm_song_change.sh`（upmix 开启时日志应出现 `gate_effects_output: muted for 150 ms` 与 `fade-in start`，而不是源流 30 ms mute；upmix 关闭时才回退到 `fade_in_new_stream: ... muted for 30 ms`）。
@@ -431,7 +606,7 @@ Copy:    L0=LVI R1=LVI SL0=SLVI SR1=SLVI RL0=RLVI RR1=RLVI C0=CVI
 
 ## 10. 工作规则（用户偏好，务必遵守）
 
-1. **每个参数必须有出处**：权威标准 > 行业经验 > 作者默认/实测，并写进代码注释；无理由的"拍脑袋值"不接受。先列方案/想法，用户确认后再改代码。
+1. **参数/算法必须有依据**：标准、接口契约、作者定义或实测，并在需要处注明；明确bug与必要重构直接修复，只有涉及设计取舍或决策才询问（2026-11-09用户更新，取代旧的逐项确认规则）。
 2. **允许大胆改源码**（用户原话："所有源码都大胆改，不用怕改坏"），但要保持真实、诚实，不确定就说不确定。
 3. **已定稿的参数不要反复重新论证**（§2：70/90 插件端口、分源增益、120 Hz **BW4**（2026-10-30 定稿，取代 LR4）、每耳对齐、扩散场 LFE 音色）。
 4. **结论要能被数据复现**，尤其是通道路由/延迟类问题：禁止只靠听感或录音下结论（见 §5 教训）。
@@ -453,11 +628,16 @@ Copy:    L0=LVI R1=LVI SL0=SLVI SR1=SLVI RL0=RLVI RR1=RLVI C0=CVI
 | 本次（2026-10-28，待试听后提交） | **三种用户可选 LFE 模式**（balanced/reference/impact，`lfe_mode`）+ 删除 legacy/env；**HRIR/LFE 相位对齐（任意 14ch HRIR 自动计算：20–120 等权拟合 delay + 自动 all-pass；UI 显示归一化/延迟/平均/最坏残差）**；impact 改为 0 dB send（无静态 EQ）；**send 移入 auto 插件 `lfe_send` 控制，修复原生多声道重复低频**；插件导出 `vsm_auto_upmix_state` + `vsm_auto_blocks` 心跳；实时输入检测；虚拟 sink 默认保护；内部效果 sink 防误选；内置扬声器跳过；旧效果图 1.2 s 延迟销毁修复切换 MPRIS 暂停；δ IR 上限 2s→10s；中文 UI；§13 声学/数值复核（LR4/δ/对齐/模式/多声道/headroom/ITD） |
 | 本次（2026-10-30，工作树未提交） | **send 30°/15° 门控**（AtmosFar/dtshx 不再抵消）；**auto 切换 wait+crossfade**（20 ms，中置/click 修复）；**非 48k HRIR q14 + 48k 对齐**；**可选预设响度匹配**（中位 A 计权，±8 dB）；**可选输出限幅**（`output_limiter`，5 ms/−1.5 dBFS/100 ms）；**实验性低频三轴**（LR4/BW4/BW8、δ/center/diffuse、每耳对齐，先默认关闭；同日随后定稿，见下一行）；UI/README/插件 README/AGENTS §14 同步；宿主与隔离验收通过 |
 | 定稿（2026-10-30，工作树未提交） | 用户试听后定稿：LFE 低通固定 **BW4**、**每耳对齐默认**、**扩散场音色默认**（δ 第二、中心第三）；删除 `lfe_lowpass`/`lfe_per_ear_alignment` 配置与 UI 及 LR4/BW8 路径；修复启动时 LFE 送量误显示“上混关闭”（配置读取后重算）；新流 30 ms mute 修复换歌爆音（后续实测首批仍泄漏，已改为效果图输出 150 ms 门控 + 100 ms 音量淡入，见下一行）；状态显示改为失效/缺失显式标记；文档同步 |
+| 2026-11-10 最终架构（工作树未提交） | 2048 FFT/3072 样本；删除合成 LFE send，改为已渲染双耳信号上的 `1+boost·|P|²` 零相差搁架；LFE 音色改为 14 通道功率平均最小相位 IR；恢复并重算 LFE/主路径公共/每耳延迟 + allpass（两脉冲 −160→+10 样本）；`center_image` constant-power 实现；8×/48-tap 重建峰限幅；上混/LFE 模式运行时控制；bass/limiter 双写线性窗口去逐 tap 取模；CTest 5/5、ASan/UBSan 5/5、隔离 e2e 60 Hz +3.00 dB 与相干和 0.2%；README/AGENTS/docs/plugin README 同步 |
+| 2026-11-10 晚 低频修正（工作树未提交） | 用户反馈 shelf 偏弱/偏前；恢复单声道 LFE send（balanced 0.501/−6 dB、impact 1.0/0 dB、reference 0，仅上混分支），删除主路径 `binaural_bass` 搁架及 512 延迟；diffuse 功率平均 IR + 每耳对齐/allpass 保留；原生多声道 balanced/reference <0.1 dB；应用侧 sink 延迟 3166；plugin_smoke/plugin_regression 恢复 send 断言；AGENTS §0C、README/QML 同步 |
+| 2026-11-10 晚 还原 FreeSurround（工作树未提交） | 按用户要求删除 2026-11-10 白天新增的 `center_image` C→FL/FR phantom 与全局功率归一化；graph 不再设置 `center_image`；上游 tygyh/Kodi/Real3D-VST 与旧提交均只保存不读；send 0.501 下 60/80/100/120 与 `f615312` 差 0.01–0.07 dB；plugin 测试改为 no-op；AGENTS §0D |
+| 2026-11-10 晚 LFE IR 结构修正（工作树未提交） | 用户反馈偏低频偏高/没劲；A/B 排除了稳态 RMS（20–120 与旧版 ±0.2 dB、LFE-only 60 相同）；改为 stereo hybrid diffuse IR：相干相位/时间/L-R 65% + 35% 每耳功率幅度，2ch ch0/1；LFE-only 60 比旧版低 0.53 dB，主对齐 4.19 ms/全通 8.00 kHz；CTest 5/5；AGENTS §0E |
+| 2026-11-10 深夜 回滚定稿（工作树未提交） | 低频全部回滚到 f615312 行为 + **FFT 4096 回滚**（2048 版实测 20–120 Hz −4~−5 dB，§0G）；删除 binaural_bass/quality_dsp/ir_processing；恢复相干 diffuse IR、30°/15° send 门控（建图持久化）；CTest 5/5；`~/.local/bin/vsm-version` 多版本切换工具 + 版本库；文档精简（删早期审计数据、压缩 §0B/0C/0E、acoustics.md 刷新） |
 | 更早 | `15fb76f` Flatpak 崩溃修复（上游历史） |
 
 ## 12. 低音管理复核（2026-10-28；调研历史）
 
-> **最终实现见 §2 的三模式表**：`balanced`（默认，−6 dB send）、`reference`（仅原生 LFE）、`impact`（对齐后 0 dB send）。本节保留调研过程与数据；其中提到的 `VSM_BASS_MODE` / `VSM_BASS_LEGACY` / `VSM_LFE_SEND_DB`、legacy 70/90 路径和 +4 dB 低架方案**已在最终实现中删除/替换**，仅作历史记录。
+> **最终实现见 §0F/§0G**：mono LFE send（仅上混分支，30°/15° 门控），无主路径搁架；reference 无 send，保留原生 LFE。本节保留 2026-10-28 的 send 调研过程与数据，仅作历史记录；`VSM_BASS_MODE` / `VSM_BASS_LEGACY` / `VSM_LFE_SEND_DB`、legacy 70/90 和 +4 dB 低架均已删除。
 > 结论：概念方向（LFE 独立、120 Hz 带限、源相关增益、δ IR 不卷积）是对的；之前的问题是 **δ IR 绝对电平未归一化**，以及 FreeSurround 70/90 重定向是"扬声器低音管理"，在双耳渲染里会带来随 HRIR 变化的低频染色。
 
 ### 12.1 权威结论（外部）
@@ -632,7 +812,7 @@ AppleSpatial 同为 +3.36/+3.01/+2.51/+1.88 与 +5.79/+5.27/+4.54/+3.48 dB。实
   - LFE 音色可选：**扩散场 HRIR（默认，7 对平均、按中心 40–80 Hz 归一化；非严格等量 L/R，可能带 HRIR 音色）**、δ（第二，严格无染色/等量 L/R）、中心 HRIR（第三）。
   - 当前 BW4 使 27_95 原生 LFE 在 60 Hz 为 +6.0 dB（比 +5.5 基准高 0.5 dB），120 Hz 比旧 LR4 高约 3 dB；这是 BW4 的听感取向。
   - 默认路径走 `lfe_alignment_configured()`；旧 `lfe_alignment()` 仅保留为参考。
-  - 仍未做：2048 FFT（需听感测试）、HRIR 切换 crossfade、FreeSurround 控制 GUI、可选跟随内容采样率。
+  - 已完成：2048 FFT（64 ms）、stereo hybrid LFE IR、LFE/主路径延迟+allpass 对齐、mono LFE send、8× 重建峰限幅。`center_image` 保持 upstream no-op（§0D）。仍未做：HRIR 切换跨世代 crossfade、FreeSurround 控制 GUI、可选跟随内容采样率。
 
 ### 14.4 文件中不应照单全收的观点
 

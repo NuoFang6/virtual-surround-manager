@@ -23,8 +23,10 @@
 
 #include "ladspa.h"
 #include "freesurround_decoder.h"
+#include "dsp_config.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -47,20 +49,16 @@ extern "C" __attribute__((visibility("default"))) std::atomic<std::uint64_t> vsm
 
 namespace {
 
-constexpr int kFftSize = 4096;                    // core block size, same as the VST plugin
-constexpr int kNumOut = 8;                        // 7.1
-constexpr int kLatency = kFftSize + kFftSize / 2; // bypass compensation, same as the VST plugin
-// Local patch (not in Real3D-VST, which uses 1e-6): silence floor for the stereo
-// detection. -90 dBFS is far below audibility, so content this quiet on the
-// non-L/R channels still counts as "fake" 8-channel output (browser/game dummy
-// channels with dither noise), while anything a listener could actually hear
-// on a surround channel still counts as real multichannel content.
+constexpr int kFftSize = VsmDsp::fft_size;         // 4096: 11.7 Hz bins at 48k, 128 ms total latency
+constexpr int kNumOut = 8;
+constexpr int kLatency = VsmDsp::upmix_latency;
+// Digital classifier threshold (~-90.46 dBFS), chosen to ignore dummy-channel
+// dither. dBFS alone does not establish physical audibility; quiet real surround
+// content can also fall below it.
 constexpr float kStereoEpsilon = 3e-5f;
-// Local patch (not in Real3D-VST): re-engaging the upmixer flushes its FIFOs, which
-// is audible as a short click. Content hovering right at the detection threshold
-// must not toggle the detector, so after a bypass the input has to stay pure stereo
-// for one second before upmixing resumes. Expressed in samples, not blocks, so the
-// behaviour is independent of the host quantum.
+// One-second release hysteresis avoids repeated classification changes near
+// the threshold. Both DSP paths remain warm; no FIFO reset occurs at a switch.
+// Expressed in samples so the behavior does not depend on the host quantum.
 constexpr double kStereoToleranceSeconds = 1.0;
 // Local patch (not in Real3D-VST): crossfade instead of a hard path switch. The
 // upmix and bypass paths are both kLatency samples delayed, so they represent the
@@ -122,17 +120,20 @@ void connectControl(Controls &c, unsigned long port, LADSPA_Data *data) {
 
 void syncControls(freesurround_decoder *decoder, const Controls &c, unsigned long sampleRate) {
     const float srNyquist = (float)(sampleRate / 2.0);
-    if (c.centerImage) decoder->center_image(*c.centerImage);
-    if (c.shift) decoder->shift(*c.shift);
-    if (c.depth) decoder->depth(*c.depth);
-    if (c.circularWrap) decoder->circular_wrap(*c.circularWrap);
-    if (c.focus) decoder->focus(*c.focus);
-    if (c.frontSep) decoder->front_separation(*c.frontSep);
-    if (c.rearSep) decoder->rear_separation(*c.rearSep);
-    if (c.useLfe) decoder->bass_redirection(*c.useLfe > 0.5f);
-    // normalized to the Nyquist frequency, exactly like the VST plugin does it
-    if (c.bassLo) decoder->low_cutoff(*c.bassLo / srNyquist);
-    if (c.bassHi) decoder->high_cutoff(*c.bassHi / srNyquist);
+    const auto value = [](const LADSPA_Data *port, float fallback, float low, float high) {
+        return port && std::isfinite(*port) ? std::clamp(*port, low, high) : fallback;
+    };
+    if (c.centerImage) decoder->center_image(value(c.centerImage, 0.7f, 0.0f, 1.0f));
+    if (c.shift) decoder->shift(value(c.shift, 0.0f, -1.0f, 1.0f));
+    if (c.depth) decoder->depth(value(c.depth, 1.0f, 0.0f, 4.0f));
+    if (c.circularWrap) decoder->circular_wrap(value(c.circularWrap, 90.0f, 0.0f, 360.0f));
+    if (c.focus) decoder->focus(value(c.focus, 0.0f, -1.0f, 1.0f));
+    if (c.frontSep) decoder->front_separation(value(c.frontSep, 1.0f, 0.0f, 2.0f));
+    if (c.rearSep) decoder->rear_separation(value(c.rearSep, 1.0f, 0.0f, 2.0f));
+    if (c.useLfe) decoder->bass_redirection(value(c.useLfe, 0.0f, 0.0f, 1.0f) > 0.5f);
+    const float hi = value(c.bassHi, 90.0f, 0.0f, std::min(150.0f, srNyquist));
+    if (c.bassLo) decoder->low_cutoff(value(c.bassLo, 70.0f, 0.0f, hi) / srNyquist);
+    if (c.bassHi) decoder->high_cutoff(hi / srNyquist);
 }
 
 // decoder channel index for each named output slot, resolved from speaker semantics
@@ -184,7 +185,10 @@ struct UpmixCore {
         for (int c = 0; c < 2; ++c) inFifo[c].assign(inSize, 0.0f);
         for (int c = 0; c < kNumOut; ++c) outFifo[c].assign(outSize, 0.0f);
         fifoWriteIdx = fifoReadIdx = inFifoFill = 0;
-        outFifoWriteIdx = outFifoReadIdx = outFifoFill = 0;
+        outFifoReadIdx = 0;
+        // The decoder adds N/2; explicitly queue N zeros to make the total
+        // N + N/2 samples, independent of the host's run() partitioning.
+        outFifoWriteIdx = outFifoFill = kFftSize;
         if (decoder) decoder->flush();
     }
 
@@ -199,8 +203,8 @@ struct UpmixCore {
                 --inFifoFill;
             }
             const std::size_t w = (fifoWriteIdx + s) % inSize;
-            inFifo[0][w] = l ? l[s] : 0.0f;
-            inFifo[1][w] = r ? r[s] : 0.0f;
+            inFifo[0][w] = l && std::isfinite(l[s]) ? l[s] : 0.0f;
+            inFifo[1][w] = r && std::isfinite(r[s]) ? r[s] : 0.0f;
             ++inFifoFill;
         }
         fifoWriteIdx = (fifoWriteIdx + n) % inSize;
@@ -229,30 +233,15 @@ struct UpmixCore {
         }
     }
 
-    bool hasOutput(unsigned long n) const { return outFifoFill >= n; }
-
-    // Advance the output FIFO without emitting anything. Used while the plugin
-    // is bypassing so the upmix core stays primed: on the next switch to upmix
-    // the FIFO already holds the processed audio and the output does not start
-    // with a silent fill-up period.
-    void discardOutput(unsigned long n) {
-        const std::size_t outSize = outFifo[0].size();
-        const std::size_t take = std::min<std::size_t>(n, outFifoFill);
-        outFifoReadIdx = (outFifoReadIdx + take) % outSize;
-        outFifoFill -= take;
+    void process(const LADSPA_Data *l, const LADSPA_Data *r, float output[kNumOut]) {
+        feed(l, r, 1);
+        const std::size_t size = outFifo[0].size();
+        for (int c = 0; c < kNumOut; ++c)
+            output[c] = outFifo[map.outIndex[c]][outFifoReadIdx];
+        outFifoReadIdx = (outFifoReadIdx + 1) % size;
+        --outFifoFill;
     }
 
-    void writeOut(LADSPA_Data *out[kNumOut], unsigned long n) {
-        const std::size_t outSize = outFifo[0].size();
-        for (int port = 0; port < kNumOut; ++port) {
-            if (!out[port]) continue;
-            const std::vector<float> &fifo = outFifo[map.outIndex[port]];
-            for (unsigned long s = 0; s < n; ++s)
-                out[port][s] = fifo[(outFifoReadIdx + s) % outSize];
-        }
-        outFifoReadIdx = (outFifoReadIdx + n) % outSize;
-        outFifoFill -= n;
-    }
 };
 
 //----------------------------------------------------------------------------
@@ -279,7 +268,10 @@ void stereoConnectPort(LADSPA_Handle handle, unsigned long port, LADSPA_Data *da
     if (port == 0) { self->inL = data; return; }
     if (port == 1) { self->inR = data; return; }
     if (port >= 2 && port < 10) { self->out[port - 2] = data; return; }
-    connectControl(self->ctrl, port - 10, data);
+    if (port == 20)
+        self->ctrl.latencyOut = data;
+    else
+        connectControl(self->ctrl, port - 10, data);
     if (self->ctrl.latencyOut) *self->ctrl.latencyOut = (float)kLatency;
 }
 
@@ -287,19 +279,20 @@ void stereoActivate(LADSPA_Handle handle) {
     StereoInstance *self = (StereoInstance *)handle;
     syncControls(self->core.decoder, self->ctrl, self->sampleRate);
     self->core.reset();
+    if (self->ctrl.latencyOut) *self->ctrl.latencyOut = static_cast<float>(kLatency);
 }
 
 void stereoRun(LADSPA_Handle handle, unsigned long n) {
     StereoInstance *self = (StereoInstance *)handle;
     if (!self->core.decoder || n == 0) return;
     syncControls(self->core.decoder, self->ctrl, self->sampleRate);
-    self->core.feed(self->inL, self->inR, n);
-    if (!self->core.hasOutput(n)) {
+    for (unsigned long s = 0; s < n; ++s) {
+        float output[kNumOut];
+        self->core.process(self->inL ? self->inL + s : nullptr,
+                           self->inR ? self->inR + s : nullptr, output);
         for (int c = 0; c < kNumOut; ++c)
-            if (self->out[c]) std::memset(self->out[c], 0, sizeof(LADSPA_Data) * n);
-        return;
+            if (self->out[c]) self->out[c][s] = output[c];
     }
-    self->core.writeOut(self->out, n);
 }
 
 void stereoCleanup(LADSPA_Handle handle) {
@@ -317,102 +310,27 @@ struct AutoInstance {
     unsigned long sampleRate = 48000;
     LADSPA_Data *in[kNumOut] = {};
     LADSPA_Data *out[kNumOut] = {};
-
     std::vector<float> bypass[kNumOut];
-    std::vector<float> upmix[kNumOut];
-    std::vector<float> bypassOut[kNumOut];
+    std::vector<unsigned char> decisions;
     std::size_t bypassWriteIdx = 0;
-
-    // steadyUpmix is the last settled path. While a crossfade runs, the output
-    // is a per-sample blend of both paths and steadyUpmix still refers to the
-    // path being faded out.
-    bool steadyUpmix = true;
-    bool fading = false;
-    bool fadeToBypass = false;
-    int fadeElapsed = 0;
-    int fadeTotal = 0;
+    std::size_t decisionWriteIdx = 0;
+    unsigned long stereoSamplesTarget = 0;
+    unsigned long bypassHold = 0;
     int crossfadeSamples = 0;
-    int stereoSamplesTarget = 0;
-    long long nonStereoSamples = 0;
-    long long stereoSamples = 0;
-
-    // Write the newest samples of every input channel into the bypass delay
-    // ring. Kept current in *both* modes so a future switch to bypass starts
-    // with real audio instead of the stale/zero ring.
-    void updateBypassRing(unsigned long n) {
-        const std::size_t kLat = (std::size_t)kLatency;
-        const unsigned long m = std::min<unsigned long>(n, kLatency);
-        const std::size_t start = (bypassWriteIdx + (n - m)) % kLat;
-        for (int c = 0; c < kNumOut; ++c) {
-            std::vector<float> &buf = bypass[c];
-            const LADSPA_Data *src = in[c];
-            for (unsigned long j = 0; j < m; ++j)
-                buf[(start + j) % kLat] = src ? src[n - m + j] : 0.0f;
-        }
-        bypassWriteIdx = (bypassWriteIdx + n) % kLat;
-    }
-
-    // Read the delayed bypass signal before the ring is advanced for this
-    // block. Native LFE gets its +6 dB makeup here, only in this branch.
-    void readBypass(unsigned long n) {
-        const std::size_t kLat = (std::size_t)kLatency;
-        for (int c = 0; c < kNumOut; ++c) {
-            const float gain = (c == 3) ? 2.0f : 1.0f;
-            const LADSPA_Data *src = in[c];
-            std::vector<float> &ring = bypass[c];
-            std::vector<float> &dst = bypassOut[c];
-            if (n < (unsigned long)kLatency) {
-                for (unsigned long s = 0; s < n; ++s)
-                    dst[s] = gain * ring[(bypassWriteIdx + s) % kLat];
-            } else {
-                for (unsigned long s = 0; s < (unsigned long)kLatency; ++s)
-                    dst[s] = gain * ring[(bypassWriteIdx + s) % kLat];
-                for (unsigned long s = (unsigned long)kLatency; s < n; ++s)
-                    dst[s] = gain * (src ? src[s - kLatency] : 0.0f);
-            }
-        }
-    }
-
-    // Write the upmixer's output into temporary buffers and replace its LFE
-    // channel with the optional mono main-sum send. The LFE send is applied
-    // only here: the native LFE (silent while upmixing) must not be doubled.
-    void writeUpmix(unsigned long n) {
-        LADSPA_Data *ports[kNumOut];
-        for (int c = 0; c < kNumOut; ++c)
-            ports[c] = upmix[c].data();
-        core.writeOut(ports, n);
-
-        const float send = ctrl.lfeSend ? *ctrl.lfeSend : 0.0f;
-        if (send == 0.0f) {
-            std::memset(upmix[3].data(), 0, sizeof(LADSPA_Data) * n);
-        } else {
-            for (unsigned long s = 0; s < n; ++s) {
-                float sum = 0.0f;
-                for (const int c : {0, 1, 2, 4, 5, 6, 7})
-                    sum += upmix[c][s];
-                upmix[3][s] = send * sum;
-            }
-        }
-    }
-
-    void zeroUpmix(unsigned long n) {
-        for (int c = 0; c < kNumOut; ++c)
-            std::memset(upmix[c].data(), 0, sizeof(LADSPA_Data) * n);
-    }
+    float bypassMix = 0.0f;
 };
 
 LADSPA_Handle autoInstantiate(const LADSPA_Descriptor *, unsigned long sampleRate) {
     AutoInstance *self = new AutoInstance();
     self->sampleRate = sampleRate ? sampleRate : 48000;
     self->core.init(self->sampleRate);
-    const std::size_t maxBlock = 4u * kFftSize;
-    for (int c = 0; c < kNumOut; ++c) {
+    for (int c = 0; c < kNumOut; ++c)
         self->bypass[c].assign(kLatency, 0.0f);
-        self->upmix[c].assign(maxBlock, 0.0f);
-        self->bypassOut[c].assign(maxBlock, 0.0f);
-    }
-    self->crossfadeSamples = std::max(1, (int)std::llround(self->sampleRate * kCrossfadeSeconds));
-    self->stereoSamplesTarget = std::max(1, (int)std::llround(self->sampleRate * kStereoToleranceSeconds));
+    self->crossfadeSamples = std::clamp((int)std::llround(self->sampleRate * kCrossfadeSeconds), 1, kLatency);
+    self->stereoSamplesTarget = std::max(1ul, (unsigned long)std::llround(self->sampleRate * kStereoToleranceSeconds));
+    // Decisions travel with the audio. Remember short native events through
+    // the one-second hold; do not fade before that audio reaches the output.
+    self->decisions.assign(kLatency, 0);
     return (LADSPA_Handle)self;
 }
 
@@ -428,125 +346,69 @@ void autoActivate(LADSPA_Handle handle) {
     AutoInstance *self = (AutoInstance *)handle;
     syncControls(self->core.decoder, self->ctrl, self->sampleRate);
     self->core.reset();
-    for (int c = 0; c < kNumOut; ++c) {
+    for (int c = 0; c < kNumOut; ++c)
         std::fill(self->bypass[c].begin(), self->bypass[c].end(), 0.0f);
-        std::fill(self->upmix[c].begin(), self->upmix[c].end(), 0.0f);
-        std::fill(self->bypassOut[c].begin(), self->bypassOut[c].end(), 0.0f);
-    }
-    self->bypassWriteIdx = 0;
-    self->steadyUpmix = true;
-    self->fading = false;
-    self->fadeToBypass = false;
-    self->fadeElapsed = 0;
-    self->fadeTotal = 0;
-    self->nonStereoSamples = 0;
-    self->stereoSamples = self->stereoSamplesTarget; // start upmixing immediately
+    const bool bypass = self->ctrl.upmixEnable && *self->ctrl.upmixEnable <= 0.5f;
+    std::fill(self->decisions.begin(), self->decisions.end(), bypass);
+    self->bypassWriteIdx = self->decisionWriteIdx = 0;
+    self->bypassHold = 0;
+    self->bypassMix = bypass ? 1.0f : 0.0f;
     vsm_auto_upmix_state.store(-1, std::memory_order_relaxed);
 }
 
 void autoRun(LADSPA_Handle handle, unsigned long n) {
     AutoInstance *self = (AutoInstance *)handle;
     if (!self->core.decoder || n == 0) return;
-
     vsm_auto_blocks.fetch_add(1, std::memory_order_relaxed);
     syncControls(self->core.decoder, self->ctrl, self->sampleRate);
-
-    // ---- stereo detection, same sample rule as the VST plugin ----
-    // ports 2..7 are FC, LFE, RL, RR, SL, SR in this graph's channel order
-    bool extraChannelsSilent = true;
-    for (int c = 2; c < kNumOut && extraChannelsSilent; ++c) {
-        if (!self->in[c]) continue;
-        for (unsigned long s = 0; s < n; ++s) {
-            if (std::fabs(self->in[c][s]) > kStereoEpsilon) {
-                extraChannelsSilent = false;
-                break;
-            }
-        }
-    }
-    if (extraChannelsSilent) {
-        self->stereoSamples += (long long)n;
-        self->nonStereoSamples = 0;
-    } else {
-        self->nonStereoSamples += (long long)n;
-        self->stereoSamples = 0;
-    }
-
     const bool upmixAllowed = !self->ctrl.upmixEnable || *self->ctrl.upmixEnable > 0.5f;
-    bool targetUpmix = upmixAllowed;
-    if (upmixAllowed) {
-        if (self->steadyUpmix) {
-            // Keep upmixing until the native content has traversed the bypass
-            // delay line *and* the crossfade is over. Starting at exactly
-            // kLatency would blend with a bypass path that still contains the
-            // old (pre-transition) content for the first fade samples.
-            targetUpmix = self->nonStereoSamples < (long long)kLatency + self->crossfadeSamples;
-        } else {
-            targetUpmix = self->stereoSamples >= self->stereoSamplesTarget;
+    // 0 = no send, 0.501 = balanced's historical -6 dB, 1.0 = impact's 0 dB.
+    // The graph writes this control at runtime (no graph rebuild).
+    const float send = self->ctrl.lfeSend && std::isfinite(*self->ctrl.lfeSend)
+        ? std::clamp<float>(*self->ctrl.lfeSend, 0.0f, 1.0f) : 0.0f;
+    const float fadeStep = 1.0f / self->crossfadeSamples;
+    for (unsigned long s = 0; s < n; ++s) {
+        float input[kNumOut], native[kNumOut], upmix[kNumOut];
+        bool extra = false;
+        for (int c = 0; c < kNumOut; ++c) {
+            input[c] = self->in[c] ? self->in[c][s] : 0.0f;
+            if (!std::isfinite(input[c])) input[c] = 0.0f;
+            if (c >= 2 && std::fabs(input[c]) > kStereoEpsilon) extra = true;
+            native[c] = self->bypass[c][self->bypassWriteIdx] * (c == 3 ? 2.0f : 1.0f);
+            self->bypass[c][self->bypassWriteIdx] = input[c];
         }
-    }
+        self->bypassWriteIdx = (self->bypassWriteIdx + 1) % kLatency;
+        if (extra)
+            self->bypassHold = self->stereoSamplesTarget;
+        else if (self->bypassHold > 0)
+            --self->bypassHold;
+        const bool bypass = self->decisions[self->decisionWriteIdx] != 0;
+        self->decisions[self->decisionWriteIdx] = !upmixAllowed || self->bypassHold > 0;
+        self->decisionWriteIdx = (self->decisionWriteIdx + 1) % self->decisions.size();
+        self->bypassMix = std::clamp(self->bypassMix + (bypass ? fadeStep : -fadeStep), 0.0f, 1.0f);
 
-    // Both paths stay primed: feed the upmix core and keep the bypass ring
-    // current every block, whichever path currently drives the output.
-    self->core.feed(self->in[0], self->in[1], n);
-    self->readBypass(n);
-
-    if (!self->fading && targetUpmix != self->steadyUpmix) {
-        self->fading = true;
-        self->fadeToBypass = !targetUpmix;
-        self->fadeElapsed = 0;
-        self->fadeTotal = self->crossfadeSamples;
-    }
-
-    const bool needUpmix = self->steadyUpmix || self->fading;
-    bool haveUpmix = false;
-    if (needUpmix) {
-        haveUpmix = self->core.hasOutput(n);
-        if (haveUpmix)
-            self->writeUpmix(n);
-        else
-            self->zeroUpmix(n);
-    } else {
-        // Bypass steady state: consume the upmix output without emitting it so
-        // its read pointer stays aligned with the bypass delay line.
-        self->core.discardOutput(n);
-    }
-
-    self->updateBypassRing(n);
-
-    if (!self->fading) {
+        self->core.process(&input[0], &input[1], upmix);
+        // Optional mono LFE send, as in the pre-shelf architecture. It is
+        // summed from the seven upmix main outputs and rendered through the
+        // graph's diffuse LFE path, so it does not inherit the front HRIR
+        // image. The native LFE is silent while upmixing; in bypass the
+        // native[c] term below carries its 2x makeup instead.
+        if (send > 0.0f) {
+            upmix[3] = send * (upmix[0] + upmix[1] + upmix[2] +
+                               upmix[4] + upmix[5] + upmix[6] + upmix[7]);
+        } else {
+            upmix[3] = 0.0f;
+        }
         for (int c = 0; c < kNumOut; ++c) {
             if (!self->out[c]) continue;
-            const std::vector<float> &src = self->steadyUpmix ? self->upmix[c] : self->bypassOut[c];
-            std::memcpy(self->out[c], src.data(), sizeof(LADSPA_Data) * n);
-        }
-        vsm_auto_upmix_state.store(self->steadyUpmix ? 1 : 0, std::memory_order_relaxed);
-        return;
-    }
-
-    // Per-sample crossfade. Both paths are kLatency delayed, so this blends the
-    // same input time; a 20 ms ramp removes the sample-step click that a hard
-    // path switch produced (measured 0.26 for a 1 kHz/0.3 tone).
-    for (int c = 0; c < kNumOut; ++c) {
-        if (!self->out[c]) continue;
-        for (unsigned long s = 0; s < n; ++s) {
-            float a = self->fadeTotal > 0
-                          ? (float)(self->fadeElapsed + (int)s) / (float)self->fadeTotal
-                          : 1.0f;
-            if (a > 1.0f)
-                a = 1.0f;
-            if (!self->fadeToBypass)
-                a = 1.0f - a;
-            self->out[c][s] = self->upmix[c][s] * (1.0f - a) + self->bypassOut[c][s] * a;
+            // Native discrete channels are never faded away by a stereo
+            // classifier. Only the synthesized stereo field/LR bypass blend.
+            self->out[c][s] = c < 2
+                ? upmix[c] * (1.0f - self->bypassMix) + native[c] * self->bypassMix
+                : upmix[c] * (1.0f - self->bypassMix) + native[c];
         }
     }
-    self->fadeElapsed += (int)n;
-    if (self->fadeElapsed >= self->fadeTotal) {
-        self->steadyUpmix = !self->fadeToBypass;
-        self->fading = false;
-        self->fadeElapsed = 0;
-        self->fadeTotal = 0;
-    }
-    vsm_auto_upmix_state.store(self->steadyUpmix ? 1 : 0, std::memory_order_relaxed);
+    vsm_auto_upmix_state.store(self->bypassMix < 0.5f ? 1 : 0, std::memory_order_relaxed);
 }
 
 void autoCleanup(LADSPA_Handle handle) {
@@ -573,15 +435,30 @@ struct LimiterInstance {
     LADSPA_Data *lookaheadMs = nullptr;
     LADSPA_Data *latencyOut = nullptr;
 
+    // 8x, 48-tap/polyphase windowed-sinc reconstruction detector. Audio stays
+    // at the native rate; only the detector is oversampled, avoiding an extra
+    // resampling pass through the programme signal. The history is duplicated
+    // so the 48-tap window is linear and the inner loop has no modulo.
+    std::array<std::array<double, 48>, 8> interpolation{};
+    std::array<std::array<double, 48>, 8> interpolationRev{};
+    std::array<std::array<float, 96>, 2> detectorHistory{};
+    unsigned detectorWrite = 0;
+    int detectorDelay = 24;
+
     std::vector<float> delay[2];
     std::vector<float> peaks;
+    std::vector<int> peakQueue;
+    unsigned queueHead = 0, queueTail = 0;
+    uint64_t sampleIndex = 0;
+    float lastThresholdDb = NAN;
+    float lastReleaseMs = NAN;
+    float lastLookaheadMs = NAN;
     int maxDelay = 0;
     int delayLen = 0;
     int writeIdx = 0;
     int peakWrite = 0;
     float gain = 1.0f;
     float threshold = 0.841395f; // -1.5 dBFS
-    float attackCoeff = 0.0f;
     float releaseCoeff = 0.0f;
 
     void init(unsigned long sr) {
@@ -589,19 +466,41 @@ struct LimiterInstance {
         maxDelay = std::max(1, (int)std::llround(sampleRate * 0.050));
         for (int c = 0; c < 2; ++c)
             delay[c].assign(maxDelay, 0.0f);
-        peaks.assign(maxDelay + 1, 0.0f);
+        peaks.assign(maxDelay + 64, 0.0f);
+        peakQueue.assign(peaks.size(), 0);
+        for (int phase = 0; phase < 8; ++phase) {
+            double sum = 0;
+            for (int tap = 0; tap < 48; ++tap) {
+                const double x = tap - detectorDelay + phase / 8.0;
+                const double window = 0.42 - 0.5 * std::cos(2 * M_PI * tap / 47) + 0.08 * std::cos(4 * M_PI * tap / 47);
+                interpolation[phase][tap] = window * (x == 0 ? 1.0 : std::sin(M_PI * x) / (M_PI * x));
+                sum += interpolation[phase][tap];
+            }
+            for (auto &v : interpolation[phase]) v /= sum;
+            // Store the reversed kernel for a contiguous history read.
+            for (int tap = 0; tap < 48; ++tap)
+                interpolationRev[phase][tap] = interpolation[phase][47 - tap];
+        }
         configure();
         reset();
     }
 
     void configure() {
-        const float db = thresholdDb ? *thresholdDb : -1.5f;
+        const auto control = [](const LADSPA_Data *p, float fallback, float low, float high) {
+            return p && std::isfinite(*p) ? std::clamp(*p, low, high) : fallback;
+        };
+        const float db = control(thresholdDb, -1.5f, -20.0f, 0.0f);
+        const float rel = control(releaseMs, 100.0f, 1.0f, 1000.0f);
+        const float look = control(lookaheadMs, 5.0f, 0.0f, 20.0f);
+        if (latencyOut)
+            *latencyOut = static_cast<float>(delayLen);
+        if (db == lastThresholdDb && rel == lastReleaseMs && look == lastLookaheadMs)
+            return;
+        lastThresholdDb = db;
+        lastReleaseMs = rel;
+        lastLookaheadMs = look;
         threshold = std::pow(10.0f, db / 20.0f);
-        const float rel = releaseMs ? *releaseMs : 100.0f;
-        const float look = lookaheadMs ? *lookaheadMs : 5.0f;
-        delayLen = std::clamp((int)std::llround((double)look * sampleRate / 1000.0), 0, maxDelay);
-        const int attackSamples = std::max(1, delayLen / 4);
-        attackCoeff = std::exp(-1.0f / (float)attackSamples);
+        delayLen = std::clamp((int)std::llround((double)look * sampleRate / 1000.0), detectorDelay + 1, maxDelay);
         const int releaseSamples = std::max(1, (int)std::llround((double)rel * sampleRate / 1000.0));
         releaseCoeff = std::exp(-1.0f / (float)releaseSamples);
         if (latencyOut)
@@ -614,6 +513,10 @@ struct LimiterInstance {
         std::fill(peaks.begin(), peaks.end(), 0.0f);
         writeIdx = 0;
         peakWrite = 0;
+        detectorWrite = 0;
+        detectorHistory = {};
+        queueHead = queueTail = 0;
+        sampleIndex = 0;
         gain = 1.0f;
     }
 };
@@ -650,23 +553,48 @@ void limiterRun(LADSPA_Handle handle, unsigned long n) {
     if (!self->in[0] || !self->in[1] || !self->out[0] || !self->out[1])
         return;
 
+    self->configure();
     const int size = (int)self->peaks.size();
     for (unsigned long s = 0; s < n; ++s) {
-        const float l = self->in[0][s];
-        const float r = self->in[1][s];
-        const float peak = std::max(std::fabs(l), std::fabs(r));
-
-        self->peaks[self->peakWrite] = peak;
-        self->peakWrite = (self->peakWrite + 1) % size;
-
-        float window_peak = 0.0f;
-        for (int j = 0; j <= self->delayLen; ++j) {
-            const int idx = (self->peakWrite - 1 - j + size) % size;
-            window_peak = std::max(window_peak, self->peaks[idx]);
+        const float l = std::isfinite(self->in[0][s]) ? self->in[0][s] : 0.0f;
+        const float r = std::isfinite(self->in[1][s]) ? self->in[1][s] : 0.0f;
+        self->detectorHistory[0][self->detectorWrite] = l;
+        self->detectorHistory[1][self->detectorWrite] = r;
+        self->detectorHistory[0][self->detectorWrite + 48] = l;
+        self->detectorHistory[1][self->detectorWrite + 48] = r;
+        const float *windowL = &self->detectorHistory[0][self->detectorWrite + 1];
+        const float *windowR = &self->detectorHistory[1][self->detectorWrite + 1];
+        double reconstructedPeak = 0;
+        for (int phase = 0; phase < 8; ++phase) {
+            double left = 0, right = 0;
+            for (int tap = 0; tap < 48; ++tap) {
+                const double coefficient = self->interpolationRev[phase][tap];
+                left += coefficient * windowL[tap];
+                right += coefficient * windowR[tap];
+            }
+            reconstructedPeak = std::max({reconstructedPeak, std::abs(left), std::abs(right)});
         }
+        self->detectorWrite = (self->detectorWrite + 1) % 48;
+        const float peak = static_cast<float>(std::max(reconstructedPeak, static_cast<double>(std::max(std::fabs(l), std::fabs(r)))));
+        self->peaks[self->peakWrite] = peak;
+        // Monotonic queue: O(1) peak window rather than a lookahead-length scan
+        // for every audio sample. Hold past the detector delay and release
+        // slowly enough to avoid creating new intersample modulation peaks.
+        while (self->queueHead != self->queueTail) {
+            const unsigned last = (self->queueTail + size - 1) % size;
+            if (self->peaks[self->peakQueue[last]] > peak) break;
+            self->queueTail = last;
+        }
+        self->peakQueue[self->queueTail] = self->peakWrite;
+        self->queueTail = (self->queueTail + 1) % size;
+        const int expired = (self->peakWrite + size - self->delayLen - self->detectorDelay - 2) % size;
+        if (self->queueHead != self->queueTail && self->peakQueue[self->queueHead] == expired)
+            self->queueHead = (self->queueHead + 1) % size;
+        const float window_peak = self->peaks[self->peakQueue[self->queueHead]];
+        self->peakWrite = (self->peakWrite + 1) % size;
         const float target = window_peak > self->threshold ? self->threshold / window_peak : 1.0f;
         if (target < self->gain)
-            self->gain = self->attackCoeff * self->gain + (1.0f - self->attackCoeff) * target;
+            self->gain = target;
         else
             self->gain = self->releaseCoeff * self->gain + (1.0f - self->releaseCoeff) * target;
 
@@ -681,6 +609,12 @@ void limiterRun(LADSPA_Handle handle, unsigned long n) {
         self->delay[1][self->writeIdx] = r;
         self->writeIdx = (self->writeIdx + 1) % self->maxDelay;
 
+        // A finite exponential attack never reaches its target exactly. Enforce
+        // the ceiling on the actual delayed stereo sample, including isolated
+        // impulses and zero-lookahead operation, without unlinking the channels.
+        const float delayedPeak = std::max(std::fabs(dl), std::fabs(dr));
+        if (delayedPeak > self->threshold)
+            self->gain = std::min(self->gain, self->threshold / delayedPeak);
         self->out[0][s] = dl * self->gain;
         self->out[1][s] = dr * self->gain;
     }

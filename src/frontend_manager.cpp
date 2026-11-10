@@ -6,6 +6,8 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QPointer>
+#include <QSaveFile>
 #include <QStandardPaths>
 #include <QTextStream>
 #include <QTimer>
@@ -52,6 +54,11 @@ FrontendManager::FrontendManager(PipeWireManager *pipewire_manager, KConfig *con
     m_config = config;
     m_config_settings = m_config->group(QStringLiteral("Settings"));
     connect(m_pipewire_manager, &PipeWireManager::error_occurred, this, &FrontendManager::set_error_message);
+    connect(m_pipewire_manager, &PipeWireManager::connection_lost, this, [this]() {
+        set_virtual_surround_enabled(false);
+        invalidate_hrir_analysis(QStringLiteral("音频服务或效果模块已断开"));
+        refresh_input_detection();
+    });
 
     // Initialize UI values. The level-match setting is needed by the first
     // analysis refresh, so read it before loading the preset list.
@@ -66,6 +73,17 @@ FrontendManager::FrontendManager(PipeWireManager *pipewire_manager, KConfig *con
     }
     m_pipewire_manager->set_lfe_options(PipeWireManager::LfeLowpass::Butterworth4,
                                            parse_lfe_timbre(m_lfe_timbre), true);
+
+    // Read the bass mode/upmix state before the first analysis refresh, so the
+    // startup status line never claims "bass off" while the config says otherwise.
+    m_upmix_enabled = m_config_settings.readEntry("upmix_enabled", bool());
+    m_lfe_mode = m_config_settings.readEntry("lfe_mode", QStringLiteral("balanced"));
+    if (!is_valid_lfe_mode(m_lfe_mode)) {
+        m_lfe_mode = QStringLiteral("balanced");
+        m_config_settings.writeEntry("lfe_mode", m_lfe_mode);
+        m_config->sync();
+    }
+    m_pipewire_manager->set_lfe_mode(parse_lfe_mode(m_lfe_mode));
 
     load_hrir_wav_files();
 
@@ -91,21 +109,6 @@ FrontendManager::FrontendManager(PipeWireManager *pipewire_manager, KConfig *con
     }
 
     m_autostart_enabled = m_config_settings.readEntry("autostart_enabled", bool());
-
-    m_upmix_enabled = m_config_settings.readEntry("upmix_enabled", bool());
-
-    m_lfe_mode = m_config_settings.readEntry("lfe_mode", QStringLiteral("balanced"));
-    if (!is_valid_lfe_mode(m_lfe_mode)) {
-        m_lfe_mode = QStringLiteral("balanced");
-        m_config_settings.writeEntry("lfe_mode", m_lfe_mode);
-        m_config->sync();
-    }
-    m_pipewire_manager->set_lfe_mode(parse_lfe_mode(m_lfe_mode));
-
-    // The initial analysis above ran before the config was read, so it showed
-    // the default upmix=false state. Refresh once all settings (upmix/LFE mode/
-    // timbre/level match/limiter) are known.
-    refresh_hrir_analysis();
 
     m_virtual_surround_auto_enabled = m_config_settings.readEntry("virtual_surround_auto_enabled", bool());
     if (m_virtual_surround_auto_enabled) {
@@ -165,6 +168,10 @@ bool FrontendManager::create_module() {
     QString path = m_hrir_wav_file_paths.value(m_hrir_wav_file_name_index);
     if (!does_hrir_wav_file_exist(path))
         return false;
+    m_hrir_levels.clear();
+    // A disabled graph may contain an older version of a file at the same path.
+    // Recreate before enabling, while no application streams are routed to it.
+    m_pipewire_manager->remove_virtual_surround_module();
     if (!m_pipewire_manager->create_virtual_surround_module(path.toStdString(), m_upmix_enabled, output_trim_db(),
                                                             m_output_limiter))
         return false;
@@ -178,6 +185,7 @@ bool FrontendManager::rebuild_module() {
     // graph is being rebuilt. The final refresh_hrir_analysis() at the end of
     // each setter replaces this sentinel with the new values.
     invalidate_hrir_analysis(QStringLiteral("重建效果图"));
+    m_hrir_levels.clear();
     // A fresh attempt invalidates any error message from a previous failure
     set_error_message(QString());
 
@@ -279,6 +287,9 @@ void FrontendManager::set_hrir_wav_file_name_index(int index) {
 void FrontendManager::load_hrir_wav_files() {
     invalidate_hrir_analysis(QStringLiteral("重新加载配置文件"));
     // Check first if a path has already been selected by the user
+    const QStringList previous_names = m_hrir_wav_file_names;
+    const QStringList previous_paths = m_hrir_wav_file_paths;
+    const int previous_index = m_hrir_wav_file_name_index;
     QString old_path = m_hrir_wav_file_paths.value(m_hrir_wav_file_name_index);
 
     // Read from config file if nothing has been selected in current session
@@ -346,24 +357,21 @@ void FrontendManager::load_hrir_wav_files() {
 
     m_hrir_wav_file_names = names;
     m_hrir_wav_file_paths = paths;
+    int new_index = paths.indexOf(old_path);
+    m_hrir_wav_file_name_index = new_index >= 0 ? new_index : 0;
 
-    Q_EMIT hrir_wav_file_names_changed();
-
-    // Try to restore the old file selection if it still exists
-    int new_index = 0;
-    if (!old_path.isEmpty())
-        new_index = m_hrir_wav_file_paths.indexOf(old_path);
-
-    // Clamp the selection so it always points at an existing file
-    if (new_index < 0 || new_index >= m_hrir_wav_file_paths.size())
-        new_index = 0;
-
-    if (new_index != m_hrir_wav_file_name_index) {
-        m_hrir_wav_file_name_index = new_index;
-        Q_EMIT hrir_wav_file_name_index_changed();
-        qDebug("Restored previous file selection");
+    // Reload means reload the file too, even when its name/index did not change.
+    // Keep the last applied selection visible if the candidate cannot be built.
+    if (m_virtual_surround_enabled && !rebuild_module()) {
+        m_hrir_wav_file_names = previous_names;
+        m_hrir_wav_file_paths = previous_paths;
+        m_hrir_wav_file_name_index = previous_index;
+    } else {
+        m_config_settings.writeEntry("hrir_wav_file_path", m_hrir_wav_file_paths.value(m_hrir_wav_file_name_index));
+        m_config->sync();
     }
-
+    Q_EMIT hrir_wav_file_names_changed();
+    Q_EMIT hrir_wav_file_name_index_changed();
     refresh_hrir_analysis();
 }
 
@@ -399,74 +407,100 @@ bool FrontendManager::get_autostart_enabled() const {
 }
 
 void FrontendManager::set_autostart_enabled(bool value) {
-    if (m_autostart_enabled == value)
+    if (m_autostart_pending || m_autostart_enabled == value) {
+        Q_EMIT autostart_enabled_changed();
         return;
-    m_autostart_enabled = value;
-
+    }
 #ifdef IS_FLATPAK
-    // Use libportal to request Flatpak autostart
-    g_autoptr(GPtrArray) cmd = nullptr;
-    XdpBackgroundFlags flags = value ? XDP_BACKGROUND_FLAG_AUTOSTART : XDP_BACKGROUND_FLAG_NONE;
-    xdp_portal_request_background(XdpQt::globalPortalObject(), nullptr, const_cast<char *>("Autostart"), cmd, flags, nullptr, nullptr, this);
-#endif
-
-#if !defined(IS_FLATPAK)
-    // Get destination path for desktop file (only used for native installation and AppImage)
-    const QString destination = QStandardPaths::standardLocations(QStandardPaths::ConfigLocation).value(0) + QStringLiteral("/autostart/de.berny23.virtual_surround_manager.desktop");
-#endif
-
-    if (m_autostart_enabled) {
-        // Get source path for desktop file (only used for native installation and AppImage)
-        // Source can either be /usr/share/applications or ~/.local/share/applications, when installed natively
-        QString source = QStringLiteral("/usr/share/applications/de.berny23.virtual_surround_manager.desktop");
-        if (!QFile::exists(source))
-            source = QStandardPaths::standardLocations(QStandardPaths::ApplicationsLocation).value(0) + QStringLiteral("/de.berny23.virtual_surround_manager.desktop");
-
+    struct Request {
+        QPointer<FrontendManager> manager;
+        bool enabled;
+    };
+    m_autostart_pending = true;
+    auto *request = new Request{this, value};
+    const auto flags = value ? XDP_BACKGROUND_FLAG_AUTOSTART : XDP_BACKGROUND_FLAG_NONE;
+    xdp_portal_request_background(XdpQt::globalPortalObject(), nullptr, "Autostart", nullptr,
+        flags, nullptr, [](GObject *portal, GAsyncResult *result, gpointer data) {
+            auto *request = static_cast<Request *>(data);
+            GError *error = nullptr;
+            const bool success = xdp_portal_request_background_finish(XDP_PORTAL(portal), result, &error);
+            if (request->manager) {
+                auto *manager = request->manager.data();
+                manager->m_autostart_pending = false;
+                if (success) {
+                    manager->m_autostart_enabled = request->enabled;
+                    manager->m_config_settings.writeEntry("autostart_enabled", request->enabled);
+                    manager->m_config->sync();
+                } else {
+                    manager->set_error_message(QStringLiteral("无法更新自动启动设置：%1")
+                        .arg(error ? QString::fromUtf8(error->message) : QStringLiteral("请求被拒绝")));
+                }
+                Q_EMIT manager->autostart_enabled_changed();
+            }
+            if (error) g_error_free(error);
+            delete request;
+        }, request);
+    return;
+#else
+    const QString destination = QStandardPaths::writableLocation(QStandardPaths::ConfigLocation) +
+        QStringLiteral("/autostart/de.berny23.virtual_surround_manager.desktop");
+    const auto fail = [&](const QString &message) {
+        set_error_message(message);
+        Q_EMIT autostart_enabled_changed();
+    };
+    if (value) {
+        QString source = QStandardPaths::locate(QStandardPaths::ApplicationsLocation,
+            QStringLiteral("de.berny23.virtual_surround_manager.desktop"));
 #ifdef IS_APPIMAGE
-        // Copy desktop file from extraced AppImage folder that is automatically created under /tmp and randomly named. The APPDIR variable contains the path.
         source = qEnvironmentVariable("APPDIR") + QStringLiteral("/de.berny23.virtual_surround_manager.desktop");
 #endif
-
-#if !defined(IS_FLATPAK)
-        // Native or AppImage: Just copy the desktop file to the user's autostart folder (e. g. ~/.config/autostart)
-        // Creates directory with all parents, mkpath skips existing folders
-        QDir().mkpath(QFileInfo(destination).path());
-        QFile::remove(destination); // QFile::copy never overwrites
-        if (!QFile::copy(source, destination)) {
-            // Without the desktop file autostart would silently not work, so
-            // roll the setting back instead of persisting a broken state
-            qWarning("set_autostart_enabled: Failed to copy desktop file from '%s' to '%s'", source.toStdString().c_str(), destination.toStdString().c_str());
-            set_error_message(QStringLiteral("无法启用自动启动：复制桌面文件失败（%1）。").arg(source));
-            m_autostart_enabled = false;
-            Q_EMIT autostart_enabled_changed();
+        QFile input(source);
+        if (!input.open(QIODevice::ReadOnly)) {
+            fail(QStringLiteral("无法读取自动启动桌面文件：%1").arg(source));
             return;
         }
-        qDebug("set_autostart_enabled: Copied desktop file from '%s' to '%s'", source.toStdString().c_str(), destination.toStdString().c_str());
-#endif
+        QString content = QString::fromUtf8(input.readAll());
 #ifdef IS_APPIMAGE
-        // Replace "Exec=virtual-surround-manager" with full path to AppImage
-        QFile file(destination);
-        if (file.open(QIODevice::ReadWrite | QIODevice::Text)) {
-            QString content = QTextStream(&file).readAll();
-            content.replace(QStringLiteral("Exec=virtual-surround-manager"), QStringLiteral("Exec=") + qEnvironmentVariable("APPIMAGE"));
-            file.seek(0);
-            file.resize(0);
-            QTextStream(&file) << content;
+        const QString appimage = qEnvironmentVariable("APPIMAGE");
+        if (appimage.isEmpty()) {
+            fail(QStringLiteral("无法确定 AppImage 的路径。"));
+            return;
         }
+        // Exec has its own quoting rules inside desktop-entry string escaping.
+        QString argument = QStringLiteral("\"");
+        for (const QChar c : appimage) {
+            if (c == u'%') argument += QStringLiteral("%%");
+            else {
+                if (c == u'\\' || c == u'"' || c == u'$' || c == u'`') argument += u'\\';
+                argument += c;
+            }
+        }
+        argument += u'"';
+        argument.replace(QStringLiteral("\\"), QStringLiteral("\\\\"));
+        argument.replace(u'\n', QStringLiteral("\\n"));
+        argument.replace(u'\r', QStringLiteral("\\r"));
+        argument.replace(u'\t', QStringLiteral("\\t"));
+        QStringList lines = content.split(u'\n');
+        for (QString &line : lines)
+            if (line.startsWith(QStringLiteral("Exec="))) line = QStringLiteral("Exec=") + argument;
+        content = lines.join(u'\n');
 #endif
-    } else {
-#if !defined(IS_FLATPAK)
-        // Native or AppImage: Remove the desktop file from the user's autostart folder (e. g. ~/.config/autostart)
-        QFile::remove(destination);
-        qDebug("set_autostart_enabled: Removed desktop file from '%s'", destination.toStdString().c_str());
-#endif
+        QSaveFile output(destination);
+        const QByteArray bytes = content.toUtf8();
+        if (!QDir().mkpath(QFileInfo(destination).path()) || !output.open(QIODevice::WriteOnly) ||
+            output.write(bytes) != bytes.size() || !output.commit()) {
+            fail(QStringLiteral("无法写入自动启动桌面文件：%1").arg(destination));
+            return;
+        }
+    } else if (QFileInfo::exists(destination) && !QFile::remove(destination)) {
+        fail(QStringLiteral("无法删除自动启动桌面文件：%1").arg(destination));
+        return;
     }
-
-    // Write to config file
-    m_config_settings.writeEntry("autostart_enabled", m_autostart_enabled);
+    m_autostart_enabled = value;
+    m_config_settings.writeEntry("autostart_enabled", value);
     m_config->sync();
-
     Q_EMIT autostart_enabled_changed();
+#endif
 }
 
 bool FrontendManager::get_virtual_surround_auto_enabled() const {
@@ -501,11 +535,9 @@ void FrontendManager::set_upmix_enabled(bool value) {
     m_config_settings.writeEntry("upmix_enabled", m_upmix_enabled);
     m_config->sync();
 
-    // The upmix flag is baked into the filter graph, so rebuild the module (this
-    // also applies the change to already routed streams). This must happen even
-    // while disabled: the module survives a disable, and leaving it stale here
-    // would resurrect the old upmix setting on the next enable.
-    if (!rebuild_module()) {
+    const bool applied = !m_virtual_surround_enabled ||
+        m_pipewire_manager->update_processing(m_upmix_enabled, parse_lfe_mode(m_lfe_mode));
+    if (!applied) {
         m_upmix_enabled = previous_value;
         m_config_settings.writeEntry("upmix_enabled", m_upmix_enabled);
         m_config->sync();
@@ -519,7 +551,8 @@ double FrontendManager::hrir_level_for_path(const QString &file_path) {
     if (cached != m_hrir_levels.cend())
         return cached.value();
     const double level = m_pipewire_manager->hrir_level_db(file_path.toStdString());
-    m_hrir_levels.insert(file_path, level);
+    if (std::isfinite(level) && level > -200.0)
+        m_hrir_levels.insert(file_path, level);
     return level;
 }
 
@@ -583,130 +616,36 @@ void FrontendManager::refresh_hrir_analysis() {
         if (generation != m_hrir_analysis_generation)
             return;
         if (!analysis.valid) {
-            text = QStringLiteral("HRIR 分析：未获取（无法读取 %1；需要有效的 14 声道 HeSuVi WAV）")
+            text = QStringLiteral("HRIR 分析不可用（%1：文件无效，或参考响应为零/无法定义相位；不应把缺失分析视为已对齐）")
                        .arg(QFileInfo(path).fileName());
         } else {
-            const QString missing = QStringLiteral("—");
-            QString alignment;
-            QString correction;
-            bool residual_valid = true;
-
-            if (analysis.per_ear_alignment) {
-                if (!analysis.per_ear_values_valid) {
-                    alignment = QStringLiteral("每耳：未获取（%1）").arg(missing);
-                    correction = missing;
-                    residual_valid = false;
-                } else {
-                    QString note;
-                    if (analysis.timbre == PipeWireManager::LfeTimbre::Diffuse) {
-                        note = QStringLiteral("（扩散场同源，L/R 相同）");
-                    } else if (analysis.main_delay_ms > 1e-9 && analysis.lfe_delay_l_ms <= 1e-9 &&
-                               analysis.lfe_delay_r_ms <= 1e-9) {
-                        note = QStringLiteral("（对齐延迟加在主路径）");
-                    }
-                    alignment = QStringLiteral("每耳：主 %1 ms；LFE L %2 / R %3 ms%4；校正前残差 L %5° / R %6°")
-                                    .arg(analysis.main_delay_ms, 0, 'f', 2)
-                                    .arg(analysis.lfe_delay_l_ms, 0, 'f', 2)
-                                    .arg(analysis.lfe_delay_r_ms, 0, 'f', 2)
-                                    .arg(note)
-                                    .arg(analysis.average_residual_l_degrees, 0, 'f', 1)
-                                    .arg(analysis.average_residual_r_degrees, 0, 'f', 1);
-                    const QString l = analysis.allpass_l_valid
-                                          ? QStringLiteral("L 全通 %1 Hz/Q%2（平均 %3°）")
-                                                .arg(analysis.allpass_l_freq, 0, 'f', 0)
-                                                .arg(analysis.allpass_l_q, 0, 'f', 2)
-                                                .arg(analysis.allpass_l_residual_degrees, 0, 'f', 1)
-                                          : QStringLiteral("L 无全通");
-                    const QString r = analysis.allpass_r_valid
-                                          ? QStringLiteral("R 全通 %1 Hz/Q%2（平均 %3°）")
-                                                .arg(analysis.allpass_r_freq, 0, 'f', 0)
-                                                .arg(analysis.allpass_r_q, 0, 'f', 2)
-                                                .arg(analysis.allpass_r_residual_degrees, 0, 'f', 1)
-                                          : QStringLiteral("R 无全通");
-                    correction = l + QStringLiteral("；") + r;
-                }
-            } else {
-                if (analysis.delay_main)
-                    alignment = QStringLiteral("主声道延迟 %1 ms").arg(analysis.alignment_ms, 0, 'f', 2);
-                else if (analysis.delay_lfe)
-                    alignment = QStringLiteral("LFE 延迟 %1 ms").arg(analysis.alignment_ms, 0, 'f', 2);
-                else if (analysis.residual_degrees > 15.0)
-                    alignment = QStringLiteral("相位非线性，未插入对齐");
-                else
-                    alignment = QStringLiteral("无需额外对齐");
-                correction = analysis.allpass_valid
-                                 ? QStringLiteral("全通 %1 Hz/Q%2（校正后平均 %3°、最坏 %4°）")
-                                       .arg(analysis.allpass_freq, 0, 'f', 0)
-                                       .arg(analysis.allpass_q, 0, 'f', 2)
-                                       .arg(analysis.allpass_residual_degrees, 0, 'f', 1)
-                                       .arg(analysis.allpass_worst_channel_degrees, 0, 'f', 1)
-                                 : QStringLiteral("未启用全通校正");
-            }
-
-            double effective_residual = 0.0;
-            if (analysis.per_ear_alignment) {
-                if (analysis.per_ear_values_valid) {
-                    const double l = analysis.allpass_l_valid ? analysis.allpass_l_residual_degrees
-                                                              : analysis.average_residual_l_degrees;
-                    const double r = analysis.allpass_r_valid ? analysis.allpass_r_residual_degrees
-                                                              : analysis.average_residual_r_degrees;
-                    effective_residual = std::max(l, r);
-                }
-            } else {
-                effective_residual = analysis.allpass_valid ? analysis.allpass_residual_degrees
-                                                             : analysis.average_residual_degrees;
-            }
-
-            QString send;
-            if (!residual_valid)
-                send = QStringLiteral("未获取（%1）").arg(missing);
-            else if (!m_upmix_enabled)
-                send = QStringLiteral("上混关闭，送量不生效");
-            else if (m_lfe_mode == QStringLiteral("reference"))
-                send = QStringLiteral("reference：仅原生 LFE");
-            else if (!analysis.send_safe)
-                send = QStringLiteral("已禁用（相位残差 %1° > 30°）").arg(effective_residual, 0, 'f', 1);
-            else if (m_lfe_mode == QStringLiteral("impact") && !analysis.impact_allowed)
-                send = QStringLiteral("impact 退回 −6 dB（相位残差 > 15°）");
-            else if (m_lfe_mode == QStringLiteral("impact"))
-                send = QStringLiteral("impact 0 dB");
-            else
-                send = QStringLiteral("balanced −6 dB");
-
-            const QString resample = analysis.resampled
-                                         ? QStringLiteral("；源 %1 kHz → 48 kHz（q14）")
-                                               .arg(analysis.source_rate / 1000.0, 0, 'f', 1)
-                                         : QString();
-            const QString level = m_preset_level_match
-                                      ? QStringLiteral("；预设响度匹配 %1 dB（列表中位参考）").arg(output_trim_db(), 0, 'f', 1)
-                                      : QStringLiteral("；预设响度匹配：关闭");
-            const QString limiter = m_output_limiter
-                                        ? QStringLiteral("；输出保护限幅：开（+5 ms）")
-                                        : QStringLiteral("；输出保护限幅：关闭");
-            const QString timbre_label =
-                analysis.timbre == PipeWireManager::LfeTimbre::Diffuse
-                    ? QStringLiteral("扩散场 HRIR")
-                    : (analysis.timbre == PipeWireManager::LfeTimbre::CenterHrir ? QStringLiteral("中心 HRIR")
-                                                                                : QStringLiteral("δ 脉冲"));
-            const QString low_frequency =
-                QStringLiteral("低频设置：Butterworth 4 阶 / %1 / 每耳").arg(timbre_label);
-
-            text = QStringLiteral("当前 HRIR：LFE 归一化 %1 dB；低频对齐：%2；拟合残差 %3°，校正前平均 %4°，最坏声道（诊断） %5°；相位校正（门控用校正后平均）：%6；%7；LFE 送量：%8%9%10%11")
-                       .arg(analysis.reference_gain_db, 0, 'f', 2)
-                       .arg(alignment)
-                       .arg(analysis.residual_degrees, 0, 'f', 1)
-                       .arg(analysis.average_residual_degrees, 0, 'f', 1)
-                       .arg(analysis.worst_channel_residual_degrees, 0, 'f', 1)
-                       .arg(correction)
-                       .arg(low_frequency)
-                       .arg(send)
-                       .arg(resample)
-                       .arg(level)
-                       .arg(limiter);
-            // Name the analysed file: several presets can legitimately produce
-            // the same 0.00 ms L/R values, so this makes a refresh visible even
-            // when the numerical fields look unchanged.
-            text += QStringLiteral("；文件：%1").arg(QFileInfo(path).fileName());
+            const QString timbre = m_lfe_timbre == QStringLiteral("diffuse")
+                ? QStringLiteral("扩散场 HRIR")
+                : (m_lfe_timbre == QStringLiteral("center") ? QStringLiteral("中心HRIR") : QStringLiteral("δ"));
+            const QString bass = !m_upmix_enabled || m_lfe_mode == QStringLiteral("reference")
+                ? QStringLiteral("关闭")
+                : (m_lfe_mode == QStringLiteral("impact") ? QStringLiteral("LFE 送量 0 dB（仅上混）")
+                                                          : QStringLiteral("LFE 送量 −6 dB（仅上混）"));
+            // A valid WAV can still have no usable LFE/main phase reference
+            // (e.g. an all-zero or cancelling IR). In that case the analyser
+            // returns no per-ear values; showing the default 0.00 would claim
+            // an alignment that the graph did not apply.
+            const QString main_delay = analysis.per_ear_values_valid
+                ? QString::number(analysis.main_delay_ms, 'f', 2) : QStringLiteral("—");
+            const QString lfe_delay_l = analysis.per_ear_values_valid
+                ? QString::number(analysis.lfe_delay_l_ms, 'f', 2) : QStringLiteral("—");
+            const QString lfe_delay_r = analysis.per_ear_values_valid
+                ? QString::number(analysis.lfe_delay_r_ms, 'f', 2) : QStringLiteral("—");
+            const QString residual_l = analysis.per_ear_values_valid
+                ? QString::number(analysis.average_residual_l_degrees, 'f', 1) : QStringLiteral("—");
+            const QString residual_r = analysis.per_ear_values_valid
+                ? QString::number(analysis.average_residual_r_degrees, 'f', 1) : QStringLiteral("—");
+            text = QStringLiteral("%1：%2 Hz；上混FFT 4096 / 128 ms；低频 %3（扩散 LFE）；原生LFE 120Hz BW4 / %4；"
+                                  "LFE/主对齐：主 %5 ms、LFE %6/%7 ms、残差 %8/%9°；%10；%11")
+                .arg(QFileInfo(path).fileName()).arg(analysis.source_rate).arg(bass).arg(timbre)
+                .arg(main_delay).arg(lfe_delay_l).arg(lfe_delay_r).arg(residual_l).arg(residual_r)
+                .arg(m_preset_level_match ? QStringLiteral("参考电平匹配 %1 dB").arg(output_trim_db(),0,'f',2) : QStringLiteral("电平匹配关闭"))
+                .arg(m_output_limiter ? QStringLiteral("8×重建峰值限幅 / 5 ms") : QStringLiteral("限幅关闭"));
         }
     }
 
@@ -739,10 +678,8 @@ void FrontendManager::set_lfe_mode(const QString &value) {
     m_config->sync();
     m_pipewire_manager->set_lfe_mode(parse_lfe_mode(m_lfe_mode));
 
-    // Like the upmix switch, the mode is baked into the filter graph. While
-    // routing is enabled only the effects graph is replaced behind the stable
-    // bridge sink, so a switch during playback keeps the stream in place.
-    if (!rebuild_module()) {
+    if (m_virtual_surround_enabled &&
+        !m_pipewire_manager->update_processing(m_upmix_enabled, parse_lfe_mode(m_lfe_mode))) {
         m_lfe_mode = previous_mode;
         m_pipewire_manager->set_lfe_mode(parse_lfe_mode(m_lfe_mode));
         m_config_settings.writeEntry("lfe_mode", m_lfe_mode);

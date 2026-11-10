@@ -85,11 +85,11 @@ void TrayIcon::set_visibility(bool visible) {
 }
 
 bool TrayIcon::is_visible() {
-    return m_tray_icon->isVisible();
+    return m_tray_icon->isVisible() && QSystemTrayIcon::isSystemTrayAvailable();
 }
 
 void TrayIcon::hide_main_window() {
-    if (m_main_window) {
+    if (m_main_window && is_visible()) {
         m_main_window->hide();
     }
 }
@@ -166,7 +166,7 @@ void TrayIcon::update_profile_menu() {
     const auto old_actions = m_profile_menu->actions();
     for (auto *action : old_actions) {
         m_profile_menu->removeAction(action);
-        delete action;
+        action->deleteLater();
     }
 
     // Use action group to enable only one selection and prevent removing the checkmark

@@ -82,6 +82,10 @@ add_subdirectory(third_party/freesurround_ladspa)
 # Include CMakeLists.txt in src directory
 add_subdirectory(src)
 
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()
+
 # Prepare and install shortcut to default system application path (e.g. /usr/share/applications/)
 configure_file(dist/${APPLICATION_ID}.desktop.in
     ${CMAKE_CURRENT_BINARY_DIR}/${APPLICATION_ID}.desktop @ONLY)

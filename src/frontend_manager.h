@@ -119,6 +119,7 @@ class FrontendManager : public QObject {
     int m_hrir_wav_file_name_index = 0;
     QString m_startup_ui;
     bool m_autostart_enabled = false;
+    bool m_autostart_pending = false;
     bool m_virtual_surround_auto_enabled = false;
     bool m_upmix_enabled = false;
     QString m_lfe_mode = QStringLiteral("balanced");

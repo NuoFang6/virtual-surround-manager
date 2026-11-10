@@ -17,6 +17,8 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 */
 
 // #include "stdafx.h"
+#include <algorithm>
+#include <numbers>
 #include <cmath>
 #include <cstring>
 #include <type_traits>
@@ -42,7 +44,7 @@ static_assert(std::is_same<kiss_fft_scalar, double>::value,
               "Compile kiss_fft with kiss_fft_scalar defined as double.");
 
 typedef std::complex<double> cplx;
-const float pi = 3.141592654f;
+const double pi = std::numbers::pi;
 const float epsilon = 0.000001f;
 using namespace std;
 
@@ -140,8 +142,8 @@ public:
 
 private:
     // helper functions
-    static inline float sqr(double x) { return x * x; }
-    static inline double amplitude(const cplx &x) { return sqrt(sqr(x.real()) + sqr(x.imag())); }
+    static inline double sqr(double x) { return x * x; }
+    static inline double amplitude(const cplx &x) { return std::abs(x); }
     static inline double phase(const cplx &x) { return atan2(x.imag(), x.real()); }
     static inline cplx polar(double a, double p) { return cplx(a * cos(p), a * sin(p)); }
     static inline float min(double a, double b) { return a < b ? a : b; }
@@ -224,6 +226,11 @@ private:
                     amp_total * ((1 - x) * (1 - y) * a[q][p] + x * (1 - y) * a[q][p + 1] + (1 - x) * y * a[q + 1][p] + x * y * a[q + 1][p + 1]),
                     phase_of[1 + (int)sign(chn_xsf[setup][c])]);
             }
+
+            // FreeSurround keeps center_image as a stored-but-unused API
+            // parameter; this decoder intentionally does not redistribute the
+            // center or renormalize the allocation vector. Keep the upstream
+            // mapping and level law here.
 
             // optionally redirect bass
             if (use_lfe && f < hi_cut)

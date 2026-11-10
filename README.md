@@ -19,13 +19,44 @@ The upstream is here: [Berny23/virtual-surround-manager](https://github.com/Bern
 
 ## Fork additions
 
-- Selectable **diffuse / δ / center LFE timbre**, fixed 120 Hz Butterworth-4 low-pass and per-ear HRIR/main phase alignment
-- 20 ms crossfade for automatic stereo ↔ multichannel switching
-- Optional **preset loudness matching** and **output limiter**
+- 4096-point FreeSurround FFT (128 ms upmix latency) with automatic stereo ↔ multichannel detection and 20 ms crossfades
+- **Mono 7-channel LFE send** (−6 / 0 dB, stereo upmix only) through the diffuse LFE path; no shelf on the front HRIRs
+- Native LFE: 120 Hz Butterworth-4, **coherent seven-pair diffuse** IR (normalized to the center HRIR), per-preset LFE/main delay and all-pass alignment
+- FreeSurround decode kept at its upstream mapping; `center_image` remains a no-op (not implemented upstream)
+- Optional **reference-level matching** and **8× reconstructed-peak limiter**
 - 44.1/96 kHz HRIR support with q14 resampling and 48 kHz graph alignment
-- Output gate with a 100 ms fade on track changes to prevent first-sample pops
+- Application-owned startup gate and 100 ms fade (an intentional interruption, not lossless processing)
 
 ## Development notes
+
+### Regression tests and reliability
+
+```sh
+cmake -B build -G Ninja -DBUILD_TESTING=ON -DBUILD_LADSPA_TEST_HOST=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+Tests cover malformed/EXTENSIBLE HRIRs, bundled HRIR analysis, arbitrary and
+variable audio block sizes, short multichannel events, limiter transients and
+the original plugin regressions. They do not change the user's audio routing.
+The 2026-11 audit also exercised separate PipeWire/WirePlumber/D-Bus sessions:
+server disconnect/re-enable, user mute preservation, preset reload and MPRIS
+pause-on-removal (including a forced-exit positive control).
+
+- All LFE timbres validate the same 14-channel WAV format. Truncated frames,
+  NaN/Inf, HRIRs over ten seconds or audio payloads over 256 MiB are rejected.
+- Generated delta/diffuse IRs use float32 without clipping individual taps;
+  quiet reference gains are no longer artificially raised to 0.05.
+- Track-start gating uses application-owned graph gains, not user mute/volume.
+- Server loss disables the reported state and safely retires modules. After
+  the service returns, enabling the effect reconnects without restarting the app.
+- `center_image` remains the upstream stored-but-unused parameter (no-op); the
+  later C/FL/FR redistribution and global power normalization were removed so
+  the FreeSurround decode keeps its original mapping and level law.
+- Flatpak portal completion handling and AppImage autostart escaping have been
+  updated, but their packaged runtime paths have not been integration-tested in
+  this session. No claim of universal bug-freedom is made.
 
 ### HRIR channel mapping
 
@@ -63,22 +94,20 @@ Channels 7-12 look "shuffled" only because HeSuVi lists the right-ear IRs of
 the right-side speakers in that block.
 
 The LFE channel is **not** convolved with the center HRIR by default. It uses a
-runtime-generated, HRIR-normalized LFE timbre IR of the same length and format
-as the selected HRIR (`convLFE_L`/`convLFE_R`): a diffuse-field average (the
-default) or, selectable in Settings, a unit impulse or the center HRIR pair.
-Only the unit impulse is strictly uncolored and equal L/R; the diffuse average
-and the center pair deliberately apply HRIR-derived timbre and can differ
-slightly between the ears. All variants keep the same convolver timing as the
-other channels. The 120 Hz 4th-order Butterworth lowpass, per-ear alignment and
-source-dependent gain are described below.
+runtime-generated, HRIR-normalized float32 stereo LFE timbre IR: the **coherent
+average of the seven left/right HRIR pairs**, scaled so its 40-80 Hz mean
+magnitude equals the center-HRIR reference gain. This is the historical
+"diffuse-field" approximation (the legacy configuration name is `diffuse`); it
+is a coherent sum, not a power average, so direction cancellations are possible.
+The unit impulse (`delta`) or the center HRIR pair (`center`) remain selectable.
+The unit impulse adds no HRIR timbre and is equal in the two generated IR
+channels; the complete path still contains filters/delays and the physical
+headphone response. Neither option is a universal neutral headphone calibration.
+Equal IR lengths do not imply equal phase or physical arrival time.
 
-This was verified **from the IR files themselves** (no recordings involved):
-for every real-measurement preset, the near-ear channel leads with the
-physically expected ITD (front ~0.2 ms, rear ~0.3 ms, side ~0.5-0.7 ms) and is
-louder by 6-12 dB; the center pair shows zero ITD and equal level. Synthesized
-presets (Apple/Atmos) carry only the level asymmetry and zero ITD. To re-check
-any preset, cross-correlate the channel pairs listed above instead of trusting
-recording-side channel maps - those are frequently wrong.
+The main-channel mapping agrees with PipeWire's installed HeSuVi example.
+ITD/level asymmetry checks can corroborate it for appropriate measured HRIRs,
+but synthetic presets and strong reflections need separate interpretation.
 
 Note: the mapping requires a 14-channel HRIR. Files with fewer channels (e.g.
 the bundled `oal_dflt.wav`, which has 7) are rejected with an error and the
@@ -95,169 +124,104 @@ multichannel content is assumed and the signal is passed through unchanged
 (the native-LFE makeup described below still applies). The bypass delay ring
 and the upmix core's FIFOs are kept primed.
 
-Both paths are 128 ms delayed. Before switching to bypass, the detector waits
-for the native content to traverse that delay line (plus the crossfade length),
-then blends the two paths over 20 ms. This removes the old hard-switch click
-and the 85 ms centre-channel hole; without the wait, the bypass path still
-contains the previous (stereo) content when the switch starts. The 20 ms
-crossfade also covers the return to upmixing after one second of pure stereo.
+Both paths are exactly 6144 samples delayed at 48 kHz (128 ms), independently
+of fixed or changing host block sizes. Detector decisions travel with the
+audio through that delay, and even brief non-L/R events are remembered. The
+paths blend over 20 ms; upmixing resumes after one second without non-L/R
+content. The transition ramp still attenuates the first part of a newly
+arriving native event; it no longer discards short events entirely.
 
-### LFE / bass management
+### Acoustic model and limitations
 
-The low-frequency handling is selectable in Settings (`lfe_mode` in the
-configuration file). All modes leave the main channels full-range (`use_lfe=0`),
-so their bass keeps the selected HRIR's spatial and timbral response, matching
-HeSuVi's stereo matrix (`SUB=0`) and the Dolby/Apple binaural renderers. Native
-5.1/7.1 LFE enters the LFE path directly and its 2x (+6 dB) plus the
-HRIR-normalized LFE timbre IR (diffuse-field by default) is calibrated against
-the Dolby binaural convention of +5.5 dB (10 dB speaker makeup minus 4.5 dB for
-two-point-source headphone rendering). With the BW4 low-pass it measures
-**+6.0 dB at 60 Hz**, 0.5 dB above that reference; the earlier LR4 produced
-+5.5 dB. That runtime IR is scaled to the selected HRIR's center-channel
-40-80 Hz magnitude, so the average 40-80 Hz LFE level is comparable across
-profiles; individual presets can still deviate at a single frequency (for
-example the synthetic AtmosRenderer profiles at 60 Hz).
+The equations, authoritative-source scope, numerical counterexamples and
+reproduction commands are documented in [the acoustic review](docs/acoustics.md).
+The implementation is an HRIR-based headphone renderer with heuristic upmixing,
+not a certified Dolby/DTS renderer or a headphone/SPL calibration system.
 
-- **Balanced (default)**: while upmixing stereo, the plugin writes a mono copy
-  of the seven main outputs, scaled to −6 dB, into its LFE output; the graph's
-  120 Hz 4th-order Butterworth stage low-passes it. The bypass branch used
-  for native 5.1/7.1 does not add this send, so real multichannel content never
-  gets a duplicate bass. Measures +3.4/+3.0/+2.5/+1.9 dB at
-  40/80/100/120 Hz with AppleSpatial and +3.6/+3.1/+2.6/+2.0 dB with
-  `27_95_142`.
-- **Reference**: native LFE only, no send; the most faithful and least
-  fatiguing option.
-- **Impact**: the same send at 0 dB instead of −6 dB (6 dB above balanced,
-  2x amplitude). Measures +5.8/+5.3/+4.5/+3.5 dB with AppleSpatial and
-  +6.1/+5.5/+4.7/+3.6 dB with `27_95_142`. It uses no static EQ; the previous
-  +4 dB/100 Hz shelf was removed because it sounded muddy and did not improve
-  punch.
-- **Automatic send safety**: a send is only added when the post-alignment
-  average absolute phase residual is at most 30°. The 0 dB impact level
-  additionally requires at most 15°. For the default diffuse timbre the LFE IR
-  is the average of the same seven HRIRs as the main sum, so the HRIR phase
-  cancels exactly and only the BW4 low-pass phase remains (~5.5° RMS after the
-  all-pass); the gate therefore passes for every preset. The preset-specific
-  failures (for example `AtmosRenderer-Far`, 249°, and `dtshx`, 143°) apply to
-  the δ/center timbres, where the LFE phase is not sourced from the same HRIR
-  average. Without the gate the −6 dB send cancelled the main bass by up to
-  4.6 dB at 40 Hz and 3.5 dB at 100 Hz. The analysis line and the journal state
-  which case applies.
+### LFE and optional bass enhancement
 
-The send and the LFE are aligned to the main HRIR bass per preset: the 120 Hz
-Butterworth-4 low-pass has several milliseconds of group delay at 40-120 Hz,
-while each HRIR has its own low-frequency delay. A per-ear 20-120 Hz fit
-(4.29 ms for `27_95_142` with the default diffuse IR; 3.98 ms in the earlier
-LR4/common-ear setup) removes the old −95…−171° phase difference above 90 Hz:
-the main path gets a common non-negative delay, and each LFE ear gets the
-remainder plus its own all-pass. Without it a louder send cancels instead of
-reinforcing. With the default diffuse timbre the L/R fits are identical,
-because the timbre is the same HRIR average as the main sum: the per-ear stage
-reduces to a common 4.29 ms main delay, zero LFE delays and one all-pass per
-ear. The continuous-grid residual is 12.15° RMS before and 5.55° RMS after the
-all-pass (max 10.6°). The per-ear/preset-dependent behavior below applies to the
-δ/center timbres: those whose phase is not a clean delay (for example
-`AtmosRenderer-Far`) fail the 30° send gate and get no send; impact
-additionally falls back to −6 dB when the residual exceeds 15°.
+Main channels remain full-range through their HRIRs. Native LFE uses a 120 Hz
+Butterworth-4 low-pass and 2x digital makeup (+6.0206 dB), applied once whether
+upmixing is enabled or not. This is the project's level convention, **not a
+universal +5.5 dB binaural standard**. The old +5.5 claim came from a secondary
+article describing a particular Dolby rendering behavior. Apple's LFE “Off”
+setting only documents disabled distance modelling; it does not specify this
+project's LFE gain or require a delta IR.
 
-The old 70-90 Hz FreeSurround redirect and its `VSM_BASS_MODE` /
-`VSM_BASS_LEGACY` / `VSM_LFE_SEND_DB` environment variables were removed.
-Important bass stays in the main channels; the LFE is an effects channel and
-is discarded in a stereo downmix.
+The three modes control a **mono main-sum LFE send**, not a shelf on the front
+HRIRs:
 
-### LFE timbre selection (A/B)
+- `reference`: no send; native LFE processing remains.
+- `balanced` (default): send at −6 dB (0.501).
+- `impact`: send at 0 dB (1.0).
 
-Settings → “LFE 音色”. The LFE low-pass is fixed to a **120 Hz 4th-order
-Butterworth** (−3 dB at 120 Hz, 24 dB/oct) and **per-ear LFE alignment is
-always on** (separate L/R delay/all-pass, one common main delay). The earlier
-LR4/BW8 low-pass and common/per-ear switches have been removed.
+The send is the sum of the seven upmix main outputs, written into the auto
+plugin's LFE output only in the upmix branch. The native bypass branch carries
+the native LFE at 2× and no send. It is low-passed at 120 Hz BW4, rendered
+through the coherent seven-pair diffuse IR with per-ear delay and
+all-pass alignment, and mixed into the final bus. The added layer is
+mono/diffuse, so it does not inherit the front HRIR
+image and does not apply to native multichannel content. This is a taste
+effect, not recovered LFE information or a standard crossover.
 
-Only the LFE IR/timbre is selectable, in this order:
+Native LFE is rendered independently: plugin bypass ×2 -> 120 Hz BW4 ->
+coherent diffuse timbre IR -> per-ear alignment delay -> final mix.
+The IR is scaled so its 40-80 Hz
+mean magnitude equals the center-HRIR reference gain, keeping the native-LFE
+calibration stable across presets. The main path gets one common alignment delay
+(so L/R ITD is untouched) and the LFE path gets per-ear delays plus an optional
+unity-magnitude all-pass. The fit is against the equal-weight coherent main sum
+over 20-120 Hz. This is a reference fit, not a guarantee for
+arbitrary content.
 
-1. **Diffuse-field HRIR (default)** — average of the seven left/right HRIRs,
-   normalized to the center pair’s 40–80 Hz magnitude. With the BW4 low-pass
-   the native LFE lands at +6.0 dB at 60 Hz, 0.5 dB above the Dolby binaural
-   +5.5 dB reference (the old LR4 produced +5.5). It is a timbre/externalization
-   choice, not a strictly neutral LFE: some presets deviate from the center IR
-   and show a small L/R difference. Because it is the same seven-HRIR average
-   used by the main sum, its HRIR phase cancels exactly in the LFE/main
-   comparison; the alignment reduces to the BW4 low-pass and is identical for
-   L/R and for every preset (the send gate passes in this mode). This exact
-   cancellation refers to the unweighted seven-HRIR main sum: FreeSurround's
-   per-channel output gains depend on the content, so a fixed LFE filter aligns
-   the mono/equal-weight reference exactly but only approximates arbitrary
-   upmix distributions (the 5.5° figure is that reference, not a guarantee for
-   every mix).
-2. **δ impulse (uncolored, second)** — the normalized unit impulse; equal L/R,
-   no HRIR coloring. This is the strictly neutral LFE option.
-3. **Center HRIR (third)** — the center HRIR pair; a colored, center-like LFE.
+The 30°/15° send gate applies again: the send is disabled entirely when the
+post-alignment residual exceeds 30°, and impact's 0 dB requires 15° (otherwise
+it falls back to −6 dB). The gate values are fixed at graph build time.
+`center_image` remains the upstream no-op: the decoder stores it but never
+reads it. The later C/FL/FR redistribution and global main-channel
+normalization were removed so the mapping and level law are the original
+FreeSurround ones.
 
-Changing the LFE timbre rebuilds the effects graph behind the stable bridge. The analysis
-line shows the active LFE timbre, the per-ear delays/all-pass and the send
-state. Measured with 27_95 at 60 Hz the output level is 0.02755 for the
-default (diffuse/BW4/per-ear); the 120 Hz BW4 level is 0.02469 vs 0.02292 with
-the old LR4. The differences are deliberately subtle; use bass-heavy content
-and A/B.
+### Reference-level matching and reconstructed-peak limiting
 
-### Relationship to speaker/AVR bass management
+Both options are off by default:
 
-The app is a **headphone binaural renderer**, not an AVR with a subwoofer, so
-the usual speaker bass-management settings do not transfer directly:
+- `preset_level_match` estimates A-weighted output power for **seven
+  uncorrelated, equal-power pink-noise inputs**, integrating 240 logarithmic
+  frequency bins below Nyquist and matching the current list median (±8 dB).
+  It sums channel powers instead of an arbitrary coherent C/FL/FR response.
+  This is a static reference level, **not LUFS or a promise of equal programme
+  loudness**. Only the overall trim changes.
+- `output_limiter` is a stereo-linked lookahead limiter with an **8×, 48-tap
+  polyphase windowed-sinc reconstructed-peak detector**. The audio stays at the
+  graph rate; only the detector is oversampled. 5 ms lookahead (240 samples),
+  −1.5 dBFS, 100 ms release. The host test checks 12 kHz phase-shifted,
+  23 kHz near-Nyquist and 200 Hz square waves with an independent 32×/128-tap
+  reconstruction; both sample and reconstructed peaks stay below −1.5 dBFS
+  (plus 0.02 tolerance). It is a safety limiter, not a hearing-protection
+  device.
 
-- **Do not add an 80 Hz speaker crossover / redirect to the main channels.**
-  The HRIR already contains the headphone's full-range response; a high-pass
-  and a mono LFE copy would remove the spatial low-frequency cues. This is why
-  the main channels stay full-range (`use_lfe=0`).
-- **LFE low-pass = 120 Hz** is the one setting that transfers directly (the
-  Dolby LFE band limit; DTS LFE content ends at 80 Hz and passes unchanged).
-  The implementation is a 120 Hz 4th-order Butterworth, which is −3 dB at
-  120 Hz and 24 dB/oct (chosen by listening on 2026-10-30 over the previous
-  LR4). Because LR4 was −6 dB at 120 Hz, BW4 makes the LFE about 3 dB hotter
-  at 100–120 Hz; that is the intended impact, not a level error. Changing it
-  would alter the 80–120 Hz transition and require re-fitting the
-  delay/all-pass.
-- **LFE is not a subwoofer**, and it is not +10 dB here. The speaker/sub
-  convention is +10 dB SPL; the Dolby binaural convention is +5.5 dB (10 dB
-  speaker makeup minus 4.5 dB for a two-point-source headphone render). The
-  native LFE gets its +6 dB (2x) and the HRIR-normalized LFE timbre IR targets
-  that reference; with BW4 it measures +6.0 dB at 60 Hz (0.5 dB hot). Do not
-  apply +10 dB to the headphone path.
-- **Reference is the LFE-only equivalent.** Native 5.1/7.1 never receives a
-  duplicated main bass (no “LFE+Main” for real multichannel). Balanced/impact
-  add a mono send **only while upmixing stereo**, with a 120 Hz low-pass and
-  phase alignment; they are taste options, not a bass-management standard.
-- **LFE LPF 80 Hz is not used**; it would cut the 80–120 Hz LFE content that
-  carries impact. The AVR advice to set the *sub's own* low-pass to maximum
-  does not apply because there is no sub in this chain.
-- **Level match and protection**: the optional preset loudness matching is the
-  analog of AVR speaker/sub level calibration, and the optional output limiter
-  is the analog of the AVR/pro LFE/output limiter. Both are off by default.
+The 0.30 output gain is −10.46 dB of nominal digital attenuation, not proof
+against overload for every multichannel signal. Headphone SPL depends on the
+whole reproduction chain and listening volume; the optional `impact` LFE send
+(0 dB) is the most likely source of hot low-frequency peaks.
 
-### Additional output options
+### Sample rate and rendering latency
 
-Both options rebuild the effects graph behind the stable bridge, so a running
-stream is not moved:
+The streams request 48 kHz; imported HRIRs are resampled by PipeWire at q14.
+The analysis uses the file's time axis and designs filters for 48 kHz. This is
+an approximation to the resampled graph and should be verified for unusual
+files, not assumed exact because the quality setting is high.
 
-- **Preset loudness matching** (`preset_level_match`, default off): computes a
-  center-weighted A-weighted level for every readable 14-channel HRIR and moves
-  the selected preset to the median of the current list, bounded to ±8 dB.
-  Only the overall gain changes; channel balance and the LFE/main ratio stay
-  untouched. The analysis line shows the applied trim.
-- **Output safety limiter** (`output_limiter`, default off): stereo-linked
-  lookahead peak limiter after `outGain`; 5 ms lookahead, −1.5 dBFS threshold,
-  100 ms release. Transparent below threshold. Enabling it adds 5 ms latency.
-  The normal chain is far below the threshold; the limiter only protects
-  extreme native bass or impact material.
-
-### Non-48 kHz HRIRs
-
-The graph always runs at 48 kHz. Imported 44.1/96 kHz 14-channel WAVs are
-accepted: PipeWire resamples the IR at the highest quality (`resample_quality`
-14), and the LFE alignment/all-pass are designed for the 48 kHz graph while the
-HRIR phase is measured on its own time axis. The analysis line shows the source
-rate and “已重采样”. The LFE timbre IR (delta or diffuse) is generated at the
-source rate and resampled by the same convolver, so the LFE/main level relation
-is preserved.
+A zero-block-latency convolver can still reproduce an IR's onset delay and
+frequency-dependent group delay. Equal IR lengths do not align those delays.
+The upmixer's 6144-sample latency (128 ms) is separate from HRIR/filter/system
+latency. The filter-graph reports the average of the main and LFE branch latencies;
+the mono LFE send and native-LFE alignment add at most ~4 ms of
+preset-dependent main-path delay on top of the 128 ms upmixer. The
+application-facing reported number therefore varies with the preset and was
+not re-measured after the FFT rollback; measure it with pw-dump when it
+matters.
 
 ### Input detection display
 
@@ -291,56 +255,44 @@ the UI switches.
 
 ### HRIR analysis
 
-The graph analyses the selected 14-channel WAV at every rebuild (not a hardcoded
-table): it prints and displays the LFE-IR normalization gain, the per-ear
-20-120 Hz alignment delays and all-pass corrections (unity magnitude, phase
-only), the absolute average/worst-channel phase residual per ear, the LFE-send
-state, the source sample rate and the preset-level trim. A new file is handled
-automatically; a 2 ms longer copy of `27_95_142` shifts the fitted delay by
-about 2 ms as expected. If the phase is not a clean delay (slope residual
->15 degrees, e.g. AtmosRenderer-Far), no delay or all-pass is inserted; a
-post-alignment residual above 30° disables any LFE send and above 15° prevents
-the 0 dB impact level. The result appears above the profile list in the main
-window and in the journal. Whenever the graph is rebuilt or the profile list is
-reloaded, the line is first replaced by an explicit “refreshing” sentinel; a
-failed or unavailable analysis shows “not acquired”, and missing per-ear values
-show “—”, so an old/default value cannot be mistaken for a fresh one. With the
-default diffuse timbre the LFE L/R delays are a real 0.00 ms (the HRIR phase
-cancels); the text says so explicitly instead of showing a bare zero.
+Each graph rebuild analyses the selected file. The display shows the reference
+gain, the LFE/main alignment delays (common main delay and per-ear LFE delays),
+the wrapped phase residual and whether an all-pass was fitted. Zero or invalid
+transfer functions cannot be called “aligned”; phase at zero magnitude is
+undefined. A phase of 359° is a −1° error, not 359°. All-pass search uses that
+circular distance as well.
 
-### Crackling / brief dropouts
+The reference phase is not the phase of every possible programme. It is an
+equal-weight coherent sum; FreeSurround's actual channel weights depend on the
+content. Diagnostics are estimates, not acoustic certification.
 
-Known sources of short interruptions during playback are addressed:
+### User HRIR 27_95_142 parameters
 
-- A newly created playback stream is routed behind a **150 ms output gate**
-  while upmixing: the effects graph is muted for 150 ms (the FreeSurround
-  delay), then unmuted at zero gain and faded in over 100 ms. Muting only the
-  source stream was too late: the first samples were already inside the 128 ms
-  delay line and reappeared at the output (measured first-sample burst
-  0.354 → 0). The gate also removes the previous track's delay-line residue.
-  A 30 ms source mute remains as a fallback when upmixing is off or the gate
-  proxy is unavailable; the continuous-tone release step measured
-  0.135 → 0.037.
-- The virtual device nodes set `node.latency = "1024/48000"`, which keeps the
-  PipeWire graph quantum at 1024 samples or more whenever the chain is active.
-  Without it, a low-latency application can drag the whole graph down to tiny
-  quanta where the convolver chain is prone to xruns, and every quantum
-  renegotiation is audible.
-- The upmix plugin applies one second of stereo hysteresis before re-engaging
-  upmixing after a bypass period (see `third_party/freesurround_ladspa/README.md`):
-  this keeps content hovering at the stereo detection threshold from toggling
-  the detector. The delay ring and upmix FIFOs stay primed.
-- The stereo/multichannel switch waits for the native content to traverse the
-  128 ms bypass delay (plus 20 ms) and then crossfades over 20 ms. The old
-  hard switch produced a click and an 85 ms centre hole with a short HRIR;
-  the wait/crossfade keeps the centre and surround image continuous.
-- Toggling upmixing on rebuilds the effect graph and needs a fresh 128 ms
-  delay line. A normal HeSuVi HRIR is about 1 s long and its tail covers that
-  refill, so changing profiles stays seamless. A very short HRIR (<128 ms,
-  e.g. `27_95_142.wav`) leaves a ~90 ms gap when upmixing is switched on;
-  upmixing off is a short overlap of the old delay line. This is a property of
-  the FreeSurround latency, not a routing problem. The optional output limiter
-  adds a further 5 ms when enabled.
+The bundled `src/assets/hrir_wav/27_95_142.wav` was generated from the user's
+April 2026 anthropometric inputs. The exact values, generator settings, source
+screenshot and SHA-256 hashes are preserved in
+[`docs/hrir/27_95_142/`](docs/hrir/27_95_142/README.md). Do not confuse them with
+the earlier January `HRTF1` inputs, which are a different measurement.
+
+### Startup and switching trade-offs
+
+- A new stream triggers application-owned post-graph gains: 150 ms hold while
+  upmixing, 30 ms otherwise, then a 100 ms fade. User mute/volume are not changed.
+  This intentionally suppresses audio and can affect other streams sharing the
+  graph; it is not lossless, and a source transient is not necessarily a defect.
+- `node.latency = "1024/48000"` is a **suggestion**, not a minimum quantum.
+  PipeWire may choose a smaller or forced larger quantum. The plugin supports
+  arbitrary block partitions instead of relying on this property for correctness.
+- Automatic content switching delays decisions alongside audio and uses a
+  20 ms crossfade. The initial part of a native event may be attenuated during
+  the transition. One second of stereo hysteresis reduces repeated switching.
+- Toggling upmix on/off and LFE mode are runtime controls and do **not** rebuild
+  the graph. Rebuilding for HRIR/timbre/level-match/limiter changes links the
+  new graph first and re-targets the bridge; the old graph can still play its
+  IR tail while the new one fills its 128 ms upmix delay. With very short HRIRs
+  this leaves an approximately 64–90 ms gap; there is no sample-level crossfade
+  between generations. This is a switching limitation, not a steady-state level
+  error.
 
 ## Acknowledgements
 

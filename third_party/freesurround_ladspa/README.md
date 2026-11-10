@@ -5,28 +5,32 @@ This directory vendors the **FreeSurround stereo-to-7.1 upmixer** from the
 
 The directory provides three LADSPA labels: **`freesurround71`** (stereo to
 7.1), **`freesurround71_auto`** (8 in / 8 out with stereo detection) and
-**`output_limiter`** (optional stereo lookahead safety limiter).
+**`output_limiter`** (optional stereo reconstructed-peak limiter).
 
 The virtual surround filter graph uses **`freesurround71_auto`** when upmixing:
 when the input is stereo — i.e. all non-L/R channels are silent — it upmixes to
 7.1 with FreeSurround (Passive Surround Decoding); as soon as any non-L/R
 channel carries signal, real multichannel content is detected and the input is
-passed through unchanged with matching latency compensation. This replicates
-the Windows chain (EqualizerAPO + Real3D-VST → HeSuVi), stereo detection
-included.
+passed through after a crossfade with matching sample latency and native-LFE
+makeup. This is heuristic spatial redistribution, not recovery of independently
+recorded surround channels or certification of equivalence to another renderer.
+The FFT is 4096 points; both paths are delayed by 6144 samples (128 ms at 48 kHz).
 
 The Virtual Surround Manager's graph always runs the upmixer with
-`use_lfe=0`: the main channels stay full-range through the HRIRs. Its three
-user-selectable LFE modes are built in the application's filter graph, not in
-the plugin: `balanced` adds a −6 dB mono copy of the main channels to the LFE
-while upmixing, `reference` uses native LFE only, and `impact` uses the same
-send at 0 dB. The application also delays the main or LFE path per preset (per
-ear by default) to align the 120 Hz low-pass bass with the HRIR bass; without
-that, a larger send cancels.
-The app additionally gates any send when the post-alignment residual is above
-30° (and the 0 dB impact level above 15°), so unaligned HRIRs cannot make the
-bass worse. The plugin's own bass-redirection DSP (`use_lfe=1`) remains
-available for other hosts but is no longer used by this application.
+`use_lfe=0`: the main channels stay full-range through the HRIRs. The
+`balanced`/`impact` modes use the auto plugin's **mono main-sum `lfe_send`**
+(−6 dB / 0 dB) only in the upmix branch; the native bypass branch keeps native
+LFE ×2 and no send. The send is low-passed at 120 Hz BW4, rendered through the
+coherent seven-pair diffuse IR, and per-ear delay/all-pass aligned against the
+main HRIR sum. A send is only applied when the post-alignment phase residual
+stays within 30° (impact's 0 dB needs 15°, otherwise it falls back to −6 dB);
+bad presets get no send at all. The added layer is a mono send through the
+diffuse IR, not a shelf on the front HRIRs, and does not apply to native
+multichannel content. The app also delays the main path (one common delay,
+preserving L/R ITD); see
+[the acoustic model](../../docs/acoustics.md).
+The plugin's own bass-redirection DSP (`use_lfe=1`) remains available for other
+hosts but is no longer used by this application.
 
 The plugin is **required for stereo upmixing** and built and installed together
 with the application (into the system LADSPA directory, e.g. `/usr/lib/ladspa`,
@@ -48,40 +52,42 @@ Local patches (not yet in Real3D-VST):
   process and reads it for the live input-detection display.
 - `vsm_auto_blocks` is exported as a monotonic processed-block counter; the
   application uses it as an "audio is really flowing" heartbeat for the UI.
-- The auto plugin has an extra `lfe_send` control. While upmixing, its LFE
-  output is the mono sum of the seven main outputs scaled by this value; while
-  bypassing, it remains the native LFE ×2 and the send is ignored. Keeping the
-  send inside the plugin is what prevents native 5.1/7.1 content from getting
-  a duplicate bass. The app passes 0.501 (balanced) or 1.0 (impact).
-
+- **`center_image` is the upstream no-op**: the LADSPA port and the decoder
+  setter store it, but `buffered_decode()` never reads it. No C/FL/FR phantom
+  and no global renormalization are applied; the original FreeSurround mapping
+  and level law are preserved.
 - `freesurround71_auto` re-engages upmixing only after one second of pure-stereo
   input instead of on the first silent block. The hysteresis is counted in
   samples (`kStereoToleranceSeconds`), so it is independent of the host quantum.
-- Both paths stay primed: the bypass delay ring is written in both modes, and
-  the upmix core is fed (with its output discarded) while bypassing.
-- The upmix→bypass switch waits for `kLatency + crossfade` samples of non-L/R
-  content. Switching after only 2 blocks used to emit the *old* bypass delay
-  contents: with a 1 kHz centre tone this was an 85 ms centre hole, a sample
-  step of 0.26 and a +5.5 dB level jump when the native channel arrived. The
-  wait ensures both paths contain the same input time before they are mixed.
+- Both paths stay primed and have an explicitly scheduled 6144-sample latency
+  (4096-point FFT), independent of the host's fixed or variable block size.
+  Large blocks are streamed through bounded buffers rather than copied into
+  fixed-size scratch arrays.
+- Detector decisions are delayed alongside the audio. A short non-L/R event
+  engages the existing one-second bypass hold rather than being discarded
+  because it did not last for `kLatency + crossfade` samples.
 - The path switch is a per-sample 20 ms crossfade (`kCrossfadeSeconds`).
   Both paths are kLatency-delayed, so they can be blended without an echo or a
   time jump; the crossfade removes the click and keeps the centre/surround
-  image continuous. The existing regression test checks block RMS, per-channel
-  centre presence, steady block steps and both transition directions.
-- The optional `output_limiter` label is a stereo-linked lookahead peak limiter
-  (default 5 ms lookahead, −1.5 dBFS threshold, 100 ms release). The application
-  inserts it after `outGain` when the user enables "输出保护限幅"; it is
-  transparent below threshold and adds the lookahead latency. The limiter
-  reports its latency through the standard LADSPA `latency` output port.
+  image continuous.
+- The optional `output_limiter` label is a stereo-linked lookahead limiter with
+  an **8×, 48-tap polyphase windowed-sinc reconstructed-peak detector**.
+  Default 5 ms lookahead (240 samples), −1.5 dBFS threshold, 100 ms release.
+  Audio stays at the host rate; only the detector is oversampled. The host test
+  checks 12 kHz phase-shifted, 23 kHz near-Nyquist and 200 Hz square waves with
+  an independent 32×/128-tap reconstruction. Below threshold it is unity gain
+  plus the lookahead delay; it is a safety limiter, not true-peak
+  hearing protection. The latency is reported through the standard LADSPA
+  `latency` output port.
+- The stereo label's latency port is wired independently of the auto label's
+  additional controls.
 - The bypass branch applies the native-LFE makeup: the LFE output is 2x the
-  input LFE (+6 dB). The filter graph uses unity LFE gain while upmix is enabled
-  (extracted bass must not be boosted), so native 5.1/7.1 LFE needs the same
-  makeup HeSuVi's `lfc.txt` applies. Bass extracted by the upmixer stays at 1x.
-- The silence floor for the stereo detection is -90 dBFS (`3e-5`) instead of
-  the VST's `-120 dBFS` (`1e-6`): dummy 8-channel output that carries only
-  dither-level noise on the non-L/R channels (browsers, games) still counts as
-  stereo and gets upmixed, while audible surround content still bypasses.
+  input LFE (+6.0206 dB), a product convention rather than universal headphone
+  calibration. The graph applies unity makeup while the auto plugin is present
+  so native LFE is not doubled twice.
+- The detector threshold is approximately −90.46 dBFS (`3e-5`) rather than
+  `1e-6`. This is a digital classification heuristic, not a physical audibility
+  threshold; quiet non-L/R content can be classified as stereo.
 
 ## Licenses
 

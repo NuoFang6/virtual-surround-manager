@@ -16,6 +16,8 @@
 #include <string>
 #include <string_view>
 
+#include "../third_party/freesurround_ladspa/dsp_config.h"
+
 using std::string;
 
 class PipeWireManager : public QObject {
@@ -26,8 +28,7 @@ class PipeWireManager : public QObject {
     ~PipeWireManager() override;
 
     //
-    // How the low-frequency path is enhanced around the always-uncolored LFE
-    // channel (see build_effects_module_args for the exact filters).
+    // LFE enhancement around the selected timbre (see build_effects_module_args).
     //
     enum class LfeMode {
         Balanced,  // native LFE + a -6 dB mono bass send while upmixing
@@ -35,9 +36,11 @@ class PipeWireManager : public QObject {
         Impact,    // the same send at 0 dB (falls back to -6 dB when unaligned)
     };
     void set_lfe_mode(LfeMode mode);
+    bool update_processing(bool upmix_enabled, LfeMode mode);
+    void write_controls_locked(std::initializer_list<std::pair<const char *, float>> values);
 
-    // Experimental low-frequency processing options (defaults reproduce the
-    // long-standing chain). They are exposed in Settings for A/B listening.
+    // The UI uses Butterworth4 and per-ear alignment. Older shapes remain in
+    // the internal analysis API for comparisons, not as user-facing settings.
     enum class LfeLowpass {
         Lr4,          // current: two cascaded Q=0.7071 low-passes, -6 dB at 120
         Butterworth4, // flat passband, -3 dB at 120, 24 dB/oct
@@ -46,7 +49,7 @@ class PipeWireManager : public QObject {
     enum class LfeTimbre {
         Delta,      // current: uncolored normalized impulse
         CenterHrir, // center HRIR pair, colored center-like LFE
-        Diffuse,    // diffuse-field average of the seven HRIR pairs
+        Diffuse,    // coherent average of the seven HRIR pairs (legacy config name)
     };
     void set_lfe_options(LfeLowpass lowpass, LfeTimbre timbre, bool per_ear_alignment);
 
@@ -63,7 +66,7 @@ class PipeWireManager : public QObject {
         bool delay_main = false;
         bool delay_lfe = false;
         double residual_degrees = 0.0;        // linear slope-fit residual
-        double average_residual_degrees = 0.0; // absolute average phase error after delay
+        double average_residual_degrees = 0.0; // legacy field name: wrapped phase RMS after delay
         double worst_channel_residual_degrees = 0.0;
         bool allpass_valid = false;
         double allpass_freq = 0.0;
@@ -75,13 +78,8 @@ class PipeWireManager : public QObject {
         // already computed for the 48 kHz graph.
         uint32_t source_rate = 0;
         bool resampled = false;
-        // Whether adding the LFE send is safe for this preset. send_safe gates
-        // any send (30 deg post-alignment residual); impact_allowed gates only
-        // the 0 dB impact level (15 deg).
-        bool send_safe = false;
-        bool impact_allowed = false;
-        // A-weighted energy of the center-weighted binaural impulse response,
-        // used only for relative preset loudness matching.
+        // A-weighted output power for equal, uncorrelated pink-noise inputs;
+        // a static reference level, not programme loudness or LUFS.
         double level_db = 0.0;
         // Per-ear LFE alignment. In this mode the LFE path gets separate L/R
         // delays and all-pass sections while the main path uses one common
@@ -111,9 +109,8 @@ class PipeWireManager : public QObject {
     HrirAnalysis analyze_hrir(const string &path) const;
 
     //
-    // Relative A-weighted level of one HRIR (center + half of FL/FR). Only
-    // differences between presets are meaningful; used by the optional preset
-    // loudness matching in the frontend.
+    // Relative A-weighted reference level for seven uncorrelated equal-power
+    // pink-noise inputs, integrated below Nyquist. Used only for preset trim.
     //
     double hrir_level_db(const string &path) const;
 
@@ -148,9 +145,8 @@ class PipeWireManager : public QObject {
     // Does nothing if the device already exists. Call this before enable_routing().
     // When upmix_enabled is set, stereo streams are upmixed to 7.1 by the bundled
     // FreeSurround LADSPA plugin (see find_ladspa_plugin()).
-    // The LFE path is always rendered without HRIR coloring, through a unit impulse
-    // ("dirac delta") IR of the same length as the selected HRIR, matching the
-    // conventional headphone-virtualizer design for the LFE channel.
+    // Delta/diffuse intermediates are float32, at the source rate and length.
+    // Center timbre uses the center HRIR pair. Only delta is uncolored.
     //
     bool create_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled,
                                         double output_trim_db = 0.0, bool output_limiter = false);
@@ -191,8 +187,30 @@ class PipeWireManager : public QObject {
     void disable_routing();
 
     Q_SIGNAL void error_occurred(const QString &message);
+    Q_SIGNAL void connection_lost();
 
   private:
+    std::atomic<bool> connected{false};
+    std::atomic<bool> shutting_down{false};
+    bool loop_started = false;
+    bool ensure_connection();
+    bool routing_stopping = false;
+    struct ModuleBinding {
+        PipeWireManager *manager;
+        pw_impl_module *module;
+        spa_hook listener{};
+        uint64_t generation;
+        bool expected_destroy = false;
+    };
+    QHash<pw_impl_module *, ModuleBinding *> module_bindings;
+    uint64_t module_generation = 0;
+    void track_module_locked(pw_impl_module *module);
+    void destroy_module_locked(pw_impl_module *module);
+    static void on_module_destroy(void *data);
+    const pw_impl_module_events module_events = {
+        .version = PW_VERSION_IMPL_MODULE_EVENTS,
+        .destroy = on_module_destroy,
+    };
     struct pw_thread_loop *thread_loop = nullptr;
     struct pw_context *context = nullptr;
     struct pw_core *core = nullptr;
@@ -226,6 +244,11 @@ class PipeWireManager : public QObject {
     LfeLowpass lfe_lowpass = LfeLowpass::Butterworth4;
     LfeTimbre lfe_timbre = LfeTimbre::Diffuse;
     bool lfe_per_ear_alignment = true;
+    // Gated mono main-sum send levels fixed at graph build time by the HRIR's
+    // post-alignment phase residual (0 when the send is unsafe). Runtime LFE
+    // mode changes must not exceed what the current graph was fitted for.
+    double lfe_send_balanced_ = VsmDsp::balanced_lfe_send;
+    double lfe_send_impact_ = VsmDsp::balanced_lfe_send;
 
     // Handle and symbol of the LADSPA plugin's exported auto-detection state.
     // The filter-chain module loads the plugin in this process, so dlopen()
@@ -249,6 +272,10 @@ class PipeWireManager : public QObject {
     // device). It lets us gate the post-graph output so a new track cannot
     // leak its first samples or the previous track's delay-line residue.
     pw_proxy *effects_playback_control_proxy = nullptr;
+    uint32_t effects_playback_control_id = SPA_ID_INVALID;
+    bool replacing_effects = false;
+    void bind_effects_control_locked();
+    void clear_effects_control_locked();
     std::atomic<bool> graph_upmix_enabled{false};
     std::atomic<uint64_t> output_gate_generation{0};
 
@@ -396,14 +423,11 @@ class PipeWireManager : public QObject {
     void update_playing_state();
 
     //
-    // Mutes a freshly routed stream for a very short moment, then unmutes it.
-    // This masks the pop caused by a new stream starting on the physical device
-    // / being moved to the bridge at the first sample of a new track. It is not
-    // the old 2 s graph-swap silence: 30 ms, only on a newly routed stream.
+    // Temporarily gates the post-graph signal on a newly routed stream. The
+    // application owns these gain controls; user mute/volume are never changed.
     //
     void fade_in_new_stream(uint32_t id);
-    void write_stream_mute(struct pw_node *node, bool mute);
-    void write_stream_volume(struct pw_node *node, float volume);
+    void write_output_gate_locked(float gain);
     bool gate_effects_output_locked();
 
     //

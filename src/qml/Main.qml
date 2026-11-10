@@ -132,7 +132,7 @@ Kirigami.ApplicationWindow {
                 text: i18nc("@action:switch", "已启用")
                 checkable: true
                 checked: frontendManager.virtualSurroundEnabled
-                enabled: frontendManager.hrirWavFileNames.length > 0
+                enabled: frontendManager.virtualSurroundEnabled || frontendManager.hrirWavFileNames.length > 0
                 onToggled: {
                     // Ignore the echo when the switch was synced from the manager state
                     if (checked === frontendManager.virtualSurroundEnabled) {
