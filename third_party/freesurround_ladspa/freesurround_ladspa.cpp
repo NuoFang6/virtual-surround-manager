@@ -374,7 +374,8 @@ void autoRun(LADSPA_Handle handle, unsigned long n) {
             input[c] = self->in[c] ? self->in[c][s] : 0.0f;
             if (!std::isfinite(input[c])) input[c] = 0.0f;
             if (c >= 2 && std::fabs(input[c]) > kStereoEpsilon) extra = true;
-            native[c] = self->bypass[c][self->bypassWriteIdx] * (c == 3 ? 2.0f : 1.0f);
+            native[c] = self->bypass[c][self->bypassWriteIdx] *
+                        (c == 3 ? VsmDsp::native_lfe_gain : 1.0f);
             self->bypass[c][self->bypassWriteIdx] = input[c];
         }
         self->bypassWriteIdx = (self->bypassWriteIdx + 1) % kLatency;
@@ -392,7 +393,7 @@ void autoRun(LADSPA_Handle handle, unsigned long n) {
         // summed from the seven upmix main outputs and rendered through the
         // graph's diffuse LFE path, so it does not inherit the front HRIR
         // image. The native LFE is silent while upmixing; in bypass the
-        // native[c] term below carries its 2x makeup instead.
+        // native[c] term below carries its calibrated makeup instead.
         if (send > 0.0f) {
             upmix[3] = send * (upmix[0] + upmix[1] + upmix[2] +
                                upmix[4] + upmix[5] + upmix[6] + upmix[7]);

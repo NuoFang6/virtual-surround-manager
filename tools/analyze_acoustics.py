@@ -15,6 +15,7 @@ import numpy as np
 
 LEFT = [0, 8, 6, 4, 12, 2, 10]
 RIGHT = [1, 7, 13, 5, 11, 3, 9]
+NATIVE_LFE_GAIN = 2.0
 
 
 def read_wav(path):
@@ -100,8 +101,12 @@ def main():
         timbre = mean * reference / np.abs(mean[::10][2:7]).mean()
         row = {"file": path.name, "rate": rate, "frames": len(samples), "reference_gain": float(reference)}
         row["native_lfe_vs_center_power_db_at_60"] = float(10 * np.log10(
-            np.sum(np.abs(2 * lowpass(np.array([60.])) * timbre[40]) ** 2) /
+            np.sum(np.abs(NATIVE_LFE_GAIN * lowpass(np.array([60.])) * timbre[40]) ** 2) /
             np.sum(np.abs(h[40, [6, 13]]) ** 2)))
+        reference_indices = np.arange(20, 61, 10)
+        row["native_lfe_vs_center_power_db_40_80"] = float(10 * np.log10(
+            np.sum(np.abs(NATIVE_LFE_GAIN * lowpass(f[reference_indices])[:, None] * timbre[reference_indices]) ** 2) /
+            np.sum(np.abs(h[reference_indices][:, [6, 13]]) ** 2)))
         row["coherent_vs_directional_power_db_at_60"] = float(10 * np.log10(
             np.mean(np.abs(mean[40]) ** 2) / np.mean(np.abs(h[40]) ** 2)))
         for send, name in [(10 ** (-6 / 20), "balanced"), (1., "impact")]:

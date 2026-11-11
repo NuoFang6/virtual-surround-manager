@@ -157,7 +157,7 @@ HRIRs:
 
 The send is the sum of the seven upmix main outputs, written into the auto
 plugin's LFE output only in the upmix branch. The native bypass branch carries
-the native LFE at 2× and no send. It is low-passed at 120 Hz BW4, rendered
+the native LFE at the calibrated gain and no send. It is low-passed at 120 Hz BW4, rendered
 through the coherent seven-pair diffuse IR with per-ear delay and
 all-pass alignment, and mixed into the final bus. The added layer is
 mono/diffuse, so it does not inherit the front HRIR

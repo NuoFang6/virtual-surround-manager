@@ -491,8 +491,10 @@ static LfeAlignment lfe_alignment_configured(const string &hrir_path, uint32_t g
         // The diffuse-field LFE IR is the average of the seven left/right HRIRs,
         // normalized to the center pair's 40-80 Hz magnitude so the LFE level
         // stays comparable across timbre modes. With the BW4 low-pass the native
-        // LFE lands at +6.0 dB at 60 Hz (0.5 dB above the +5.5 dB reference; the
-        // old LR4 gave +5.5). The writer below uses the same normalization.
+        // With the historical native 2x coefficient, the normalized timbre puts
+        // the default 40/50/60/70/80 Hz binaural-power reference near +6 dB.
+        // The coefficient lives in the auto plugin so the synthesized send is
+        // unaffected by native-LFE makeup.
         //
         // This is also the same seven-HRIR average that forms the main sum, so
         // lfe/left below is exactly a real multiple of the low-pass. The HRIR
@@ -1620,7 +1622,7 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
     // low-frequency layer is non-frontal.
     // - Balanced: the seven main channels are summed to mono at -6 dB inside
     //   the auto plugin's upmix branch; native LFE passes through the bypass
-    //   branch (2x makeup there).
+    //   branch with its calibrated makeup there.
     // - Reference: no send; native LFE only.
     // - Impact: the same send at 0 dB instead of -6 dB (2x amplitude).
     // A send is only safe when the post-alignment phase residual is small; for
@@ -1808,17 +1810,16 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
         { output = "fs:Out SR"  input="copySR:In"  }
 )graph";
         upmix_links += R"graph(
-        # The plugin's LFE output is the native LFE (2x) in bypass mode and the
-        # mono main-sum send while upmixing, so the graph always takes it.
+        # The plugin's LFE output is the calibrated native LFE in bypass mode and
+        # the mono main-sum send while upmixing, so the graph always takes it.
         { output = "fs:Out LFE" input="copyLFE:In" }
 )graph";
         graph_inputs = R"graph(  [ "fs:In FL" "fs:In FR" "fs:In FC" "fs:In LFE" "fs:In RL" "fs:In RR" "fs:In SL" "fs:In SR" ])graph";
     }
 
     // Native-LFE digital makeup remains 2x (+6.0206 dB), the historical product
-    // convention. It is not a universal headphone/SPL calibration. Actual LFE
-    // relative level depends on the selected IR, frequency and signal covariance.
-    // The auto bypass already applies 2x; do not apply it twice or to the send.
+    // convention restored after lower-gain listening trials. It is not a universal
+    // headphone/SPL calibration. Do not apply it twice or to the synthesized send.
     const string lfe_gain = "1.0";
     // Set 7.1 filter graph for virtual surround module, automatically creating playback and capture nodes
     const string filter_graph = R"graph(
@@ -1893,8 +1894,8 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
         # At 120 Hz this is -3 dB, so the LFE is 3 dB hotter at 100-120 Hz than the
         # earlier -6 dB LR4; that is the intended BW4 impact, not a level bug.
         # The IR is the selected diffuse/delta/center LFE timbre IR. The always
-        # present auto plugin applies the native 2x makeup in its bypass branch
-        # (and the balanced/impact send is already at its intended level), so
+        # present auto plugin applies the calibrated native makeup in its bypass
+        # branch (the balanced/impact send is already at its intended level), so
         # this graph gain stays 1.0 for both branches.
 )graph" + lpf_nodes + lfe_phase_nodes + R"graph(
         { type = builtin label = linear name = gainLFE_L control = { "Mult" = )graph" + lfe_gain + R"graph( } }

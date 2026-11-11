@@ -95,7 +95,7 @@ void blockTests(const LADSPA_Descriptor *descriptor) {
             h.run(512);
             for (float x : h.ports[channel + 8]) peak = std::max(peak, std::abs(x));
         }
-        check("short native event is preserved", std::abs(peak - (channel == 3 ? 0.5f : 0.25f)) < 1e-6f);
+        check("short native event is preserved", std::abs(peak - (channel == 3 ? 0.25f * VsmDsp::native_lfe_gain : 0.25f)) < 1e-6f);
     }
 }
 void limiterTests(const LADSPA_Descriptor *descriptor) {    const float ceiling = std::pow(10.0f, -1.5f / 20.0f);

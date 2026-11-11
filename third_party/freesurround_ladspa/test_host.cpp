@@ -4,7 +4,7 @@
     Covers:
       - freesurround71 stereo upmix smoke levels (440 Hz -> FC, 60 Hz -> LFE)
       - freesurround71_auto stereo <-> multichannel transitions without a gap
-      - the native-LFE bypass makeup (2x, +6 dB)
+      - the calibrated native-LFE bypass makeup
 
     Build: cmake -DBUILD_LADSPA_TEST_HOST=ON .. && cmake --build . --target freesurround_ladspa_test
     Run:   ./freesurround_ladspa_test path/to/freesurround_ladspa.so
@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "ladspa.h"
+#include "dsp_config.h"
 
 namespace {
 
@@ -306,14 +307,13 @@ void autoNativeLfe(const LADSPA_Descriptor *desc) {
     }
     long long t = 0;
     // FC (0.1) + LFE (0.25) only: non-L/R content -> bypass. Wait out the
-    // 6144-sample delay plus the 20 ms crossfade, then compare the steady last
-    // blocks against the generated input (the block RMS of a 40 Hz tone is not
-    // stable on its own).
+    // 6144-sample delay plus the 20 ms crossfade, then compare a steady 32-cycle
+    // window against the generated input.
     double inLfeAcc = 0, outLfeAcc = 0, inFcAcc = 0, outFcAcc = 0;
     for (int b = 0; b < 300; ++b) {
         r.block(t, 0xC);
         t += kBlock;
-        if (b >= 292) {
+        if (b >= 225) {
             for (unsigned s = 0; s < kBlock; ++s) {
                 inLfeAcc += (double)r.in[3][s] * r.in[3][s];
                 outLfeAcc += (double)r.out[3][s] * r.out[3][s];
@@ -322,7 +322,7 @@ void autoNativeLfe(const LADSPA_Descriptor *desc) {
             }
         }
     }
-    check("native LFE bypass gain", sqrt(outLfeAcc / inLfeAcc), 2.0, 0.05);
+    check("native LFE bypass gain", sqrt(outLfeAcc / inLfeAcc), VsmDsp::native_lfe_gain, 0.002);
     check("FC bypass gain", sqrt(outFcAcc / inFcAcc), 1.0, 0.02);
     r.cleanup();
 }

@@ -174,6 +174,15 @@ auto 检测 crossfade/迟滞、`hrir_wav` 统一校验、断连/世代处理、�
 
 **版本切换工具**：`~/.local/bin/vsm-version`（`list/current/stop/start/<name>`），版本库 `~/.local/share/virtual-surround-manager/versions/`：`v20261030`（旧版）、`v20261110-fft2048`、`v20261110-shelf`、`v20261110-power`、`v20261110-hybrid`、`v20261110-rollback`（4096 现行）。切换会 sudo 安装应用+插件并重启应用。注意：切换脚本只换二进制；`lfe_diffuse_ir.wav` 由建图时自动重新生成，无需手动清理。
 
+## 0H. 2026-11-11 默认原生 LFE 系数试听后还原（**现行**）
+
+用户先把默认 `27_95_142` 的原生LFE目标定为+5.5 dB，随后依次试听1.8941745×和1.95×，均认为低频不如原来，最终要求恢复 **2.0×**。测量口径为同幅度原生LFE与中心主声道分别通过完整默认路径后，在40/50/60/70/80 Hz五点上合并左右耳功率，再计算比值；不是单独的插件系数，也不外推为所有HRIR/频率的声学标准。
+
+- 隔离 PipeWire/WirePlumber/pipewire-pulse/null sink：2.0×基线实测 **+5.9722 dB**；1.8941745×复测 **+5.4999 dB**；1.95×复测 **+5.7523 dB**；最终恢复2.0×后复测仍为 **+5.9722 dB**，40/50/60/70/80 Hz分别为 +6.0182/+6.0172/+6.0056/+5.9643/+5.8533 dB。
+- 原生LFE旁路系数最终恢复为 **2.0**。共享常量与更严格的整数周期插件回归测试保留；系数只作用于原生多声道旁路，balanced/impact合成send、diffuse IR、BW4、对齐与主声道不变。
+- 40 Hz 是历史 LFE 音色归一化参考带 40–80 Hz 的起点，不是高通截止；LFE 路径仍处理 40 Hz 以下。该参考带避开 HRIR 最低频更易受测量/窗长影响的区域，并远离 120 Hz 低通转折区。
+- 系数定义于 `third_party/freesurround_ladspa/dsp_config.h`，插件及回归测试共用；系统安装和宿主应用重启仍需单独执行。
+
 ## 1. 项目概况
 
 - **Virtual Surround Manager**：Berny23 上游项目的硬分叉（hard fork），版本从 0.0.1 重新起算。C++20、Qt6 + Kirigami、CMake/Ninja。
