@@ -3,6 +3,9 @@
 #include <complex>
 #include <array>
 #include <algorithm>
+#include <atomic>
+#include <bit>
+#include <cstdint>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -98,7 +101,18 @@ void blockTests(const LADSPA_Descriptor *descriptor) {
         check("short native event is preserved", std::abs(peak - (channel == 3 ? 0.25f * VsmDsp::native_lfe_gain : 0.25f)) < 1e-6f);
     }
 }
-void limiterTests(const LADSPA_Descriptor *descriptor) {    const float ceiling = std::pow(10.0f, -1.5f / 20.0f);
+void limiterTests(const LADSPA_Descriptor *descriptor, void *library) {
+    const float ceiling = std::pow(10.0f, -1.5f / 20.0f);
+    auto *currentBits = reinterpret_cast<std::atomic<std::uint32_t> *>(dlsym(library, "vsm_limiter_current_gain_bits"));
+    auto *minimumBits = reinterpret_cast<std::atomic<std::uint32_t> *>(dlsym(library, "vsm_limiter_min_gain_bits"));
+    auto *activeSamples = reinterpret_cast<std::atomic<std::uint64_t> *>(dlsym(library, "vsm_limiter_active_samples"));
+    auto *reducedSamples = reinterpret_cast<std::atomic<std::uint64_t> *>(dlsym(library, "vsm_limiter_reduced_samples"));
+    auto *latestGeneration = reinterpret_cast<std::atomic<std::uint64_t> *>(dlsym(library, "vsm_limiter_latest_generation"));
+    auto *activeGeneration = reinterpret_cast<std::atomic<std::uint64_t> *>(dlsym(library, "vsm_limiter_active_generation"));
+    auto *intervalPeakBits = reinterpret_cast<std::atomic<std::uint32_t> *>(dlsym(library, "vsm_limiter_interval_peak_bits"));
+    auto *statisticsEnabled = reinterpret_cast<std::atomic<bool> *>(dlsym(library, "vsm_limiter_statistics_enabled"));
+    check("limiter statistics exports are available", currentBits && minimumBits && activeSamples && reducedSamples &&
+          latestGeneration && activeGeneration && intervalPeakBits && statisticsEnabled);
     for (float amplitude : {1.0f, 10.0f, 100.0f}) {
         Host h(descriptor, 2048);
         h.ports[0][0] = amplitude; h.ports[1][0] = amplitude / 10;
@@ -113,6 +127,34 @@ void limiterTests(const LADSPA_Descriptor *descriptor) {    const float ceiling 
     check("threshold changes take effect while running", h.ports[2].back() <= 0.100001f);
     h.set("Lookahead (ms)", 0); h.run(4096);
     check("minimum lookahead covers reconstruction detector", h.ports[h.index("latency")][0] >= 25.0f);
+
+    if (currentBits && minimumBits && activeSamples && reducedSamples && latestGeneration &&
+        activeGeneration && intervalPeakBits && statisticsEnabled) {
+        statisticsEnabled->store(false);
+        currentBits->store(std::bit_cast<std::uint32_t>(1.0f));
+        minimumBits->store(std::bit_cast<std::uint32_t>(1.0f));
+        activeSamples->store(0);
+        reducedSamples->store(0);
+        intervalPeakBits->store(0);
+        activeGeneration->store(latestGeneration->load());
+        Host stats(descriptor, 1024);
+        activeGeneration->store(latestGeneration->load());
+        stats.run(1024);
+        check("limiter silence is excluded from statistics", activeSamples->load() == 0);
+        check("limiter silence has no input peak", intervalPeakBits->load() == 0);
+        std::fill(stats.ports[0].begin(), stats.ports[0].end(), 1.0f);
+        std::fill(stats.ports[1].begin(), stats.ports[1].end(), 1.0f);
+        stats.run(1024);
+        check("disabled telemetry does not count active samples", activeSamples->load() == 0);
+        check("disabled telemetry does not publish input peaks", intervalPeakBits->load() == 0);
+        statisticsEnabled->store(true);
+        stats.run(1024);
+        check("limiter counts active samples", activeSamples->load() > 0);
+        check("limiter counts materially reduced samples", reducedSamples->load() > 0 && reducedSamples->load() <= activeSamples->load());
+        check("limiter exports current reduction", std::bit_cast<float>(currentBits->load()) < 1.0f);
+        check("limiter exports maximum reduction", std::bit_cast<float>(minimumBits->load()) < 1.0f);
+        check("limiter exports reconstructed input peak", std::bit_cast<float>(intervalPeakBits->load()) >= 1.0f);
+    }
 }
 void qualityTests(const LADSPA_Descriptor *autoDesc, const LADSPA_Descriptor *limiterDesc) {
     // Upstream FreeSurround stores center_image but never reads it in the
@@ -185,7 +227,7 @@ int main(int argc, char **argv) {
         check("stereo latency control is connected", stereo.ports[stereo.index("latency")][0] == latency);
     }
     blockTests(descriptor(1));
-    limiterTests(descriptor(2));
+    limiterTests(descriptor(2), library);
     qualityTests(descriptor(1),descriptor(2));
     dlclose(library);
     std::printf("%d failures\n", failures);

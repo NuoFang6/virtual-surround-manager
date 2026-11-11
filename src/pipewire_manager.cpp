@@ -23,6 +23,7 @@
 #include <QtEndian>
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <bit>
 #include <cstdlib>
@@ -863,7 +864,55 @@ bool PipeWireManager::restore_physical_default() {
     pw_metadata_set_property(metadata, 0, "default.audio.sink", "Spa:String:JSON", payload.c_str());
     qInfo("restore_physical_default: virtual sink was selected as default, restored '%s'", restore.c_str());
     update_speaker_bypass();
+    update_physical_output();
     return true;
+}
+
+void PipeWireManager::update_physical_output() {
+    string name;
+    if (effects_playback_id != SPA_ID_INVALID) {
+        for (const LinkInfo &link : std::as_const(links)) {
+            if (link.output_node == effects_playback_id && sinks.contains(link.input_node)) {
+                name = sinks.value(link.input_node).node_name;
+                break;
+            }
+        }
+    }
+    if (name.empty()) {
+        name = last_physical_default_sink;
+        if (name.empty() || is_our_sink_name(name))
+            name = default_sink_name;
+        if (name.empty() || is_our_sink_name(name))
+            name = choose_physical_default_sink();
+    }
+
+    string description;
+    for (auto it = sinks.cbegin(); it != sinks.cend(); ++it) {
+        if (it.value().node_name == name) {
+            description = it.value().description;
+            break;
+        }
+    }
+    if (description.empty())
+        description = name;
+    {
+        QMutexLocker locker(&physical_output_mutex_);
+        if (name == physical_output_name_ && description == physical_output_description_)
+            return;
+        physical_output_name_ = name;
+        physical_output_description_ = description;
+    }
+    Q_EMIT physical_output_changed(QString::fromStdString(name), QString::fromStdString(description));
+}
+
+QString PipeWireManager::physical_output_name() const {
+    QMutexLocker locker(&physical_output_mutex_);
+    return QString::fromStdString(physical_output_name_);
+}
+
+QString PipeWireManager::physical_output_description() const {
+    QMutexLocker locker(&physical_output_mutex_);
+    return QString::fromStdString(physical_output_description_);
 }
 
 void PipeWireManager::update_speaker_bypass() {
@@ -1118,14 +1167,21 @@ void PipeWireManager::on_sink_info(void *data, const struct pw_node_info *info) 
     if (it != manager->sinks.end()) {
         if (form_factor)
             it.value().form_factor = form_factor;
+        const char *description = spa_dict_lookup(info->props, PW_KEY_NODE_DESCRIPTION);
+        if (!description)
+            description = spa_dict_lookup(info->props, PW_KEY_NODE_NICK);
+        if (description)
+            it.value().description = description;
         if (priority_text)
             it.value().priority = std::atoi(priority_text);
     }
 
     if (manager->is_our_sink_name(manager->default_sink_name))
         manager->restore_physical_default();
-    else
+    else {
         manager->update_speaker_bypass();
+        manager->update_physical_output();
+    }
 }
 
 int PipeWireManager::on_metadata_property(void *data,
@@ -1167,6 +1223,7 @@ int PipeWireManager::on_metadata_property(void *data,
         if (changed)
             qDebug("on_metadata_property: Default sink is now '%s'", new_default.c_str());
         manager->update_speaker_bypass();
+        manager->update_physical_output();
         return 0;
     }
 
@@ -1304,6 +1361,7 @@ void PipeWireManager::registry_event_global(void *data,
             const uint32_t out_id = static_cast<uint32_t>(std::strtoul(output, nullptr, 10));
             const uint32_t in_id = static_cast<uint32_t>(std::strtoul(input, nullptr, 10));
             manager->links.insert(id, LinkInfo{out_id, in_id});
+            manager->update_physical_output();
             if (manager->link_wait_active.load(std::memory_order_relaxed))
                 pw_thread_loop_signal(manager->thread_loop, false);
 
@@ -1377,7 +1435,11 @@ void PipeWireManager::registry_event_global(void *data,
             const char *priority_text = spa_dict_lookup(props, "priority.session");
             if (!priority_text)
                 priority_text = spa_dict_lookup(props, "priority.driver");
+            const char *description = spa_dict_lookup(props, PW_KEY_NODE_DESCRIPTION);
+            if (!description)
+                description = spa_dict_lookup(props, PW_KEY_NODE_NICK);
             manager->sinks[id] = SinkInfo{node_name, serial ? serial : "", form_factor ? form_factor : "",
+                                          description ? description : node_name,
                                           priority_text ? std::atoi(priority_text) : 0};
             // The registry global does not carry device.form-factor, so bind the
             // sink node to read its full info. This is also what tells the
@@ -1392,6 +1454,7 @@ void PipeWireManager::registry_event_global(void *data,
                                          &manager->sink_node_events, binding);
                 }
             }
+            manager->update_physical_output();
         }
         return;
     }
@@ -1472,6 +1535,7 @@ void PipeWireManager::registry_event_global_remove(void *data, uint32_t id) {
         }
         if (manager->link_wait_active.load(std::memory_order_relaxed))
             pw_thread_loop_signal(manager->thread_loop, false);
+        manager->update_physical_output();
     }
 
     auto sink_binding = manager->sink_bindings.find(id);
@@ -1483,6 +1547,7 @@ void PipeWireManager::registry_event_global_remove(void *data, uint32_t id) {
     }
 
     manager->sinks.remove(id);
+    manager->update_physical_output();
     manager->metadata_targets.remove(id);
     manager->routed_node_ids.remove(id);
     manager->decided_streams.remove(id);
@@ -1534,7 +1599,8 @@ void PipeWireManager::attach_binding_listener(NodeBinding *binding) {
 
 string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, bool upmix_enabled,
                                                   const string &capture_name, const string &playback_name,
-                                                  double output_trim_db, bool output_limiter) {
+                                                  double output_trim_db,
+                                                  const OutputEqConfig &output_eq) {
     if (hrir_wav_path.empty()) {
         qWarning("build_effects_module_args: No HRIR file provided");
         return {};
@@ -1724,33 +1790,64 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
         Q_EMIT error_occurred(QStringLiteral("未找到新版DSP插件。请重新安装。"));
         return {};
     }
-    const bool limiter_enabled = output_limiter;
+    string eq_nodes;
+    string eq_links;
+    string output_source_l = "outGainL:Out";
+    string output_source_r = "outGainR:Out";
+    if (output_eq.enabled) {
+        string filters;
+        for (const OutputEqFilter &filter : output_eq.filters) {
+            filters += "{ type = " + OutputEqualizer::filter_type_name(filter.type).toStdString() +
+                       " freq = " + std::to_string(filter.frequency) +
+                       " q = " + std::to_string(filter.q) +
+                       " gain = " + std::to_string(filter.gain_db) + " } ";
+        }
+        eq_nodes = R"graph(
+        # Device-specific headphone calibration. The parsed Equalizer APO
+        # filters are instantiated natively; eqGain applies a fixed
+        # A-weighted pink-reference match. The reconstructed-peak limiter after
+        # it contains narrow boosts without lowering the programme baseline.
+        { type = builtin label = param_eq name = outputEq config = { filters1 = [ )graph" + filters +
+                   R"graph( ] filters2 = [ )graph" + filters + R"graph( ] } }
+        { type = builtin label = linear name = eqGainL control = { "Mult" = )graph" +
+                   std::to_string(std::pow(10.0, output_eq.static_gain_db / 20.0)) + R"graph( } }
+        { type = builtin label = linear name = eqGainR control = { "Mult" = )graph" +
+                   std::to_string(std::pow(10.0, output_eq.static_gain_db / 20.0)) + R"graph( } }
+)graph";
+        eq_links = R"graph(
+        { output = "outGainL:Out" input="outputEq:In 1" }
+        { output = "outGainR:Out" input="outputEq:In 2" }
+        { output = "outputEq:Out 1" input="eqGainL:In" }
+        { output = "outputEq:Out 2" input="eqGainR:In" }
+)graph";
+        output_source_l = "eqGainL:Out";
+        output_source_r = "eqGainR:Out";
+        qInfo("build_effects_module_args: Output EQ enabled: %d filters, file preamp %+.2f dB, "
+              "reference response %+.2f dB, fixed gain %+.2f dB, resulting peak %+.2f dB",
+              output_eq.filters.size(), output_eq.file_preamp_db, output_eq.reference_level_db,
+              output_eq.static_gain_db, output_eq.maximum_output_gain_db);
+    }
+
     string limiter_nodes;
     string limiter_links;
     string graph_outputs = R"graph( [ "gateL:Out" "gateR:Out" ])graph";
-    string gate_links = R"graph(
-        { output = "outGainL:Out" input="gateL:In" }
-        { output = "outGainR:Out" input="gateR:In" }
-)graph";
-    if (limiter_enabled) {
-        const string limiter_plugin = json_escape(plugin_path.toStdString());
-        limiter_nodes = R"json(
-        # Optional output safety limiter (stereo-linked, 5 ms lookahead,
-        # -1.5 dBFS threshold, 100 ms release). Transparent below threshold;
-        # adds 5 ms latency. The user can turn it off in Settings.
+    string gate_links;
+    const string limiter_plugin = json_escape(plugin_path.toStdString());
+    limiter_nodes = R"json(
+        # Mandatory output safety limiter (stereo-linked, 5 ms lookahead,
+        # -1.5 dBFS threshold, 100 ms release). It is transparent below the
+        # threshold except for latency and bounds reconstructed output peaks.
         { type = ladspa name = limiter plugin = ")json" + limiter_plugin + R"json(" label = "output_limiter"
-          control = { "Threshold (dBFS)" = -1.5 "Release (ms)" = 100.0 "Lookahead (ms)" = 5.0 } }
+          control = { "Threshold (dBFS)" = -1.5 "Release (ms)" = 100.0 "Lookahead (ms)" = 5.0 "Statistics Generation" = )json" +
+                    std::to_string(effects_generation + 1) + R"json( } }
 )json";
-        limiter_links = R"json(
-        { output = "outGainL:Out" input="limiter:In L" }
-        { output = "outGainR:Out" input="limiter:In R" }
-)json";
-        gate_links = R"graph(
+    limiter_links = "        { output = \"" + output_source_l + "\" input=\"limiter:In L\" }\n" +
+                    "        { output = \"" + output_source_r + "\" input=\"limiter:In R\" }\n";
+    gate_links = R"graph(
         { output = "limiter:Out L" input="gateL:In" }
         { output = "limiter:Out R" input="gateR:In" }
 )graph";
-        qInfo("build_effects_module_args: Output limiter enabled (-1.5 dBFS, 5 ms lookahead)");
-    }
+    qInfo("build_effects_module_args: Mandatory output limiter enabled (-1.5 dBFS, 5 ms lookahead)");
 
     {
         qInfo("create_virtual_surround_module: Using FreeSurround plugin '%s'", plugin_path.toStdString().c_str());
@@ -1766,12 +1863,28 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
             if (upmix_state_handle) {
                 upmix_state = reinterpret_cast<std::atomic<int> *>(dlsym(upmix_state_handle, "vsm_auto_upmix_state"));
                 upmix_blocks = reinterpret_cast<std::atomic<uint64_t> *>(dlsym(upmix_state_handle, "vsm_auto_blocks"));
+                limiter_current_gain_bits = reinterpret_cast<std::atomic<uint32_t> *>(dlsym(upmix_state_handle, "vsm_limiter_current_gain_bits"));
+                limiter_min_gain_bits = reinterpret_cast<std::atomic<uint32_t> *>(dlsym(upmix_state_handle, "vsm_limiter_min_gain_bits"));
+                limiter_active_samples = reinterpret_cast<std::atomic<uint64_t> *>(dlsym(upmix_state_handle, "vsm_limiter_active_samples"));
+                limiter_reduced_samples = reinterpret_cast<std::atomic<uint64_t> *>(dlsym(upmix_state_handle, "vsm_limiter_reduced_samples"));
+                limiter_latest_generation = reinterpret_cast<std::atomic<uint64_t> *>(dlsym(upmix_state_handle, "vsm_limiter_latest_generation"));
+                limiter_active_generation = reinterpret_cast<std::atomic<uint64_t> *>(dlsym(upmix_state_handle, "vsm_limiter_active_generation"));
+                limiter_interval_peak_bits = reinterpret_cast<std::atomic<uint32_t> *>(dlsym(upmix_state_handle, "vsm_limiter_interval_peak_bits"));
+                limiter_statistics_enabled = reinterpret_cast<std::atomic<bool> *>(dlsym(upmix_state_handle, "vsm_limiter_statistics_enabled"));
+                if (limiter_statistics_enabled)
+                    limiter_statistics_enabled->store(limiter_statistics_requested.load(std::memory_order_relaxed),
+                                                      std::memory_order_relaxed);
             } else {
                 qWarning("build_effects_module_args: Could not open '%s' to read the upmix detection state",
                          plugin_path_utf8.constData());
             }
             if (!upmix_state)
                 qWarning("build_effects_module_args: The plugin does not export vsm_auto_upmix_state");
+            if (!limiter_current_gain_bits || !limiter_min_gain_bits ||
+                !limiter_active_samples || !limiter_reduced_samples ||
+                !limiter_latest_generation || !limiter_active_generation ||
+                !limiter_interval_peak_bits || !limiter_statistics_enabled)
+                qWarning("build_effects_module_args: The plugin does not export limiter statistics");
         }
 
         // FreeSurround stereo to 7.1 upmixer with the Real3D-VST auto-detection:
@@ -1912,11 +2025,12 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
         { type = builtin label = mixer name = finalR }
 )graph" + alignment_nodes + R"graph(
 
-        # Nominal digital attenuation: 0.30 = -10.46 dB before optional trim.
-        # Not a bound on arbitrary multichannel/FIR peaks or acoustic SPL.
-        { type = builtin label = linear name = outGainL control = { "Mult" = )graph" + std::to_string(0.30 * std::pow(10.0, output_trim_db / 20.0)) + R"graph( } }
-        { type = builtin label = linear name = outGainR control = { "Mult" = )graph" + std::to_string(0.30 * std::pow(10.0, output_trim_db / 20.0)) + R"graph( } }
-)graph" + limiter_nodes + R"graph(
+        # Static A-weighted reference calibration is supplied by the frontend.
+        # It is fixed for the selected HRIR and never follows programme content;
+        # the mandatory reconstructed-peak limiter provides the overload bound.
+        { type = builtin label = linear name = outGainL control = { "Mult" = )graph" + std::to_string(std::pow(10.0, output_trim_db / 20.0)) + R"graph( } }
+        { type = builtin label = linear name = outGainR control = { "Mult" = )graph" + std::to_string(std::pow(10.0, output_trim_db / 20.0)) + R"graph( } }
+)graph" + eq_nodes + limiter_nodes + R"graph(
         # Application-owned gate, independent of the user's node mute/volume.
         { type = builtin label = linear name = gateL control = { "Mult" = 1.0 } }
         { type = builtin label = linear name = gateR control = { "Mult" = 1.0 } }
@@ -1952,7 +2066,7 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
         { output = "nativeDelayR:Out" input="finalR:In 2" }
         { output = "finalL:Out" input="outGainL:In" }
         { output = "finalR:Out" input="outGainR:In" }
-)graph" + limiter_links + gate_links + R"graph(
+)graph" + eq_links + limiter_links + gate_links + R"graph(
     ]
     inputs  = )graph" + graph_inputs + R"graph(
     outputs = )graph" + graph_outputs + R"graph(
@@ -2013,7 +2127,8 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
 }
 
 bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled,
-                                                     double output_trim_db, bool output_limiter) {
+                                                     double output_trim_db,
+                                                     const OutputEqConfig &output_eq) {
     if (!ensure_connection()) {
         Q_EMIT error_occurred(QStringLiteral("连接 PipeWire 音频服务失败。"));
         return false;
@@ -2031,7 +2146,8 @@ bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path
     qInfo("create_virtual_surround_module: Creating device with WAV path '%s', upmixing %s",
           hrir_wav_path.c_str(), upmix_enabled ? "enabled" : "disabled");
 
-    pw_impl_module *new_effects = load_effects_module_locked(hrir_wav_path, upmix_enabled, output_trim_db, output_limiter);
+    pw_impl_module *new_effects = load_effects_module_locked(hrir_wav_path, upmix_enabled, output_trim_db,
+                                                             output_eq);
     if (!new_effects) {
         effects_capture_node_name.clear();
         effects_playback_node_name.clear();
@@ -2057,6 +2173,7 @@ bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path
 
     effects_module = new_effects;
     graph_upmix_enabled.store(upmix_enabled, std::memory_order_relaxed);
+    reset_limiter_statistics(effects_generation);
     sync_with_core(1);
     const bool created = is_valid() && bridge_module && module_bindings.contains(new_effects);
     pw_thread_loop_unlock(thread_loop);
@@ -2070,13 +2187,14 @@ bool PipeWireManager::create_virtual_surround_module(const string &hrir_wav_path
 }
 
 bool PipeWireManager::replace_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled,
-                                                      double output_trim_db, bool output_limiter) {
+                                                      double output_trim_db,
+                                                      const OutputEqConfig &output_eq) {
     if (!thread_loop)
         return false;
     pw_thread_loop_lock(thread_loop);
     if (!bridge_module) {
         pw_thread_loop_unlock(thread_loop);
-        return create_virtual_surround_module(hrir_wav_path, upmix_enabled, output_trim_db, output_limiter);
+        return create_virtual_surround_module(hrir_wav_path, upmix_enabled, output_trim_db, output_eq);
     }
 
     if (!is_valid()) {
@@ -2126,7 +2244,8 @@ bool PipeWireManager::replace_virtual_surround_module(const string &hrir_wav_pat
         effects_playback_id = old_playback_id;
         replacing_effects = false;
     };
-    pw_impl_module *new_effects = load_effects_module_locked(hrir_wav_path, upmix_enabled, output_trim_db, output_limiter);
+    pw_impl_module *new_effects = load_effects_module_locked(hrir_wav_path, upmix_enabled, output_trim_db,
+                                                             output_eq);
     if (!new_effects) {
         restore_state();
         pw_thread_loop_unlock(thread_loop);
@@ -2216,6 +2335,7 @@ bool PipeWireManager::replace_virtual_surround_module(const string &hrir_wav_pat
     }
     effects_module = new_effects;
     graph_upmix_enabled.store(upmix_enabled, std::memory_order_relaxed);
+    reset_limiter_statistics(effects_generation);
     replacing_effects = false;
     bind_effects_control_locked();
     pw_thread_loop_unlock(thread_loop);
@@ -2330,14 +2450,15 @@ void PipeWireManager::destroy_pending_effects_locked() {
 }
 
 pw_impl_module *PipeWireManager::load_effects_module_locked(const string &hrir_wav_path, bool upmix_enabled,
-                                                            double output_trim_db, bool output_limiter) {
+                                                            double output_trim_db,
+                                                            const OutputEqConfig &output_eq) {
     const uint32_t new_generation = effects_generation + 1;
     const string generation = std::to_string(new_generation);
     const string capture_name = string(capture_node_name_base) + ".effects." + generation;
     const string playback_name = string(playback_node_name_base) + ".effects." + generation;
 
     const string args = build_effects_module_args(hrir_wav_path, upmix_enabled, capture_name, playback_name,
-                                                  output_trim_db, output_limiter);
+                                                  output_trim_db, output_eq);
     if (args.empty())
         return nullptr;
 
@@ -2647,6 +2768,12 @@ void PipeWireManager::disable_routing() {
     }
 
     is_registry_listener_added = false;
+    {
+        QMutexLocker locker(&physical_output_mutex_);
+        physical_output_name_.clear();
+        physical_output_description_.clear();
+    }
+    Q_EMIT physical_output_changed(QString(), QString());
 
     pw_thread_loop_unlock(thread_loop);
 
@@ -2752,6 +2879,62 @@ uint64_t PipeWireManager::upmix_block_count() const {
     return upmix_blocks->load(std::memory_order_relaxed);
 }
 
+void PipeWireManager::set_limiter_statistics_enabled(bool enabled) {
+    limiter_statistics_requested.store(enabled, std::memory_order_relaxed);
+    if (!limiter_statistics_enabled)
+        return;
+    limiter_statistics_enabled->store(enabled, std::memory_order_relaxed);
+    if (!enabled && limiter_interval_peak_bits)
+        limiter_interval_peak_bits->store(0, std::memory_order_relaxed);
+}
+
+void PipeWireManager::reset_limiter_statistics(uint64_t generation) {
+    if (!limiter_current_gain_bits || !limiter_min_gain_bits ||
+        !limiter_active_samples || !limiter_reduced_samples ||
+        !limiter_latest_generation || !limiter_active_generation ||
+        !limiter_interval_peak_bits || !limiter_statistics_enabled)
+        return;
+    limiter_active_generation->store(0, std::memory_order_relaxed);
+    limiter_current_gain_bits->store(std::bit_cast<uint32_t>(1.0f), std::memory_order_relaxed);
+    limiter_min_gain_bits->store(std::bit_cast<uint32_t>(1.0f), std::memory_order_relaxed);
+    limiter_active_samples->store(0, std::memory_order_relaxed);
+    limiter_reduced_samples->store(0, std::memory_order_relaxed);
+    limiter_interval_peak_bits->store(0, std::memory_order_relaxed);
+    limiter_active_generation->store(generation, std::memory_order_relaxed);
+    qInfo("reset_limiter_statistics: active limiter generation %llu",
+          static_cast<unsigned long long>(generation));
+}
+
+PipeWireManager::LimiterStatistics PipeWireManager::limiter_statistics() const {
+    LimiterStatistics result;
+    if (!limiter_current_gain_bits || !limiter_min_gain_bits ||
+        !limiter_active_samples || !limiter_reduced_samples)
+        return result;
+
+    const uint64_t active = limiter_active_samples->load(std::memory_order_relaxed);
+    const uint64_t reduced = std::min(limiter_reduced_samples->load(std::memory_order_relaxed), active);
+    const float current = std::bit_cast<float>(limiter_current_gain_bits->load(std::memory_order_relaxed));
+    const float minimum = std::bit_cast<float>(limiter_min_gain_bits->load(std::memory_order_relaxed));
+    const auto reduction_db = [](float gain) {
+        return gain > 0.0f && std::isfinite(gain) ? std::max(0.0, -20.0 * std::log10(gain)) : 0.0;
+    };
+    result.available = true;
+    result.active_samples = active;
+    result.reduced_samples = reduced;
+    result.current_reduction_db = reduction_db(current);
+    result.maximum_reduction_db = reduction_db(minimum);
+    result.reduced_percent = active == 0 ? 0.0 : 100.0 * reduced / active;
+    result.active_seconds = static_cast<double>(active) / 48000.0;
+    result.threshold = std::pow(10.0, -1.5 / 20.0);
+    if (limiter_interval_peak_bits) {
+        const float peak = std::bit_cast<float>(
+            limiter_interval_peak_bits->exchange(0, std::memory_order_relaxed));
+        result.input_peak_valid = peak > 0.0f && std::isfinite(peak);
+        result.input_peak = result.input_peak_valid ? peak : 0.0;
+    }
+    return result;
+}
+
 bool PipeWireManager::is_speaker_bypass() const {
     return speaker_bypass.load(std::memory_order_relaxed);
 }
@@ -2776,6 +2959,12 @@ void PipeWireManager::on_core_error(void *data, uint32_t id, [[maybe_unused]] in
                              res == -ECONNABORTED || res == -ESHUTDOWN)) {
         const bool was_connected = manager->connected.exchange(false, std::memory_order_acq_rel);
         manager->audio_playing.store(false, std::memory_order_relaxed);
+        {
+            QMutexLocker locker(&manager->physical_output_mutex_);
+            manager->physical_output_name_.clear();
+            manager->physical_output_description_.clear();
+        }
+        Q_EMIT manager->physical_output_changed(QString(), QString());
         ++manager->output_gate_generation;
         pw_thread_loop_signal(manager->thread_loop, false);
         Q_EMIT manager->error_occurred(QString::asprintf("PipeWire error: %s", message && message[0] ? message : strerror(-res)));
@@ -2918,6 +3107,14 @@ PipeWireManager::~PipeWireManager() {
         upmix_state_handle = nullptr;
         upmix_state = nullptr;
         upmix_blocks = nullptr;
+        limiter_current_gain_bits = nullptr;
+        limiter_min_gain_bits = nullptr;
+        limiter_active_samples = nullptr;
+        limiter_reduced_samples = nullptr;
+        limiter_latest_generation = nullptr;
+        limiter_active_generation = nullptr;
+        limiter_interval_peak_bits = nullptr;
+        limiter_statistics_enabled = nullptr;
     }
 
     if (thread_loop) {

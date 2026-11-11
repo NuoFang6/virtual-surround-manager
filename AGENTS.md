@@ -2,12 +2,13 @@
 
 > **本文件包含项目上下文及历史记录，不是正确性证明。** 2026-11-09 用户要求：不要完全信任接手前的文档或代码；以接口规范、实际实现与可复现实测为依据，冲突时更新记录。
 > 面向未来的 LLM/协作者：先阅读本文件；历史数据的适用版本必须区分。
-> 最后更新：2026-11-10（深夜：FFT 4096 回滚定稿 + 文档精简，见 §0F/§0G）。
+> 最后更新：2026-11-12（静态参考响度 + 固定末级限幅，见 §0J）。
 
 ## 0. 2026-11-09～10 审查修复（优先于下方旧记录）
 
 ### 工作授权
 - 明确的 bug、健壮性改进和必要重构直接实施，不必逐项询问；涉及音色/延迟等设计取舍才询问。
+- Git偏好：用户要求提交/推送时直接提交到`main`，不要另建分支，除非用户另行指定。
 - **不使用子智能体**（用户本轮明确要求）。测试不得干扰宿主音频；sudo/系统安装前仍须告知，不保存密码。
 - 下方“唯一真相”“已验证”等历史措辞不能代替新验证。本轮没有重新认可所有旧声学论断。
 
@@ -183,13 +184,76 @@ auto 检测 crossfade/迟滞、`hrir_wav` 统一校验、断连/世代处理、�
 - 40 Hz 是历史 LFE 音色归一化参考带 40–80 Hz 的起点，不是高通截止；LFE 路径仍处理 40 Hz 以下。该参考带避开 HRIR 最低频更易受测量/窗长影响的区域，并远离 120 Hz 低通转折区。
 - 系数定义于 `third_party/freesurround_ladspa/dsp_config.h`，插件及回归测试共用；系统安装和宿主应用重启仍需单独执行。
 
+## 0I. 2026-11-11 按输出设备应用参数 EQ（现行）
+
+- 新增默认关闭的输出设备 EQ 校准：设置页为当前物理 sink 手动选择 Equalizer APO Parametric EQ 文本，并按 `node.name` 独立保存启用状态与路径；实际效果播放 Link 优先于 metadata 默认设备，`object.serial` 不用于持久身份。
+- 严格解析 `Preamp`、启用的 `PK`/`LSC`/`HSC`，最多64段；拒绝未知启用语句、NaN/Inf、超 1 MiB、超出 5 Hz–48 kHz Nyquist 的频率及异常 Q/增益。关闭的 filter 忽略。
+- 48 kHz 下按 PipeWire 1.6.10 同式 biquad 在32768个log点及DC/Nyquist计算合成峰值。文件 Preamp 与自动调整合并后，最终 EQ 自身的响应峰归一到0 dB：正峰自动降低，全频衰减可自动提高；不改变原有 outGain 0.30/预设电平匹配定义，也不是连续域、重建峰、SPL或听力保护保证。
+- 信号链为 `outGain → param_eq → 自动总增益 → limiter（可选）→ gate → 设备`。设备切换若无法安全应用新设备配置，会停止虚拟化路由，而不是继续把上一设备的 EQ 输出到新设备。
+- 代码审查后补充：拒绝低于扫描下限5 Hz的滤波器；丢弃queued的过期设备事件；停用路由/断连清空当前设备；未选文件时UI禁用开关。QCY另生成OE2018 notch-fill和250Hz混合版（200–315Hz平滑交叉），保护版保留AutoEq对约4.4kHz测量凹口的保护，notch-fill实验版把该点残差从约−5.94dB改善到+0.08/+0.09dB，但不作为默认推荐。
+- 新 `output_equalizer` CTest 覆盖合法/非法格式、OFF filter、正峰衰减、全衰减回补、缺 Preamp、NaN、低于5Hz和64段上限；完整 CTest 6/6。隔离 PipeWire/WirePlumber/null-sink 图实测 QCY H3 Pro 24段文件：文件前级−3.96 dB、自动+0.20 dB、净−3.76 dB，`eqGain=0.648374`；limiter开/关两种链路均成功建图。
+- **系统部署**：旧应用/插件备份 `/tmp/vsm-sys-backup-20261111-235232/`；安装 `/usr/bin/virtual-surround-manager` = `400ebdf7…`（521304 B），`/usr/lib(64)/ladspa/freesurround_ladspa.so` = `44908495…`（366320 B），与 Release 构建逐字节一致。桌面自启动的新实例 PID 233411 已核验：效果图创建成功、LFE balanced send 0.501、Enabled routing，稳定桥和内部效果节点均存在；未重启宿主 PipeWire。EQ 默认关闭，需在设置页按当前设备选择文件并手动启用。
+
+## 0J. 2026-11-12 静态参考响度与固定末级限幅（现行）
+
+用户反馈默认 `27_95_142` + 当前 QCY EQ 比关闭处理小很多，目标为：处理后不过载、响度接近未处理、基准响度不在播放途中变化。
+
+- 根因实测：旧图在 EQ 前固定 `outGain=0.30`（−10.46 dB），当前 QCY 24段 EQ 又按最高频响峰整体衰减 −3.76 dB，合计静态衰减约 −14.22 dB。物理耳机音量61%、虚拟/效果节点100%，不是节点音量误改。
+- 删除历史 0.30 固定衰减。初版先按七路不相关等功率粉红噪声把HRIR静态匹配到0dB，后经§0K/§0N改为带固定峰值余量的−15.5dB参考上限；本条初版数值已不现行。
+- EQ 不再按最高窄峰把整段压低；32768点log网格按 A 计权粉噪参考计算固定增益。当前 QCY 文件滤波器参考响应 **−0.05 dB**，固定校准 **+0.05 dB**，校准后最高频响峰约 **+3.81 dB**，由末级限幅承接。文件Preamp仅用于兼容/状态显示。
+- `output_limiter` 改为图中固定必经阶段，C++接口和UI不再提供关闭；升级时删除旧配置键。参数保持8×/48-tap重建峰检测、5ms前瞻、−1.5dBFS、100ms release。静态基准不跟随节目；真实过载时限幅增益及release必然会动态变化，这是不过载要求，不是节目响度归一化。
+- 当前链路：`HRIR/LFE mix → 静态HRIR增益 → param_eq → 静态EQ增益 → limiter → gate → device`。
+- Release CTest **6/6**。私人 PipeWire/WirePlumber/null-sink 端到端，同一12秒低电平立体声粉噪：处理后相对直出 **+1.0912 dB**；连续7个1秒窗波动 **0.033081 dB**；0.98峰值热信号经默认上混+balanced+27_95+QCY EQ后输出样本峰 **0.841395**。日志确认 `trim +0.84 dB`、EQ fixed gain `+0.05 dB`、mandatory limiter。测试未连接或重启宿主音频。
+- 边界：该参考不是LUFS/SPL，也不保证所有节目主观等响；限幅器不是认证true-peak或听力保护。处理后+1.09dB属于当前固定参考模型下的接近结果，不外推为任意内容。
+- **系统部署**：旧版备份 `/tmp/vsm-sys-backup-20261112-loudness/`；安装 `/usr/bin/virtual-surround-manager` = `10c240ef…`、`/usr/lib(64)/ladspa/freesurround_ladspa.so` = `44908495…`，与测试构建逐字节一致。新实例 PID 275697，宿主日志确认27_95 `trim +0.84 dB`、QCY EQ fixed gain `+0.05 dB` / resulting peak `+3.81 dB`、mandatory limiter、Enabled routing；桥与effects.2节点存在，旧`output_limiter`键已迁移删除。未重启宿主PipeWire。
+
+## 0K. 2026-11-12 直出参考上限与限幅统计（现行，补充 §0J）
+
+用户要求增加限幅器信息统计，并使固定参考只允许低于或等于直出。
+
+- 默认 HRIR 静态目标从相对直出0 dB改为 **−1.5 dB**；`preset_level_match=true` 取 `min(当前列表中位, −1.5 dB)`，不能越过直出参考上限。当前27_95 trim由+0.84 dB变为 **−0.66 dB**；EQ仍为等参考固定校准，不跟随内容。
+- 隔离 PipeWire/WirePlumber/null-sink 同一低电平粉噪 A/B：当前实际25段 conservative-fill EQ 下处理后相对直出 **−0.3732 dB**，连续7个1秒窗波动 **0.025928 dB**；0.98峰值热信号最终样本峰仍为 **0.841395**。测试硬断言处理后不得高于直出，且不能低超过2 dB。
+- LADSPA导出当前增益、当前图最小增益、非静音输出样本数、受衰减样本数；主界面每250ms显示当前/最大衰减、触发占比和累计有声时长。静音阈值为`1e-12`，不进入占比分母；统计不反馈DSP。
+- 每个效果图把应用 `effects_generation` 通过限幅器 `Statistics Generation` 控制端口显式传入；应用只在新效果图确认链接后激活同一世代并清零统计。旧图尾音和失败候选不能污染当前结果，不依赖LADSPA实例异步创建时序；直接宿主未设置端口时保留插件自动世代回退。
+- `plugin_regression`新增统计符号、静音排除、有声计数、触发计数、当前/最大衰减断言；完整Release CTest **6/6**。隔离应用真实前端状态：压力测试最大衰减1.22dB、当前衰减随release回到0.00dB，累计有声约26.5s；约46%衰减占比包含12秒近满幅热粉噪，不代表普通音乐。
+- **系统部署**：备份 `/tmp/vsm-sys-backup-20261112-limiter-stats/`；安装应用 `705310c1…`、插件 `52a0a1c5…`，与Release构建逐字节一致。实例PID307454；当前27_95 trim −0.66dB，实际25段 conservative-fill EQ fixed gain −0.19dB/resulting peak +3.58dB，EQ图明确激活统计世代2；无warning/error，未重启宿主PipeWire。
+
+## 0L. 2026-11-12 限幅滚动统计与 HRIR 状态修复（现行）
+
+用户报告衰减占比一直增加、HRIR分析卡在刷新中。
+
+- 原占比是当前图生命周期累计值，且任意小于单位增益的release尾巴都计为衰减，历史只能累积且容易接近100%。现改为最近 **10秒有声输出**滚动窗口，并只计至少 **0.10dB** 的实际衰减；每250ms取累计原子差值，旧桶按墙钟10秒过期，比例可升可降。当前/最大衰减与累计有声时长口径不变；换图计数回退时自动清空窗口。
+- 压力后恢复测试：近10秒≥0.10dB占比从非零明确回落到 **0.00%**，当前衰减回0.00dB，最大1.15dB保留。当前25段conservative-fill EQ端到端处理相对直出 **−0.3709dB**，窗口波动0.0231dB，热信号峰0.841395；CTest 6/6。
+- HRIR卡住根因：设备EQ异步重建调用`rebuild_module()`使分析失效，但该调用者不像设置setter那样在返回后刷新。现由`rebuild_module()`自身在所有成功/失败/禁用/无文件返回路径调用`refresh_hrir_analysis()`，不再依赖各调用者收尾。
+- 隔离`VSM_TEST_OUTPUT_EQ`在首图前注入EQ，不会触发宿主的异步二次换图，因此不冒充该路径的集成覆盖；最终宿主启动日志必须验证“刷新中→EQ图成功→最终分析文本”。
+
+## 0M. 2026-11-12 实时限幅余量（现行）
+
+用户指出滚动衰减占比仍不能判断余量是否足够，要求实时显示距离触发限幅多远。
+
+- 直接复用限幅器8×/48-tap检测器每块计算的重建输入峰值，原子累计轮询区间最大值；前端读取后清零。显示相对−1.5dBFS门槛的`距限幅 X dB`或`超过门槛 X dB`，与实际限幅判定同源，不是sample-peak近似。
+- 最近1秒没有高于−120dBFS（1e-6）的峰值时显示`峰值余量 暂无有声数据`；该门槛同时用于遥测有声时长，避免极小卷积/release尾巴生成几十至上百dB的伪实时余量。只影响遥测，不改音频与限幅。
+- 集成测试三态均出现：低电平约距限幅30dB；热粉噪超过门槛约1.05dB且最大衰减约1.15dB；停止后无数据。近10秒≥0.10dB占比恢复为0；CTest 6/6。当前25段EQ下处理相对直出−0.3714dB，热信号峰0.841395。
+- **系统部署**：备份`/tmp/vsm-sys-backup-20261112-margin/`；应用`e8aac568…`、插件`3679004c…`与Release构建逐字节一致。实例PID328255；EQ图统计世代2，启动异步换图后最后HRIR状态为最终分析（非刷新中），warning/error 0；未重启宿主PipeWire。
+
+## 0N. 2026-11-12 真实音乐峰值调查与14dB固定余量（现行）
+
+用户关闭播放器响度均衡后，多首音乐常显示超过限幅，曾单次看到约15dB；随后当前会话最大衰减稳定为13.09dB，决定采用14dB固定余量，并要求统计不在后台运行。
+
+- 同时录制桥输入与蓝牙物理输出约30秒：源为持续高电平母带，峰−0.234dBFS，每秒均达到该峰，8.79%样本高于−1.5dBFS；物理输出峰严格−1.5dBFS。所有播放流/桥/效果节点音量均100%/0dB，非软件音量超调。
+- 原录音相关系数约0.751；隔离完整链稳定复现超过门槛11.07dB。文件域直接用实际27_95 HRIR卷积同一源：峰从−0.234变为+9.447dBFS，峰增益+9.680dB，RMS反而低约1.02dB；证明根因是HRIR相关瞬态相干叠加，而非EQ/LFE/send/遥测。完整链相对源峰增益约9.8dB；先前曾误报12.57dB（漏了门槛与源峰修正），已更正。
+- 实时Link/Port核对确认播放器FL/FR→桥FL/FR，桥8通道逐一映射；不存在FR进LFE路由错误。
+- 按用户决定，HRIR静态参考上限从−1.5dB改为 **−15.5dB相对直出**，即在−1.5dBFS限幅门槛下保留14dB固定峰值余量；按27_95电平分析trim约−14.66dB。13.09dB已观察最大衰减对应约0.91dB剩余空间。`preset_level_match`只能取更低目标；trim下限扩到−24dB。基准固定，不做AGC。
+- 限幅遥测默认关闭，只在主窗口可见时由QML启用；隐藏/托盘时清峰并停止前端轮询，DSP每块仅一次relaxed布尔读取，跳过全部逐样本遥测比较/计数和遥测原子写入，不写磁盘。限幅器8×重建峰检测是安全音频路径，始终保留，不属于统计开销。
+- **验证/部署**：真实录制音乐隔离重放在14dB余量下最小仍距限幅2.93dB、最大衰减0；当前25段EQ低电平参考相对直出−14.3714dB，0.98热粉噪峰0.1912且不触限；CTest 6/6。备份`/tmp/vsm-sys-backup-20261112-headroom14/`；应用`94e50b5d…`、插件`72b43375…`与Release构建一致。实例PID364069，当前27_95 trim−14.66dB、EQ图世代2、最终HRIR分析正常、warning/error 0；未重启宿主PipeWire。
+
 ## 1. 项目概况
 
 - **Virtual Surround Manager**：Berny23 上游项目的硬分叉（hard fork），版本从 0.0.1 重新起算。C++20、Qt6 + Kirigami、CMake/Ninja。
 - **功能**：创建 PipeWire filter-chain 虚拟 8 声道 sink（7.1），可选 FreeSurround 上混，然后经 HeSuVi 14 通道 HRIR 卷积做耳机双耳渲染，输出 2 声道。
 - **用户背景（重要）**：本仓库用户是 **Real3D-VST 的作者**（基于 FreeSurround 改写的插件，网上搜不到）。历史上 80/111 Hz 的分频值出自用户本人，非外部权威；现已改为 70/90（见 §3）。
 - **构建**：`cmake -B build -G Ninja && cmake --build build`，安装前缀 `/usr`（`sudo cmake --install build --config Release`）。启动方式见 §9。
-- **关键源码**：`src/pipewire_manager.cpp`（稳定桥 + 可重建效果图 + LFE/主路径对齐 + send 门控）、`src/frontend_manager.cpp`（配置/Q_PROPERTY/状态文本）、`src/qml/Settings.qml`、`src/hrir_wav.{h,cpp}`（14ch WAV 校验）、`src/acoustics.h`、`third_party/freesurround_ladspa/`（三个 label：`freesurround71`、`freesurround71_auto`、`output_limiter`；`dsp_config.h` 集中 FFT/延迟/send 常数）、`tests/`（CTest）。
+- **关键源码**：`src/pipewire_manager.cpp`（稳定桥 + 可重建效果图 + LFE/主路径对齐 + send 门控 + 输出设备识别）、`src/frontend_manager.cpp`（配置/Q_PROPERTY/状态文本）、`src/qml/Settings.qml`、`src/hrir_wav.{h,cpp}`（14ch WAV 校验）、`src/output_equalizer.{h,cpp}`（Equalizer APO 严格解析 + 自动总增益）、`src/acoustics.h`、`third_party/freesurround_ladspa/`（三个 label：`freesurround71`、`freesurround71_auto`、`output_limiter`；`dsp_config.h` 集中 FFT/延迟/send 常数）、`tests/`（CTest）。
 
 ## 2. 历史信号链与参数（2026-10；已被 §0D–§0G 取代）
 

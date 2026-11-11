@@ -5,7 +5,9 @@
 #include <QDesktopServices>
 #include <QDir>
 #include <QFile>
+#include <QFileDialog>
 #include <QFileInfo>
+#include <QCryptographicHash>
 #include <QPointer>
 #include <QSaveFile>
 #include <QStandardPaths>
@@ -22,6 +24,8 @@
 #endif
 
 namespace {
+
+constexpr double kDirectReferenceCeilingDb = -15.5;
 
 PipeWireManager::LfeMode parse_lfe_mode(const QString &value) {
     if (value == QStringLiteral("reference"))
@@ -59,11 +63,16 @@ FrontendManager::FrontendManager(PipeWireManager *pipewire_manager, KConfig *con
         invalidate_hrir_analysis(QStringLiteral("音频服务或效果模块已断开"));
         refresh_input_detection();
     });
+    connect(m_pipewire_manager, &PipeWireManager::physical_output_changed, this,
+            [this](const QString &node_name, const QString &description) {
+                if (node_name != m_pipewire_manager->physical_output_name())
+                    return;
+                load_output_eq_for_device(node_name, description);
+            }, Qt::QueuedConnection);
 
     // Initialize UI values. The level-match setting is needed by the first
     // analysis refresh, so read it before loading the preset list.
     m_preset_level_match = m_config_settings.readEntry("preset_level_match", bool());
-    m_output_limiter = m_config_settings.readEntry("output_limiter", bool());
 
     m_lfe_timbre = m_config_settings.readEntry("lfe_timbre", QStringLiteral("diffuse"));
     if (!is_valid_lfe_timbre(m_lfe_timbre)) {
@@ -86,16 +95,20 @@ FrontendManager::FrontendManager(PipeWireManager *pipewire_manager, KConfig *con
     m_pipewire_manager->set_lfe_mode(parse_lfe_mode(m_lfe_mode));
 
     load_hrir_wav_files();
+    load_output_eq_for_device(m_pipewire_manager->physical_output_name(),
+                              m_pipewire_manager->physical_output_description());
 
     // Remove settings that no longer have any behaviour. `channels` belonged to
     // versions that still supported 5.1 output; `lfe_bypass` was the old toggle
     // for HRIR-colored LFE, which is now always rendered through the LFE timbre IR.
     if (m_config_settings.hasKey("channels") || m_config_settings.hasKey("lfe_bypass") ||
-        m_config_settings.hasKey("lfe_lowpass") || m_config_settings.hasKey("lfe_per_ear_alignment")) {
+        m_config_settings.hasKey("lfe_lowpass") || m_config_settings.hasKey("lfe_per_ear_alignment") ||
+        m_config_settings.hasKey("output_limiter")) {
         m_config_settings.deleteEntry("channels");
         m_config_settings.deleteEntry("lfe_bypass");
         m_config_settings.deleteEntry("lfe_lowpass");
         m_config_settings.deleteEntry("lfe_per_ear_alignment");
+        m_config_settings.deleteEntry("output_limiter");
         m_config->sync();
     }
 
@@ -173,7 +186,7 @@ bool FrontendManager::create_module() {
     // Recreate before enabling, while no application streams are routed to it.
     m_pipewire_manager->remove_virtual_surround_module();
     if (!m_pipewire_manager->create_virtual_surround_module(path.toStdString(), m_upmix_enabled, output_trim_db(),
-                                                            m_output_limiter))
+                                                            m_output_eq_config))
         return false;
     if (m_virtual_surround_enabled)
         m_pipewire_manager->enable_routing();
@@ -182,9 +195,12 @@ bool FrontendManager::create_module() {
 
 bool FrontendManager::rebuild_module() {
     // Never leave the previous preset's diagnostic values on screen while the
-    // graph is being rebuilt. The final refresh_hrir_analysis() at the end of
-    // each setter replaces this sentinel with the new values.
+    // graph is being rebuilt. Every return path below refreshes the final state.
     invalidate_hrir_analysis(QStringLiteral("重建效果图"));
+    const auto finish = [this](bool success) {
+        refresh_hrir_analysis();
+        return success;
+    };
     m_hrir_levels.clear();
     // A fresh attempt invalidates any error message from a previous failure
     set_error_message(QString());
@@ -192,30 +208,30 @@ bool FrontendManager::rebuild_module() {
     if (m_hrir_wav_file_names.isEmpty()) {
         qWarning("rebuild_module: No virtualization profiles available");
         set_error_message(QStringLiteral("未找到虚拟化配置文件。请把 HRIR WAV 文件放入下方文件夹，然后点击“重新加载”。"));
-        return false;
+        return finish(false);
     }
 
     QString path = m_hrir_wav_file_paths.value(m_hrir_wav_file_name_index);
     if (!does_hrir_wav_file_exist(path))
-        return false;
+        return finish(false);
 
     if (m_virtual_surround_enabled) {
         // Only the effects graph is replaced. The sink applications are routed to
         // stays alive, so their streams are never moved: no fallback to the physical
         // device (loud) and no sink removal for WirePlumber to pause players over.
         if (m_pipewire_manager->replace_virtual_surround_module(path.toStdString(), m_upmix_enabled, output_trim_db(),
-                                                               m_output_limiter))
-            return true;
+                                                               m_output_eq_config))
+            return finish(true);
 
         // Do not tear the device down on failure: that is exactly what causes the
         // level jump and the player pause. Keep the previous graph running.
         qWarning("rebuild_module: Effects graph replacement failed, keeping the previous graph");
-        return false;
+        return finish(false);
     }
 
     // Routing is off and nothing is linked to the bridge, so a full rebuild is safe
     m_pipewire_manager->remove_virtual_surround_module();
-    return create_module();
+    return finish(create_module());
 }
 
 bool FrontendManager::get_virtual_surround_enabled() const {
@@ -557,24 +573,6 @@ double FrontendManager::hrir_level_for_path(const QString &file_path) {
 }
 
 double FrontendManager::output_trim_db() {
-    if (!m_preset_level_match)
-        return 0.0;
-
-    QList<double> levels;
-    for (const QString &path : std::as_const(m_hrir_wav_file_paths)) {
-        const double level = hrir_level_for_path(path);
-        if (level > -200.0)
-            levels.append(level);
-    }
-    if (levels.isEmpty())
-        return 0.0;
-
-    std::sort(levels.begin(), levels.end());
-    const int count = levels.size();
-    const double median = (count % 2 == 1)
-                              ? levels.at(count / 2)
-                              : 0.5 * (levels.at(count / 2 - 1) + levels.at(count / 2));
-
     const QString selected_path = m_hrir_wav_file_paths.value(m_hrir_wav_file_name_index);
     if (selected_path.isEmpty())
         return 0.0;
@@ -582,7 +580,24 @@ double FrontendManager::output_trim_db() {
     if (selected <= -200.0)
         return 0.0;
 
-    return std::clamp(median - selected, -8.0, 8.0);
+    double target = kDirectReferenceCeilingDb;
+    if (m_preset_level_match) {
+        QList<double> levels;
+        for (const QString &path : std::as_const(m_hrir_wav_file_paths)) {
+            const double level = hrir_level_for_path(path);
+            if (level > -200.0)
+                levels.append(level);
+        }
+        if (!levels.isEmpty()) {
+            std::sort(levels.begin(), levels.end());
+            const int count = levels.size();
+            target = std::min(kDirectReferenceCeilingDb, count % 2 == 1
+                ? levels.at(count / 2)
+                : 0.5 * (levels.at(count / 2 - 1) + levels.at(count / 2)));
+        }
+    }
+
+    return std::clamp(target - selected, -24.0, 12.0);
 }
 
 QString FrontendManager::get_hrir_analysis_text() const {
@@ -644,8 +659,9 @@ void FrontendManager::refresh_hrir_analysis() {
                                   "LFE/主对齐：主 %5 ms、LFE %6/%7 ms、残差 %8/%9°；%10；%11")
                 .arg(QFileInfo(path).fileName()).arg(analysis.source_rate).arg(bass).arg(timbre)
                 .arg(main_delay).arg(lfe_delay_l).arg(lfe_delay_r).arg(residual_l).arg(residual_r)
-                .arg(m_preset_level_match ? QStringLiteral("参考电平匹配 %1 dB").arg(output_trim_db(),0,'f',2) : QStringLiteral("电平匹配关闭"))
-                .arg(m_output_limiter ? QStringLiteral("8×重建峰值限幅 / 5 ms") : QStringLiteral("限幅关闭"));
+                .arg(m_preset_level_match ? QStringLiteral("HRIR 列表中位参考 %1 dB").arg(output_trim_db(),0,'f',2)
+                                          : QStringLiteral("HRIR 中性参考 %1 dB").arg(output_trim_db(),0,'f',2))
+                .arg(QStringLiteral("8×重建峰值限幅 / 5 ms（始终启用）"));
         }
     }
 
@@ -739,31 +755,217 @@ void FrontendManager::set_preset_level_match(bool value) {
     refresh_hrir_analysis();
 }
 
-bool FrontendManager::get_output_limiter() const {
-    return m_output_limiter;
+QString FrontendManager::output_eq_group_name(const QString &node_name) const {
+    const QByteArray digest = QCryptographicHash::hash(node_name.toUtf8(), QCryptographicHash::Sha256).toHex();
+    return QStringLiteral("OutputEqualizer/%1").arg(QString::fromLatin1(digest));
 }
 
-void FrontendManager::set_output_limiter(bool value) {
-    if (m_output_limiter == value)
+void FrontendManager::load_output_eq_for_device(const QString &node_name, const QString &description) {
+    if (m_output_device_id == node_name && m_output_device_name == description)
         return;
 
-    const bool previous_value = m_output_limiter;
-    m_output_limiter = value;
-    m_config_settings.writeEntry("output_limiter", m_output_limiter);
-    m_config->sync();
-    Q_EMIT output_limiter_changed();
+    const bool applied_enabled = m_output_eq_enabled;
+    const QString applied_path = m_output_eq_file_path;
+    m_output_device_id = node_name;
+    m_output_device_name = description.isEmpty() ? node_name : description;
+    if (m_output_device_name.isEmpty())
+        m_output_device_name = QStringLiteral("尚未检测到物理输出设备");
 
-    if (!rebuild_module()) {
-        m_output_limiter = previous_value;
-        m_config_settings.writeEntry("output_limiter", m_output_limiter);
-        m_config->sync();
-        Q_EMIT output_limiter_changed();
+    m_output_eq_enabled = false;
+    m_output_eq_file_path.clear();
+    m_output_eq_config = {};
+    const QString test_eq = qEnvironmentVariable("VSM_TEST_OUTPUT_EQ");
+    if (!test_eq.isEmpty()) {
+        m_output_eq_file_path = test_eq;
+        m_output_eq_enabled = true;
+    } else if (!node_name.isEmpty()) {
+        KConfigGroup group(m_config, output_eq_group_name(node_name));
+        if (group.readEntry("node_name", QString()) == node_name) {
+            m_output_eq_file_path = group.readEntry("file_path", QString());
+            m_output_eq_enabled = group.readEntry("enabled", false);
+        }
     }
-    refresh_hrir_analysis();
+
+    QString error;
+    if (m_output_eq_enabled && !refresh_output_eq_config(&error)) {
+        m_output_eq_enabled = false;
+        m_output_eq_status = QStringLiteral("当前设备 EQ：配置无效，已关闭（%1）").arg(error);
+        set_error_message(m_output_eq_status);
+        KConfigGroup group(m_config, output_eq_group_name(node_name));
+        group.writeEntry("enabled", false);
+        m_config->sync();
+    } else {
+        refresh_output_eq_config();
+    }
+
+    Q_EMIT output_device_changed();
+    Q_EMIT output_eq_changed();
+    if (m_virtual_surround_enabled &&
+        (applied_enabled != m_output_eq_enabled || applied_path != m_output_eq_file_path) &&
+        !rebuild_module()) {
+        m_virtual_surround_enabled = false;
+        m_pipewire_manager->disable_routing();
+        Q_EMIT virtual_surround_enabled_changed();
+        set_error_message(QStringLiteral("输出设备已切换，但无法安全应用该设备的 EQ；已停止虚拟化路由，避免沿用上一设备的校准。"));
+    }
+}
+
+bool FrontendManager::refresh_output_eq_config(QString *error) {
+    m_output_eq_config = {};
+    if (!m_output_eq_enabled) {
+        m_output_eq_status = m_output_eq_file_path.isEmpty()
+            ? QStringLiteral("当前设备 EQ：关闭（未选择配置）")
+            : QStringLiteral("当前设备 EQ：关闭（%1）").arg(QFileInfo(m_output_eq_file_path).fileName());
+        return true;
+    }
+    if (m_output_eq_file_path.isEmpty()) {
+        if (error) *error = QStringLiteral("尚未选择 EQ 配置文件。");
+        return false;
+    }
+
+    QString parse_error;
+    if (!OutputEqualizer::read(m_output_eq_file_path, m_output_eq_config, &parse_error)) {
+        if (error) *error = parse_error;
+        return false;
+    }
+    m_output_eq_status = QStringLiteral("当前设备 EQ：%1；%2 段；文件前级 %3 dB；参考响应 %4 dB；固定校准 %5 dB；校准后峰值 %6 dB")
+        .arg(QFileInfo(m_output_eq_file_path).fileName())
+        .arg(m_output_eq_config.filters.size())
+        .arg(m_output_eq_config.file_preamp_db, 0, 'f', 2)
+        .arg(m_output_eq_config.reference_level_db, 0, 'f', 2)
+        .arg(m_output_eq_config.static_gain_db, 0, 'f', 2)
+        .arg(m_output_eq_config.maximum_output_gain_db, 0, 'f', 2);
+    return true;
+}
+
+bool FrontendManager::apply_output_eq_change() {
+    Q_EMIT output_eq_changed();
+    return !m_virtual_surround_enabled || rebuild_module();
+}
+
+QString FrontendManager::get_output_device_name() const {
+    return m_output_device_name;
+}
+
+bool FrontendManager::get_output_eq_enabled() const {
+    return m_output_eq_enabled;
+}
+
+void FrontendManager::set_output_eq_enabled(bool value) {
+    if (m_output_eq_enabled == value)
+        return;
+    if (m_output_device_id.isEmpty()) {
+        set_error_message(QStringLiteral("尚未检测到物理输出设备，无法启用 EQ。"));
+        Q_EMIT output_eq_changed();
+        return;
+    }
+
+    const bool previous = m_output_eq_enabled;
+    const OutputEqConfig previous_config = m_output_eq_config;
+    const QString previous_status = m_output_eq_status;
+    m_output_eq_enabled = value;
+    QString error;
+    if (!refresh_output_eq_config(&error)) {
+        m_output_eq_enabled = previous;
+        m_output_eq_config = previous_config;
+        m_output_eq_status = previous_status;
+        set_error_message(error);
+        Q_EMIT output_eq_changed();
+        return;
+    }
+
+    KConfigGroup group(m_config, output_eq_group_name(m_output_device_id));
+    group.writeEntry("node_name", m_output_device_id);
+    group.writeEntry("enabled", m_output_eq_enabled);
+    group.writeEntry("file_path", m_output_eq_file_path);
+    m_config->sync();
+    if (!apply_output_eq_change()) {
+        m_output_eq_enabled = previous;
+        m_output_eq_config = previous_config;
+        m_output_eq_status = previous_status;
+        group.writeEntry("enabled", previous);
+        m_config->sync();
+        Q_EMIT output_eq_changed();
+    }
+}
+
+QString FrontendManager::get_output_eq_file_name() const {
+    return m_output_eq_file_path.isEmpty() ? QStringLiteral("未选择") : QFileInfo(m_output_eq_file_path).fileName();
+}
+
+QString FrontendManager::get_output_eq_status() const {
+    return m_output_eq_status;
+}
+
+void FrontendManager::select_output_eq_file() {
+    if (m_output_device_id.isEmpty()) {
+        set_error_message(QStringLiteral("尚未检测到物理输出设备，无法选择该设备的 EQ。"));
+        return;
+    }
+    const QString start = m_output_eq_file_path.isEmpty()
+        ? QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+        : QFileInfo(m_output_eq_file_path).absolutePath();
+    const QString selected = QFileDialog::getOpenFileName(nullptr, QStringLiteral("选择 Equalizer APO 参数 EQ"),
+                                                          start, QStringLiteral("参数 EQ (*.txt);;所有文件 (*)"));
+    if (selected.isEmpty())
+        return;
+
+    OutputEqConfig parsed;
+    QString error;
+    if (!OutputEqualizer::read(selected, parsed, &error)) {
+        set_error_message(error);
+        return;
+    }
+
+    const QString previous_path = m_output_eq_file_path;
+    const OutputEqConfig previous_config = m_output_eq_config;
+    const QString previous_status = m_output_eq_status;
+    m_output_eq_file_path = QFileInfo(selected).absoluteFilePath();
+    refresh_output_eq_config();
+
+    KConfigGroup group(m_config, output_eq_group_name(m_output_device_id));
+    group.writeEntry("node_name", m_output_device_id);
+    group.writeEntry("file_path", m_output_eq_file_path);
+    group.writeEntry("enabled", m_output_eq_enabled);
+    m_config->sync();
+    if (m_output_eq_enabled && !apply_output_eq_change()) {
+        m_output_eq_file_path = previous_path;
+        m_output_eq_config = previous_config;
+        m_output_eq_status = previous_status;
+        group.writeEntry("file_path", previous_path);
+        m_config->sync();
+        Q_EMIT output_eq_changed();
+        return;
+    }
+    Q_EMIT output_eq_changed();
 }
 
 QString FrontendManager::get_input_detection_text() const {
     return m_input_detection_text;
+}
+
+QString FrontendManager::get_limiter_statistics_text() const {
+    return m_limiter_statistics_text;
+}
+
+void FrontendManager::set_limiter_statistics_visible(bool visible) {
+    if (m_limiter_statistics_visible == visible)
+        return;
+    m_limiter_statistics_visible = visible;
+    m_pipewire_manager->set_limiter_statistics_enabled(visible);
+    m_limiter_window.clear();
+    m_limiter_window_active_samples = 0;
+    m_limiter_window_reduced_samples = 0;
+    m_last_limiter_active_samples = 0;
+    m_last_limiter_reduced_samples = 0;
+    m_last_limiter_peak_ms = 0;
+    m_last_limiter_peak_margin_db = 0.0;
+    if (visible) {
+        refresh_input_detection();
+    } else {
+        m_limiter_statistics_text = QStringLiteral("限幅统计：窗口隐藏时暂停统计");
+        Q_EMIT limiter_statistics_text_changed();
+    }
 }
 
 void FrontendManager::refresh_input_detection() {
@@ -809,9 +1011,75 @@ void FrontendManager::refresh_input_detection() {
         }
     }
 
-    if (text == m_input_detection_text)
+    if (text != m_input_detection_text) {
+        m_input_detection_text = text;
+        qDebug("refresh_input_detection: %s", text.toStdString().c_str());
+        Q_EMIT input_detection_text_changed();
+    }
+
+    if (!m_limiter_statistics_visible)
         return;
-    m_input_detection_text = text;
-    qDebug("refresh_input_detection: %s", text.toStdString().c_str());
-    Q_EMIT input_detection_text_changed();
+
+    const PipeWireManager::LimiterStatistics limiter = m_pipewire_manager->limiter_statistics();
+    if (!limiter.available || limiter.active_samples < m_last_limiter_active_samples ||
+        limiter.reduced_samples < m_last_limiter_reduced_samples) {
+        m_limiter_window.clear();
+        m_limiter_window_active_samples = 0;
+        m_limiter_window_reduced_samples = 0;
+        m_last_limiter_active_samples = 0;
+        m_last_limiter_reduced_samples = 0;
+        m_last_limiter_peak_ms = 0;
+        m_last_limiter_peak_margin_db = 0.0;
+    }
+    const uint64_t active_delta = limiter.active_samples - m_last_limiter_active_samples;
+    const uint64_t reduced_delta = limiter.reduced_samples - m_last_limiter_reduced_samples;
+    m_last_limiter_active_samples = limiter.active_samples;
+    m_last_limiter_reduced_samples = limiter.reduced_samples;
+    if (active_delta != 0) {
+        m_limiter_window.push_back({now_ms, active_delta, reduced_delta});
+        m_limiter_window_active_samples += active_delta;
+        m_limiter_window_reduced_samples += reduced_delta;
+    }
+    constexpr qint64 kLimiterWindowMs = 10000;
+    while (!m_limiter_window.empty() && now_ms - m_limiter_window.front().timestamp_ms >= kLimiterWindowMs) {
+        m_limiter_window_active_samples -= m_limiter_window.front().active_samples;
+        m_limiter_window_reduced_samples -= m_limiter_window.front().reduced_samples;
+        m_limiter_window.pop_front();
+    }
+    const double window_percent = m_limiter_window_active_samples == 0 ? 0.0
+        : 100.0 * m_limiter_window_reduced_samples / m_limiter_window_active_samples;
+    if (limiter.input_peak_valid) {
+        m_last_limiter_peak_ms = now_ms;
+        m_last_limiter_peak_margin_db = 20.0 * std::log10(limiter.threshold / limiter.input_peak);
+    }
+    QString margin_text;
+    if (m_last_limiter_peak_ms == 0 || now_ms - m_last_limiter_peak_ms > 1000) {
+        margin_text = QStringLiteral("峰值余量 暂无有声数据");
+    } else if (m_last_limiter_peak_margin_db >= 0.0) {
+        margin_text = QStringLiteral("距限幅 %1 dB").arg(m_last_limiter_peak_margin_db, 0, 'f', 2);
+    } else {
+        margin_text = QStringLiteral("超过门槛 %1 dB").arg(-m_last_limiter_peak_margin_db, 0, 'f', 2);
+    }
+
+    QString limiter_text;
+    if (!m_virtual_surround_enabled) {
+        limiter_text = QStringLiteral("限幅统计：虚拟环绕声已关闭");
+    } else if (!limiter.available) {
+        limiter_text = QStringLiteral("限幅统计：新版 DSP 统计不可用");
+    } else if (limiter.active_seconds == 0.0) {
+        limiter_text = QStringLiteral("限幅统计：等待有声输出…");
+    } else {
+        limiter_text = QStringLiteral("限幅统计：%1；当前 %2 dB；最大 %3 dB；近10秒≥0.10dB占比 %4%；累计有声 %5 s")
+            .arg(margin_text)
+            .arg(limiter.current_reduction_db, 0, 'f', 2)
+            .arg(limiter.maximum_reduction_db, 0, 'f', 2)
+            .arg(window_percent, 0, 'f', 2)
+            .arg(limiter.active_seconds, 0, 'f', 1);
+    }
+    if (limiter_text != m_limiter_statistics_text) {
+        m_limiter_statistics_text = limiter_text;
+        if (qEnvironmentVariableIsSet("VSM_TEST_LOG_LIMITER_STATS"))
+            qInfo("VSM_TEST limiter statistics: %s", limiter_text.toStdString().c_str());
+        Q_EMIT limiter_statistics_text_changed();
+    }
 }

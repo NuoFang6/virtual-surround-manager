@@ -3,7 +3,12 @@ target_include_directories(hrir_wav_test PRIVATE ../src)
 target_link_libraries(hrir_wav_test PRIVATE Qt6::Core)
 add_test(NAME hrir_wav COMMAND hrir_wav_test)
 
-add_executable(hrir_analysis_test hrir_analysis_test.cpp ../src/hrir_wav.cpp ../src/pipewire_manager.cpp ../src/pipewire_manager.h)
+add_executable(output_equalizer_test output_equalizer_test.cpp ../src/output_equalizer.cpp)
+target_include_directories(output_equalizer_test PRIVATE ../src)
+target_link_libraries(output_equalizer_test PRIVATE Qt6::Core)
+add_test(NAME output_equalizer COMMAND output_equalizer_test)
+
+add_executable(hrir_analysis_test hrir_analysis_test.cpp ../src/hrir_wav.cpp ../src/output_equalizer.cpp ../src/pipewire_manager.cpp ../src/pipewire_manager.h)
 target_include_directories(hrir_analysis_test PRIVATE ../src ${PIPEWIRE_INCLUDE_DIRS})
 target_compile_definitions(hrir_analysis_test PRIVATE VSM_LADSPA_PLUGIN_PATH="$<TARGET_FILE:freesurround_ladspa>")
 target_link_libraries(hrir_analysis_test PRIVATE Qt6::Core ${PIPEWIRE_LIBRARIES} ${CMAKE_DL_LIBS})

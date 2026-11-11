@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QMap>
+#include <QMutex>
 #include <QHash>
 #include <QObject>
 #include <QSet>
@@ -16,6 +17,7 @@
 #include <string>
 #include <string_view>
 
+#include "output_equalizer.h"
 #include "../third_party/freesurround_ladspa/dsp_config.h"
 
 using std::string;
@@ -132,6 +134,21 @@ class PipeWireManager : public QObject {
     //
     uint64_t upmix_block_count() const;
 
+    struct LimiterStatistics {
+        bool available = false;
+        double current_reduction_db = 0.0;
+        double maximum_reduction_db = 0.0;
+        double reduced_percent = 0.0;
+        double active_seconds = 0.0;
+        uint64_t active_samples = 0;
+        uint64_t reduced_samples = 0;
+        bool input_peak_valid = false;
+        double input_peak = 0.0;
+        double threshold = 0.0;
+    };
+    LimiterStatistics limiter_statistics() const;
+    void set_limiter_statistics_enabled(bool enabled);
+
     //
     // True if the connection to the PipeWire audio service was established.
     // While this is false, the routing methods are no-ops and creating the
@@ -149,7 +166,8 @@ class PipeWireManager : public QObject {
     // Center timbre uses the center HRIR pair. Only delta is uncolored.
     //
     bool create_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled,
-                                        double output_trim_db = 0.0, bool output_limiter = false);
+                                        double output_trim_db = 0.0,
+                                        const OutputEqConfig &output_eq = {});
 
     //
     // Replaces only the effects graph behind the permanent bridge sink. Applications
@@ -160,7 +178,8 @@ class PipeWireManager : public QObject {
     // Falls back to create_virtual_surround_module() when no device exists.
     //
     bool replace_virtual_surround_module(const string &hrir_wav_path, bool upmix_enabled,
-                                         double output_trim_db = 0.0, bool output_limiter = false);
+                                         double output_trim_db = 0.0,
+                                         const OutputEqConfig &output_eq = {});
 
     //
     // True while at least one of the streams routed to the virtual sink is running
@@ -186,8 +205,12 @@ class PipeWireManager : public QObject {
     //
     void disable_routing();
 
+    QString physical_output_name() const;
+    QString physical_output_description() const;
+
     Q_SIGNAL void error_occurred(const QString &message);
     Q_SIGNAL void connection_lost();
+    Q_SIGNAL void physical_output_changed(const QString &node_name, const QString &description);
 
   private:
     std::atomic<bool> connected{false};
@@ -258,6 +281,16 @@ class PipeWireManager : public QObject {
     void *upmix_state_handle = nullptr;
     std::atomic<int> *upmix_state = nullptr;
     std::atomic<uint64_t> *upmix_blocks = nullptr;
+    std::atomic<uint32_t> *limiter_current_gain_bits = nullptr;
+    std::atomic<uint32_t> *limiter_min_gain_bits = nullptr;
+    std::atomic<uint64_t> *limiter_active_samples = nullptr;
+    std::atomic<uint64_t> *limiter_reduced_samples = nullptr;
+    std::atomic<uint64_t> *limiter_latest_generation = nullptr;
+    std::atomic<uint64_t> *limiter_active_generation = nullptr;
+    std::atomic<uint32_t> *limiter_interval_peak_bits = nullptr;
+    std::atomic<bool> *limiter_statistics_enabled = nullptr;
+    std::atomic<bool> limiter_statistics_requested{false};
+    void reset_limiter_statistics(uint64_t generation);
 
     // Thanks to EasyEffects for the list
     constexpr static auto ignored_node_names = std::to_array<std::string_view>({"libcanberra", "org.gnome.VolumeControl", "GNOME Shell", "Mutter", "gsd-media-keys"});
@@ -313,9 +346,13 @@ class PipeWireManager : public QObject {
         string node_name;
         string serial;
         string form_factor;
+        string description;
         int priority = 0;
     };
     QMap<uint32_t, SinkInfo> sinks;
+    mutable QMutex physical_output_mutex_;
+    string physical_output_name_;
+    string physical_output_description_;
 
     // Last default sink that was not one of ours; used to give the user's real
     // output device back when WirePlumber selects a virtual sink.
@@ -331,6 +368,7 @@ class PipeWireManager : public QObject {
     bool physical_default_is_internal() const;
     bool restore_physical_default();
     void update_speaker_bypass();
+    void update_physical_output();
     void release_routed_streams();
     void route_default_streams();
     struct NodeBinding {
@@ -449,7 +487,8 @@ class PipeWireManager : public QObject {
     //
     string build_effects_module_args(const string &hrir_wav_path, bool upmix_enabled,
                                      const string &capture_name, const string &playback_name,
-                                     double output_trim_db, bool output_limiter);
+                                     double output_trim_db,
+                                     const OutputEqConfig &output_eq);
 
     //
     // Builds the permanent bridge graph: an 8-channel sink that fans out to an
@@ -464,7 +503,8 @@ class PipeWireManager : public QObject {
     // failure.
     //
     pw_impl_module *load_effects_module_locked(const string &hrir_wav_path, bool upmix_enabled,
-                                               double output_trim_db, bool output_limiter);
+                                               double output_trim_db,
+                                               const OutputEqConfig &output_eq);
 
     //
     // Loads the bridge module if it does not exist yet. Must be called with the

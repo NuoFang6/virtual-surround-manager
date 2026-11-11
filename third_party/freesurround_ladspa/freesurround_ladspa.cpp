@@ -10,13 +10,13 @@
        channels carry signal) it upmixes with FreeSurround; when real multichannel
        content is detected it bypasses the upmixer with matching latency
        compensation (20 ms crossfade on both transitions).
-    3. label "output_limiter"        optional stereo-linked lookahead peak limiter
-       (-1.5 dBFS, 5 ms lookahead, 100 ms release).
+    3. label "output_limiter"        mandatory stereo-linked lookahead peak limiter
+       in the application graph (-1.5 dBFS, 5 ms lookahead, 100 ms release).
 
     The "auto" version is used by the Virtual Surround Manager filter graph, so a
     single 8-channel virtual device reproduces the Windows chain
-    (EqualizerAPO + Real3D-VST -> HeSuVi), channel detection included. The
-    output limiter is inserted after the output gain when the user enables it.
+    (EqualizerAPO + Real3D-VST -> HeSuVi), channel detection included. The output
+    limiter is the final safety stage before the application's output gate.
 
     SPDX-License-Identifier: GPL-2.0-or-later
 */
@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -46,6 +47,19 @@ extern "C" __attribute__((visibility("default"))) std::atomic<int> vsm_auto_upmi
 // on some sessions). It is deliberately not reset on activation: the count
 // keeps increasing across graph replacements in the same process.
 extern "C" __attribute__((visibility("default"))) std::atomic<std::uint64_t> vsm_auto_blocks{0};
+
+// Limiter telemetry for the active effects graph. Values are cumulative since
+// the application resets them after a graph becomes active. Only samples with
+// non-silent delayed output are counted, so idle time cannot dilute the active
+// reduction ratio. These atomics are diagnostic and never feed back into DSP.
+extern "C" __attribute__((visibility("default"))) std::atomic<std::uint32_t> vsm_limiter_current_gain_bits{0x3f800000};
+extern "C" __attribute__((visibility("default"))) std::atomic<std::uint32_t> vsm_limiter_min_gain_bits{0x3f800000};
+extern "C" __attribute__((visibility("default"))) std::atomic<std::uint64_t> vsm_limiter_active_samples{0};
+extern "C" __attribute__((visibility("default"))) std::atomic<std::uint64_t> vsm_limiter_reduced_samples{0};
+extern "C" __attribute__((visibility("default"))) std::atomic<std::uint64_t> vsm_limiter_latest_generation{0};
+extern "C" __attribute__((visibility("default"))) std::atomic<std::uint64_t> vsm_limiter_active_generation{0};
+extern "C" __attribute__((visibility("default"))) std::atomic<std::uint32_t> vsm_limiter_interval_peak_bits{0};
+extern "C" __attribute__((visibility("default"))) std::atomic<bool> vsm_limiter_statistics_enabled{false};
 
 namespace {
 
@@ -435,6 +449,7 @@ struct LimiterInstance {
     LADSPA_Data *releaseMs = nullptr;
     LADSPA_Data *lookaheadMs = nullptr;
     LADSPA_Data *latencyOut = nullptr;
+    LADSPA_Data *statisticsGeneration = nullptr;
 
     // 8x, 48-tap/polyphase windowed-sinc reconstruction detector. Audio stays
     // at the native rate; only the detector is oversampled, avoiding an extra
@@ -461,8 +476,18 @@ struct LimiterInstance {
     float gain = 1.0f;
     float threshold = 0.841395f; // -1.5 dBFS
     float releaseCoeff = 0.0f;
+    std::uint64_t generation = 0;
 
     void init(unsigned long sr) {
+        generation = vsm_limiter_latest_generation.fetch_add(1, std::memory_order_relaxed) + 1;
+        std::uint64_t inactive = 0;
+        if (vsm_limiter_active_generation.compare_exchange_strong(inactive, generation, std::memory_order_relaxed)) {
+            vsm_limiter_current_gain_bits.store(std::bit_cast<std::uint32_t>(1.0f), std::memory_order_relaxed);
+            vsm_limiter_min_gain_bits.store(std::bit_cast<std::uint32_t>(1.0f), std::memory_order_relaxed);
+            vsm_limiter_active_samples.store(0, std::memory_order_relaxed);
+            vsm_limiter_reduced_samples.store(0, std::memory_order_relaxed);
+            vsm_limiter_interval_peak_bits.store(0, std::memory_order_relaxed);
+        }
         sampleRate = sr ? sr : 48000;
         maxDelay = std::max(1, (int)std::llround(sampleRate * 0.050));
         for (int c = 0; c < 2; ++c)
@@ -539,6 +564,7 @@ void limiterConnectPort(LADSPA_Handle handle, unsigned long port, LADSPA_Data *d
     case 5: self->releaseMs = data; break;
     case 6: self->lookaheadMs = data; break;
     case 7: self->latencyOut = data; break;
+    case 8: self->statisticsGeneration = data; break;
     default: break;
     }
 }
@@ -555,7 +581,15 @@ void limiterRun(LADSPA_Handle handle, unsigned long n) {
         return;
 
     self->configure();
+    const bool collectStatistics = vsm_limiter_statistics_enabled.load(std::memory_order_relaxed);
+    const float configuredGeneration = self->statisticsGeneration ? *self->statisticsGeneration : 0.0f;
+    if (std::isfinite(configuredGeneration) && configuredGeneration >= 1.0f)
+        self->generation = static_cast<std::uint64_t>(std::llround(configuredGeneration));
     const int size = (int)self->peaks.size();
+    std::uint64_t activeSamples = 0;
+    std::uint64_t reducedSamples = 0;
+    float minimumGain = 1.0f;
+    float intervalPeak = 0.0f;
     for (unsigned long s = 0; s < n; ++s) {
         const float l = std::isfinite(self->in[0][s]) ? self->in[0][s] : 0.0f;
         const float r = std::isfinite(self->in[1][s]) ? self->in[1][s] : 0.0f;
@@ -577,6 +611,8 @@ void limiterRun(LADSPA_Handle handle, unsigned long n) {
         }
         self->detectorWrite = (self->detectorWrite + 1) % 48;
         const float peak = static_cast<float>(std::max(reconstructedPeak, static_cast<double>(std::max(std::fabs(l), std::fabs(r)))));
+        if (collectStatistics && peak > 1e-6f)
+            intervalPeak = std::max(intervalPeak, peak);
         self->peaks[self->peakWrite] = peak;
         // Monotonic queue: O(1) peak window rather than a lookahead-length scan
         // for every audio sample. Hold past the detector delay and release
@@ -618,6 +654,31 @@ void limiterRun(LADSPA_Handle handle, unsigned long n) {
             self->gain = std::min(self->gain, self->threshold / delayedPeak);
         self->out[0][s] = dl * self->gain;
         self->out[1][s] = dr * self->gain;
+        if (collectStatistics && delayedPeak > 1e-6f) { // -120 dBFS telemetry silence floor
+            ++activeSamples;
+            minimumGain = std::min(minimumGain, self->gain);
+            if (self->gain < 0.9885531f) // at least 0.10 dB of gain reduction
+                ++reducedSamples;
+        }
+    }
+    if (collectStatistics &&
+        self->generation == vsm_limiter_active_generation.load(std::memory_order_relaxed)) {
+        vsm_limiter_current_gain_bits.store(std::bit_cast<std::uint32_t>(self->gain), std::memory_order_relaxed);
+        std::uint32_t peakObserved = vsm_limiter_interval_peak_bits.load(std::memory_order_relaxed);
+        const std::uint32_t peakCandidate = std::bit_cast<std::uint32_t>(intervalPeak);
+        while (peakCandidate > peakObserved &&
+               !vsm_limiter_interval_peak_bits.compare_exchange_weak(peakObserved, peakCandidate,
+                                                                     std::memory_order_relaxed)) {
+        }
+        if (activeSamples == 0)
+            return;
+        vsm_limiter_active_samples.fetch_add(activeSamples, std::memory_order_relaxed);
+        vsm_limiter_reduced_samples.fetch_add(reducedSamples, std::memory_order_relaxed);
+        std::uint32_t observed = vsm_limiter_min_gain_bits.load(std::memory_order_relaxed);
+        const std::uint32_t candidate = std::bit_cast<std::uint32_t>(minimumGain);
+        while (candidate < observed &&
+               !vsm_limiter_min_gain_bits.compare_exchange_weak(observed, candidate, std::memory_order_relaxed)) {
+        }
     }
 }
 
@@ -697,12 +758,12 @@ const LADSPA_PortRangeHint autoPortRangeHints[] = {
 
 const char *const limiterPortNames[] = {
     "In L", "In R", "Out L", "Out R",
-    "Threshold (dBFS)", "Release (ms)", "Lookahead (ms)", "latency",
+    "Threshold (dBFS)", "Release (ms)", "Lookahead (ms)", "latency", "Statistics Generation",
 };
 
 const LADSPA_PortDescriptor limiterPortDescriptors[] = {
     AUDIO_IN, AUDIO_IN, AUDIO_OUT, AUDIO_OUT,
-    CONTROL_IN, CONTROL_IN, CONTROL_IN, CONTROL_OUT,
+    CONTROL_IN, CONTROL_IN, CONTROL_IN, CONTROL_OUT, CONTROL_IN,
 };
 
 const LADSPA_PortRangeHint limiterPortRangeHints[] = {
@@ -711,6 +772,7 @@ const LADSPA_PortRangeHint limiterPortRangeHints[] = {
     CTRL(LADSPA_HINT_BOUNDED_BELOW | LADSPA_HINT_BOUNDED_ABOVE | LADSPA_HINT_DEFAULT_MIDDLE, 1.0f, 1000.0f), // release
     CTRL(LADSPA_HINT_BOUNDED_BELOW | LADSPA_HINT_BOUNDED_ABOVE | LADSPA_HINT_DEFAULT_LOW, 0.0f, 20.0f), // lookahead
     NOHINT, // latency (output)
+    CTRL(LADSPA_HINT_BOUNDED_BELOW | LADSPA_HINT_DEFAULT_0 | LADSPA_HINT_INTEGER, 0.0f, 0.0f), // statistics generation
 };
 
 const LADSPA_Descriptor descriptorLimiter = {
@@ -719,7 +781,7 @@ const LADSPA_Descriptor descriptorLimiter = {
     .Name = "Stereo Lookahead Output Limiter",
     .Maker = "Virtual Surround Manager",
     .Copyright = "GPL-2.0-or-later",
-    .PortCount = 8,
+    .PortCount = 9,
     .PortDescriptors = limiterPortDescriptors,
     .PortNames = limiterPortNames,
     .PortRangeHints = limiterPortRangeHints,

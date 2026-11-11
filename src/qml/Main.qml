@@ -17,6 +17,9 @@ Kirigami.ApplicationWindow {
     // Set right before quitting so the confirmation is not shown twice
     property bool forceQuit: false
 
+    Component.onCompleted: frontendManager.set_limiter_statistics_visible(visible)
+    onVisibleChanged: frontendManager.set_limiter_statistics_visible(visible)
+
     // Poll the auto upmixer's detector only while this window is in the
     // foreground; the text itself is owned by FrontendManager so it survives
     // page navigation and stays in sync with the tray/UI switches.
@@ -171,6 +174,15 @@ Kirigami.ApplicationWindow {
                 type: Kirigami.MessageType.Information
                 text: frontendManager.inputDetectionText
                 visible: text.length > 0
+            }
+
+            Controls.Label {
+                Layout.fillWidth: true
+                text: frontendManager.limiterStatisticsText
+                visible: text.length > 0
+                wrapMode: Text.Wrap
+                font: Kirigami.Theme.smallFont
+                opacity: 0.8
             }
 
             Controls.Label {

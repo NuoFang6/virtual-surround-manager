@@ -14,6 +14,8 @@ target_sources(virtual-surround-manager
     pipewire_manager.cpp
     hrir_wav.h
     hrir_wav.cpp
+    output_equalizer.h
+    output_equalizer.cpp
     tray_icon.h
     tray_icon.cpp
 )

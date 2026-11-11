@@ -23,7 +23,7 @@ The upstream is here: [Berny23/virtual-surround-manager](https://github.com/Bern
 - **Mono 7-channel LFE send** (−6 / 0 dB, stereo upmix only) through the diffuse LFE path; no shelf on the front HRIRs
 - Native LFE: 120 Hz Butterworth-4, **coherent seven-pair diffuse** IR (normalized to the center HRIR), per-preset LFE/main delay and all-pass alignment
 - FreeSurround decode kept at its upstream mapping; `center_image` remains a no-op (not implemented upstream)
-- Optional **reference-level matching** and **8× reconstructed-peak limiter**
+- Optional **reference-level matching**, per-output-device **Equalizer APO parametric EQ**, and **8× reconstructed-peak limiter**
 - 44.1/96 kHz HRIR support with q14 resampling and 48 kHz graph alignment
 - Application-owned startup gate and 100 ms fade (an intentional interruption, not lossless processing)
 
@@ -182,29 +182,77 @@ reads it. The later C/FL/FR redistribution and global main-channel
 normalization were removed so the mapping and level law are the original
 FreeSurround ones.
 
-### Reference-level matching and reconstructed-peak limiting
+### Output-device EQ calibration
 
-Both options are off by default:
+Output EQ is disabled by default. The Settings page lets the user select one
+Equalizer APO parametric-EQ text file and enable it independently for each
+physical output sink. The application prefers the sink actually linked from the
+effects playback node and falls back to the physical default while that link is
+not yet available. Settings are keyed by the sink's `node.name`, not its
+session-local object serial.
 
-- `preset_level_match` estimates A-weighted output power for **seven
-  uncorrelated, equal-power pink-noise inputs**, integrating 240 logarithmic
-  frequency bins below Nyquist and matching the current list median (±8 dB).
-  It sums channel powers instead of an arbitrary coherent C/FL/FR response.
-  This is a static reference level, **not LUFS or a promise of equal programme
-  loudness**. Only the overall trim changes.
-- `output_limiter` is a stereo-linked lookahead limiter with an **8×, 48-tap
-  polyphase windowed-sinc reconstructed-peak detector**. The audio stays at the
-  graph rate; only the detector is oversampled. 5 ms lookahead (240 samples),
-  −1.5 dBFS, 100 ms release. The host test checks 12 kHz phase-shifted,
-  23 kHz near-Nyquist and 200 Hz square waves with an independent 32×/128-tap
-  reconstruction; both sample and reconstructed peaks stay below −1.5 dBFS
-  (plus 0.02 tolerance). It is a safety limiter, not a hearing-protection
-  device.
+The parser accepts `Preamp` plus enabled `PK`, `LSC` and `HSC` filters, up to 64
+bands. Unknown enabled syntax, NaN/Inf, frequencies outside 5–24 kHz and
+unreasonable Q/gain values are rejected before rebuilding the graph. Filters
+run as PipeWire's native stereo `param_eq` after the static HRIR calibration and
+before the mandatory limiter:
 
-The 0.30 output gain is −10.46 dB of nominal digital attenuation, not proof
-against overload for every multichannel signal. Headphone SPL depends on the
-whole reproduction chain and listening volume; the optional `impact` LFE send
-(0 dB) is the most likely source of hot low-frequency peaks.
+```
+HRIR/LFE mix -> static HRIR gain -> param_eq -> static EQ gain -> limiter -> gate -> device
+```
+
+At 48 kHz the application evaluates the combined PipeWire biquad response on
+32,768 logarithmic points plus DC/Nyquist. The EQ receives a fixed gain that
+matches its A-weighted pink-noise reference level to the un-EQ'd reference; the
+current programme never changes this gain. Narrow positive peaks remain part of
+the requested correction and are contained by the final reconstructed-peak
+limiter rather than lowering all content by the highest peak. The file `Preamp`
+is retained for compatibility/status but is replaced by this computed static
+reference calibration.
+
+The selected HRIR receives the same kind of static reference calibration. Its
+seven-channel, uncorrelated equal-power pink-noise A-weighted output targets
+**−15.5 dB relative to direct output**, providing 14 dB of fixed peak headroom
+below the −1.5 dBFS limiter threshold. The optional preset matching mode may use
+a quieter current-list median but can never raise that ceiling. This replaces
+the old fixed 0.30 (−10.46 dB) attenuation. It is a stable engineering
+reference, not LUFS, equal perceived loudness for every programme, SPL
+calibration or hearing protection.
+
+### Static reference matching and reconstructed-peak limiting
+
+- `preset_level_match` selects the static HRIR target. Off uses −15.5 dB
+  relative to direct output; on may select a quieter current-list median (−24
+  to +12 dB trim bound) but cannot exceed −15.5 dB. The estimate is based on
+  **seven uncorrelated, equal-power pink-noise inputs**, integrating 240
+  logarithmic frequency bins below Nyquist and summing channel powers. It is
+  fixed when the graph is built, not programme-following AGC or LUFS.
+- `output_limiter` is always present: a stereo-linked lookahead limiter with an
+  **8×, 48-tap polyphase windowed-sinc reconstructed-peak detector**. The audio
+  stays at the graph rate; only the detector is oversampled. Its settings are
+  5 ms lookahead (240 samples), −1.5 dBFS and 100 ms release. The host test
+  checks 12 kHz phase-shifted, 23 kHz near-Nyquist and 200 Hz square waves with
+  an independent 32×/128-tap reconstruction; both sample and reconstructed
+  peaks stay below −1.5 dBFS (plus 0.02 tolerance).
+
+The static baseline does not change during playback. The main page reports the
+current and maximum linked gain reduction, the recent reconstructed input-peak
+margin to the −1.5 dBFS limiter threshold, the percentage of non-silent output
+samples with at least 0.10 dB reduction during the most recent 10 seconds, and
+cumulative non-silent duration for the active effects graph. The peak display
+reports `distance to limiting`, `over threshold`, or no recent audio data; its
+one-second freshness and −120 dBFS telemetry floor prevent old FIR tails from
+being presented as a live margin. Telemetry is enabled only while the main
+window is visible; hiding it to the tray clears the interval peak and makes the
+DSP skip per-sample telemetry comparisons/counters and all telemetry atomic
+writes. No history is written to disk. The limiter's reconstructed-peak detector
+still runs because it is part of the audio safety path. A successfully linked
+new graph resets the counters and rolling window; telemetry never feeds back
+into gain control.
+When the signal would otherwise overload, the limiter necessarily reduces both
+channels together and its release can remain below unity for a short time; that
+is the dynamic safety mechanism, not loudness normalization. It is not a
+certified true-peak meter or hearing-protection device.
 
 ### Sample rate and rendering latency
 

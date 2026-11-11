@@ -107,8 +107,8 @@ FormCard.FormCardPage {
 
         FormCard.FormSwitchDelegate {
             id: presetLevelMatch
-            text: i18nc("@label:switch", "预设参考电平匹配")
-            description: i18nc("@info:description", "以七路不相关、等功率粉红噪声为参考，积分各 HRIR 的 A 计权输出功率，匹配列表中位数（最多 ±8 dB）。只改整体增益；不是 LUFS，也不保证不同节目等响。默认关闭。")
+            text: i18nc("@label:switch", "跨预设使用列表中位参考")
+            description: i18nc("@info:description", "关闭时，每个 HRIR 都以七路不相关等功率粉红噪声的 A 计权参考静态校准到比直出低 15.5 dB，为 −1.5 dBFS 限幅门槛保留 14 dB 固定峰值余量；开启时可改用更低的当前 HRIR 列表中位参考，但绝不抬高该上限。两种模式都只在建图时确定增益，不跟随播放内容变化。")
             checkable: true
             checked: frontendManager.presetLevelMatch
             onToggled: frontendManager.presetLevelMatch = checked
@@ -123,22 +123,49 @@ FormCard.FormCardPage {
             }
         }
 
+        FormCard.FormButtonDelegate {
+            enabled: false
+            text: i18nc("@label", "输出安全与响度")
+            description: i18nc("@info:description", "使用 14 dB 固定峰值余量；HRIR 和设备 EQ 都采用建图时确定的静态校准。最终始终经过 8× 多相重建峰检测、5 ms lookahead、−1.5 dBFS、100 ms release 的立体声联动限幅。基准增益不会随节目变化；只有可能过载时限幅器才会降低增益。限幅统计仅在主窗口可见时启用，隐藏到托盘时停止统计。不是认证 true-peak 限幅或听力保护。")
+            trailingLogo.visible: false
+        }
+    }
+
+    FormCard.FormHeader {
+        title: i18nc("@title:group", "输出设备 EQ 校准")
+    }
+
+    FormCard.FormCard {
         FormCard.FormSwitchDelegate {
-            id: outputLimiter
-            text: i18nc("@label:switch", "输出重建峰值限幅")
-            description: i18nc("@info:description", "8× 多相重建峰检测、5 ms lookahead、−1.5 dBFS、100 ms release 的立体声联动限幅。音频不重采样，只有检测器过采样；瞬态仍会影响同一前瞻窗口的低电平样本。不是认证 true-peak 限幅或听力保护。默认关闭。")
+            id: outputEqEnabled
+            text: i18nc("@label:switch", "为当前输出设备启用 EQ")
+            description: i18nc("@info:description", "当前物理输出：%1。每个设备独立保存开关和配置，默认关闭；切换设备时自动应用该设备的选择。", frontendManager.outputDeviceName)
             checkable: true
-            checked: frontendManager.outputLimiter
-            onToggled: frontendManager.outputLimiter = checked
+            enabled: frontendManager.outputEqFileName !== "未选择"
+            checked: frontendManager.outputEqEnabled
+            onToggled: frontendManager.outputEqEnabled = checked
 
             Connections {
                 target: frontendManager
-                function onOutputLimiterChanged() {
-                    outputLimiter.checked = Qt.binding(function () {
-                        return frontendManager.outputLimiter;
+                function onOutputEqChanged() {
+                    outputEqEnabled.checked = Qt.binding(function () {
+                        return frontendManager.outputEqEnabled;
                     })
                 }
             }
+        }
+
+        FormCard.FormButtonDelegate {
+            text: i18nc("@action:button", "选择 Equalizer APO 参数 EQ")
+            description: i18nc("@info:description", "当前文件：%1。接受 Preamp、PK、LSC 和 HSC；选择文件不会自动启用。", frontendManager.outputEqFileName)
+            onClicked: frontendManager.select_output_eq_file()
+        }
+
+        FormCard.FormButtonDelegate {
+            enabled: false
+            text: i18nc("@label", "EQ 增益状态")
+            description: frontendManager.outputEqStatus
+            trailingLogo.visible: false
         }
     }
 
