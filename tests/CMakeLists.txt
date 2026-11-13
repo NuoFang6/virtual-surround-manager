@@ -22,3 +22,19 @@ add_test(NAME plugin_regression COMMAND plugin_regression_test $<TARGET_FILE:fre
 if(TARGET freesurround_ladspa_test)
     add_test(NAME plugin_smoke COMMAND freesurround_ladspa_test $<TARGET_FILE:freesurround_ladspa>)
 endif()
+
+find_program(VSM_PIPEWIRE_EXECUTABLE pipewire)
+find_program(VSM_WIREPLUMBER_EXECUTABLE wireplumber)
+find_program(VSM_WPCTL_EXECUTABLE wpctl)
+find_program(VSM_PW_CLI_EXECUTABLE pw-cli)
+find_program(VSM_PW_DUMP_EXECUTABLE pw-dump)
+find_program(VSM_PW_METADATA_EXECUTABLE pw-metadata)
+find_program(VSM_JQ_EXECUTABLE jq)
+if(VSM_PIPEWIRE_EXECUTABLE AND VSM_WIREPLUMBER_EXECUTABLE AND VSM_WPCTL_EXECUTABLE AND
+   VSM_PW_CLI_EXECUTABLE AND VSM_PW_DUMP_EXECUTABLE AND VSM_PW_METADATA_EXECUTABLE AND VSM_JQ_EXECUTABLE)
+    add_test(NAME virtual_sink_mute
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/virtual_sink_mute_test.sh
+                $<TARGET_FILE:virtual-surround-manager>
+                ${CMAKE_SOURCE_DIR}/src/assets/hrir_wav/27_95_142.wav)
+    set_tests_properties(virtual_sink_mute PROPERTIES TIMEOUT 30)
+endif()

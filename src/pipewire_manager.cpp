@@ -17,6 +17,7 @@
 #include <QFileInfo>
 #include <spa/param/props.h>
 #include <spa/pod/builder.h>
+#include <spa/pod/iter.h>
 #include <QList>
 #include <QStandardPaths>
 #include <QTimer>
@@ -827,6 +828,26 @@ string PipeWireManager::choose_physical_default_sink() const {
     return best_name;
 }
 
+uint32_t PipeWireManager::physical_output_id() const {
+    if (effects_playback_id != SPA_ID_INVALID) {
+        for (const LinkInfo &link : std::as_const(links)) {
+            if (link.output_node == effects_playback_id && sinks.contains(link.input_node))
+                return link.input_node;
+        }
+    }
+
+    string name = last_physical_default_sink;
+    if (name.empty() || is_our_sink_name(name))
+        name = default_sink_name;
+    if (name.empty() || is_our_sink_name(name))
+        name = choose_physical_default_sink();
+    for (auto it = sinks.cbegin(); it != sinks.cend(); ++it) {
+        if (it.value().node_name == name)
+            return it.key();
+    }
+    return SPA_ID_INVALID;
+}
+
 bool PipeWireManager::physical_default_is_internal() const {
     string name = last_physical_default_sink;
     if (name.empty() || is_our_sink_name(name))
@@ -870,21 +891,9 @@ bool PipeWireManager::restore_physical_default() {
 
 void PipeWireManager::update_physical_output() {
     string name;
-    if (effects_playback_id != SPA_ID_INVALID) {
-        for (const LinkInfo &link : std::as_const(links)) {
-            if (link.output_node == effects_playback_id && sinks.contains(link.input_node)) {
-                name = sinks.value(link.input_node).node_name;
-                break;
-            }
-        }
-    }
-    if (name.empty()) {
-        name = last_physical_default_sink;
-        if (name.empty() || is_our_sink_name(name))
-            name = default_sink_name;
-        if (name.empty() || is_our_sink_name(name))
-            name = choose_physical_default_sink();
-    }
+    const uint32_t output_id = physical_output_id();
+    if (output_id != SPA_ID_INVALID)
+        name = sinks.value(output_id).node_name;
 
     string description;
     for (auto it = sinks.cbegin(); it != sinks.cend(); ++it) {
@@ -895,14 +904,46 @@ void PipeWireManager::update_physical_output() {
     }
     if (description.empty())
         description = name;
+    bool changed = false;
     {
         QMutexLocker locker(&physical_output_mutex_);
-        if (name == physical_output_name_ && description == physical_output_description_)
-            return;
-        physical_output_name_ = name;
-        physical_output_description_ = description;
+        changed = name != physical_output_name_ || description != physical_output_description_;
+        if (changed) {
+            physical_output_name_ = name;
+            physical_output_description_ = description;
+        }
     }
-    Q_EMIT physical_output_changed(QString::fromStdString(name), QString::fromStdString(description));
+    if (changed)
+        Q_EMIT physical_output_changed(QString::fromStdString(name), QString::fromStdString(description));
+    enforce_virtual_sink_unmuted();
+}
+
+void PipeWireManager::write_node_mute(pw_proxy *proxy, bool mute) {
+    if (!proxy)
+        return;
+    uint8_t buffer[64];
+    spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+    const spa_pod *props = static_cast<const spa_pod *>(spa_pod_builder_add_object(&builder,
+        SPA_TYPE_OBJECT_Props, SPA_PARAM_Props,
+        SPA_POD_Prop(SPA_PROP_mute, SPA_POD_Bool(mute))));
+    if (props)
+        pw_node_set_param(reinterpret_cast<pw_node *>(proxy), SPA_PARAM_Props, 0, props);
+}
+
+void PipeWireManager::enforce_virtual_sink_unmuted() {
+    const uint32_t output_id = physical_output_id();
+    const auto output = sinks.constFind(output_id);
+    if (output == sinks.cend() || !output->mute_known || output->muted)
+        return;
+
+    for (SinkBinding *binding : std::as_const(sink_bindings)) {
+        if (!binding->internal || !binding->mute_known || !binding->muted)
+            continue;
+        write_node_mute(binding->proxy, false);
+        binding->muted = false;
+        qInfo("enforce_virtual_sink_unmuted: cleared mute on virtual sink %u because physical output '%s' is unmuted",
+              binding->id, output->node_name.c_str());
+    }
 }
 
 QString PipeWireManager::physical_output_name() const {
@@ -1153,7 +1194,20 @@ void PipeWireManager::on_node_info(void *data, const struct pw_node_info *info) 
 void PipeWireManager::on_sink_info(void *data, const struct pw_node_info *info) {
     SinkBinding *binding = static_cast<SinkBinding *>(data);
     PipeWireManager *manager = binding->manager;
-    if (!info || !info->props)
+    if (!info)
+        return;
+
+    if (info->change_mask & PW_NODE_CHANGE_MASK_PARAMS) {
+        for (uint32_t i = 0; i < info->n_params; ++i) {
+            if (info->params[i].id == SPA_PARAM_Props &&
+                info->params[i].flags & SPA_PARAM_INFO_READ) {
+                uint32_t ids[] = {SPA_PARAM_Props};
+                pw_node_subscribe_params(reinterpret_cast<pw_node *>(binding->proxy), ids, 1);
+                break;
+            }
+        }
+    }
+    if (!info->props)
         return;
 
     const char *form_factor = spa_dict_lookup(info->props, "device.form-factor");
@@ -1182,6 +1236,29 @@ void PipeWireManager::on_sink_info(void *data, const struct pw_node_info *info) 
         manager->update_speaker_bypass();
         manager->update_physical_output();
     }
+}
+
+void PipeWireManager::on_sink_param(void *data, [[maybe_unused]] int seq, uint32_t id,
+                                    [[maybe_unused]] uint32_t index, [[maybe_unused]] uint32_t next,
+                                    const struct spa_pod *param) {
+    auto *binding = static_cast<SinkBinding *>(data);
+    auto *manager = binding->manager;
+    if (id != SPA_PARAM_Props || !param || !spa_pod_is_object_type(param, SPA_TYPE_OBJECT_Props))
+        return;
+
+    const spa_pod_prop *property = spa_pod_find_prop(param, nullptr, SPA_PROP_mute);
+    bool muted = false;
+    if (!property || spa_pod_get_bool(&property->value, &muted) < 0)
+        return;
+
+    binding->mute_known = true;
+    binding->muted = muted;
+    auto sink = manager->sinks.find(binding->id);
+    if (sink != manager->sinks.end()) {
+        sink->mute_known = true;
+        sink->muted = muted;
+    }
+    manager->enforce_virtual_sink_unmuted();
 }
 
 int PipeWireManager::on_metadata_property(void *data,
@@ -1419,12 +1496,22 @@ void PipeWireManager::registry_event_global(void *data,
     if (strcmp(node_media_class, "Audio/Sink") == 0 || strcmp(node_media_class, "Audio/Duplex") == 0) {
         const size_t base_len = strlen(manager->capture_node_name_base);
         if (node_name && strncmp(node_name, manager->capture_node_name_base, base_len) == 0) {
-            // The app-facing bridge sink and the current effects sink are internal
+            // The app-facing bridge sink and the current effects sink are internal.
             manager->internal_capture_ids.insert(id);
             if (strcmp(node_name, manager->capture_node_name_base) == 0)
                 manager->bridge_capture_id = id;
             else if (node_name == manager->effects_capture_node_name)
                 manager->effects_capture_id = id;
+            if (!manager->sink_bindings.contains(id)) {
+                pw_proxy *proxy = static_cast<pw_proxy *>(
+                    pw_registry_bind(manager->registry, id, PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, 0));
+                if (proxy) {
+                    auto *binding = new SinkBinding{manager, id, proxy, {}, true};
+                    manager->sink_bindings.insert(id, binding);
+                    pw_node_add_listener(reinterpret_cast<pw_node *>(proxy), &binding->listener,
+                                         &manager->sink_node_events, binding);
+                }
+            }
             if (manager->link_wait_active.load(std::memory_order_relaxed))
                 pw_thread_loop_signal(manager->thread_loop, false);
         } else if (node_name) {
@@ -2085,6 +2172,7 @@ string PipeWireManager::build_effects_module_args(const string &hrir_wav_path, b
                                          R"graph(
     node.description = "虚拟环绕声（内部效果）"
     media.class = "Audio/Sink"
+    state.restore-props = false
     priority.session = 0
     node.latency = "1024/48000"
     audio.rate = 48000
@@ -2507,6 +2595,7 @@ string PipeWireManager::build_bridge_module_args(const string &effects_sink_name
     node.name = )" + string(capture_node_name_base) + R"(
     node.description = "虚拟环绕声"
     media.class = "Audio/Sink"
+    state.restore-props = false
     priority.session = 0
     node.latency = "1024/48000"
     audio.rate = 48000

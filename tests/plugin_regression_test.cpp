@@ -156,6 +156,30 @@ void limiterTests(const LADSPA_Descriptor *descriptor, void *library) {
         check("limiter exports reconstructed input peak", std::bit_cast<float>(intervalPeakBits->load()) >= 1.0f);
     }
 }
+void telemetryGatingTests(const LADSPA_Descriptor *autoDescriptor, void *library) {
+    auto *statisticsEnabled = reinterpret_cast<std::atomic<bool> *>(dlsym(library, "vsm_limiter_statistics_enabled"));
+    auto *blocks = reinterpret_cast<std::atomic<std::uint64_t> *>(dlsym(library, "vsm_auto_blocks"));
+    auto *state = reinterpret_cast<std::atomic<int> *>(dlsym(library, "vsm_auto_upmix_state"));
+    check("input detector telemetry exports are available", statisticsEnabled && blocks && state);
+    if (!statisticsEnabled || !blocks || !state)
+        return;
+
+    Host host(autoDescriptor, 512);
+    std::fill(host.ports[0].begin(), host.ports[0].end(), 0.1f);
+    std::fill(host.ports[1].begin(), host.ports[1].end(), 0.1f);
+    statisticsEnabled->store(false);
+    const uint64_t hiddenBlocks = blocks->load();
+    const int hiddenState = state->load();
+    host.run(512);
+    check("hidden UI does not update input heartbeat", blocks->load() == hiddenBlocks);
+    check("hidden UI does not publish input state", state->load() == hiddenState);
+    statisticsEnabled->store(true);
+    host.run(512);
+    check("visible UI updates input heartbeat", blocks->load() == hiddenBlocks + 1);
+    check("visible UI publishes input state", state->load() != -1);
+    statisticsEnabled->store(false);
+}
+
 void qualityTests(const LADSPA_Descriptor *autoDesc, const LADSPA_Descriptor *limiterDesc) {
     // Upstream FreeSurround stores center_image but never reads it in the
     // decode; both values must produce identical output.
@@ -228,6 +252,7 @@ int main(int argc, char **argv) {
     }
     blockTests(descriptor(1));
     limiterTests(descriptor(2), library);
+    telemetryGatingTests(descriptor(1), library);
     qualityTests(descriptor(1),descriptor(2));
     dlclose(library);
     std::printf("%d failures\n", failures);

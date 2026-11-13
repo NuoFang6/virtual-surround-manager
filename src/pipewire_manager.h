@@ -348,6 +348,8 @@ class PipeWireManager : public QObject {
         string form_factor;
         string description;
         int priority = 0;
+        bool mute_known = false;
+        bool muted = false;
     };
     QMap<uint32_t, SinkInfo> sinks;
     mutable QMutex physical_output_mutex_;
@@ -365,10 +367,13 @@ class PipeWireManager : public QObject {
     bool is_our_sink_name(const string &name) const;
     bool is_effects_sink_name(const string &name) const;
     string choose_physical_default_sink() const;
+    uint32_t physical_output_id() const;
     bool physical_default_is_internal() const;
     bool restore_physical_default();
     void update_speaker_bypass();
     void update_physical_output();
+    void enforce_virtual_sink_unmuted();
+    static void write_node_mute(pw_proxy *proxy, bool mute);
     void release_routed_streams();
     void route_default_streams();
     struct NodeBinding {
@@ -391,6 +396,9 @@ class PipeWireManager : public QObject {
         uint32_t id;
         struct pw_proxy *proxy;
         struct spa_hook listener;
+        bool internal = false;
+        bool mute_known = false;
+        bool muted = false;
     };
     QMap<uint32_t, SinkBinding *> sink_bindings;
 
@@ -587,10 +595,12 @@ class PipeWireManager : public QObject {
     // full props (the registry global does not carry it).
     //
     static void on_sink_info(void *data, const struct pw_node_info *info);
+    static void on_sink_param(void *data, int seq, uint32_t id, uint32_t index,
+                              uint32_t next, const struct spa_pod *param);
 
     const struct pw_node_events sink_node_events = {
         .version = PW_VERSION_NODE_EVENTS,
         .info = on_sink_info,
-        .param = nullptr,
+        .param = on_sink_param,
     };
 };

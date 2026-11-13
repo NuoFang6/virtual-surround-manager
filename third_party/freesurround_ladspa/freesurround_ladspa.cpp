@@ -35,17 +35,17 @@
 #include <iterator>
 #include <vector>
 
-// Live detector state for the application UI. The filter-chain module loads
-// this plugin inside the application process, so the app can dlopen() the same
-// object and read this atomic: 1 = stereo (upmixing), 0 = multichannel
+// Live detector state for the application UI. Publishing is enabled only while
+// the main window is visible, using the same switch as limiter telemetry. The
+// filter-chain module loads this plugin inside the application process, so the
+// app can dlopen() the same object and read this atomic: 1 = stereo (upmixing), 0 = multichannel
 // (bypassing), -1 = not active yet. Visibility is forced because the build
 // otherwise uses hidden visibility for plugin sources.
 extern "C" __attribute__((visibility("default"))) std::atomic<int> vsm_auto_upmix_state{-1};
 
 // Monotonic process counter, used by the application to tell whether audio is
-// actually flowing through the graph (the node state alone proved unreliable
-// on some sessions). It is deliberately not reset on activation: the count
-// keeps increasing across graph replacements in the same process.
+// actually flowing through the graph. It advances only while UI telemetry is
+// enabled and is deliberately not reset on activation.
 extern "C" __attribute__((visibility("default"))) std::atomic<std::uint64_t> vsm_auto_blocks{0};
 
 // Limiter telemetry for the active effects graph. Values are cumulative since
@@ -373,7 +373,9 @@ void autoActivate(LADSPA_Handle handle) {
 void autoRun(LADSPA_Handle handle, unsigned long n) {
     AutoInstance *self = (AutoInstance *)handle;
     if (!self->core.decoder || n == 0) return;
-    vsm_auto_blocks.fetch_add(1, std::memory_order_relaxed);
+    const bool publishState = vsm_limiter_statistics_enabled.load(std::memory_order_relaxed);
+    if (publishState)
+        vsm_auto_blocks.fetch_add(1, std::memory_order_relaxed);
     syncControls(self->core.decoder, self->ctrl, self->sampleRate);
     const bool upmixAllowed = !self->ctrl.upmixEnable || *self->ctrl.upmixEnable > 0.5f;
     // 0 = no send, 0.501 = balanced's historical -6 dB, 1.0 = impact's 0 dB.
@@ -423,7 +425,8 @@ void autoRun(LADSPA_Handle handle, unsigned long n) {
                 : upmix[c] * (1.0f - self->bypassMix) + native[c];
         }
     }
-    vsm_auto_upmix_state.store(self->bypassMix < 0.5f ? 1 : 0, std::memory_order_relaxed);
+    if (publishState)
+        vsm_auto_upmix_state.store(self->bypassMix < 0.5f ? 1 : 0, std::memory_order_relaxed);
 }
 
 void autoCleanup(LADSPA_Handle handle) {
